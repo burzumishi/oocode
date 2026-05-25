@@ -1,0 +1,7 @@
+hostname,ip,type,os,status,fecha_registro
+fw-01,10.0.0.254,firewall,FortiOS 7,active,2026-05-21
+srv-01,10.1.1.1,,,,2026-05-21
+srv-02,10.1.1.2,,,,2026-05-21
+fw-01,10.0.0.254,firewall,FortiOS 7,active,2026-05-21
+srv-01,10.1.1.1,,,,2026-05-21
+srv-02,10.1.1.2,,,,2026-05-21

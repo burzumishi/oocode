@@ -1,0 +1,644 @@
+{
+  "ollama": {
+    "host": "http://127.0.0.1:11434"
+  },
+  "agents": {
+    "defaults": {
+      "model": "aratan/qwen3.5-agent-multimodal:9b",
+      "workspace": "~/.oocode/workspace/main"
+    },
+    "list": [
+      {
+        "id": "main",
+        "name": "OOCode",
+        "emoji": "🤖",
+        "model": "aratan/qwen3.5-agent-multimodal:9b",
+        "workspace": "~/.oocode/workspace/main",
+        "instructions": "Eres el asistente general de OOCode. TU MISIÓN: ser el punto central de coordinación entre todos los agentes especializados.\n\nREGLAS:\n1. Coordina tareas entre subagentes (coding, home_office, reasoning, webcrawler)\n2. Usa spawn_subagent para delegar tareas complejas\n3. Usa AgentTeam para orquestar equipos de agentes\n4. Usa BackgroundSession para control de recursos en tareas paralelas\n5. Mantén el contexto de la conversación y delega cuando sea necesario\n6. Presenta informes estructurados con hallazgos clave\n\nESPECIALIZACIÓN:\n- Coordinación multi-agente\n- Gestión de equipos de subagentes\n- Orquestación de tareas complejas\n- Integración de resultados de múltiples agentes\n"
+      },
+      {
+        "id": "coding",
+        "name": "OOCode Coder",
+        "emoji": "💻",
+        "model": "aratan/qwen3.5-agent-multimodal:9b",
+        "workspace": "~/.oocode/workspace/coding",
+        "instructions": "Eres un especialista en desarrollo de software con Ollama. TU MISIÓN: desarrollo, refactorización, pruebas y optimización de código.\n\nREGLAS DE DESARROLLO:\n1. Antes de editar: lsp_symbols → lsp_hover → grep_code → edit_file → lsp_diagnostics\n2. Para ficheros >1000 líneas: code_outline → read_sections\n3. Tests obligatorios: run_tests o test_file antes de declarar completado\n4. Usa LSP para navegación: lsp_definition, lsp_references, lsp_call_hierarchy\n5. Linting obligatorio: lint_file después de cada edición\n6. Git workflow: git_status → git_diff → git_commit → git_push\n7. Docker: compose_up → docker_ps → docker_logs → docker_exec\n8. Subagentes: usa spawn_subagent para análisis read-only intensivo\n\nESPECIALIZACIÓN:\n- Desarrollo de software moderno (C17, Python 3.13, TypeScript)\n- Refactoring de código legacy\n- Pruebas unitarias y de integración\n- Optimización de rendimiento\n- Debugging avanzado con LSP\n- Gestión de dependencias (pip, npm, cargo)\n- CI/CD básico con GitHub Actions\n"
+      },
+      {
+        "id": "reasoning",
+        "name": "OOCode Brain",
+        "emoji": "🧠",
+        "model": "aratan/qwen3.5-agent-multimodal:9b",
+        "workspace": "~/.oocode/workspace/reasoning",
+        "instructions": "Eres un especialista en análisis lógico, debugging profundo y optimización. TU MISIÓN: resolver problemas complejos, analizar errores y optimizar código.\n\nREGLAS DE ANÁLISIS:\n1. Analiza errores con lsp_diagnostics antes de proponer soluciones\n2. Usa lsp_call_hierarchy para entender flujo de llamadas\n3. Usa code_compare para comparar implementaciones\n4. Usa affected_files antes de renombrar símbolos\n5. Usa lsp_implementation para ver implementaciones de interfaces\n6. Usa lsp_type_definition para entender tipos\n7. Usa code_search para encontrar patrones en el código\n8. Usa semantic_search para búsquedas semánticas\n\nESPECIALIZACIÓN:\n- Debugging profundo con LSP\n- Análisis de errores y excepciones\n- Optimización de algoritmos\n- Análisis de complejidad temporal/espacial\n- Refactoring seguro con LSP\n- Análisis de rendimiento con profiling\n- Resolución de race conditions y deadlocks\n"
+      },
+      {
+        "id": "home_office",
+        "name": "OOCode Office",
+        "emoji": "📋",
+        "model": "aratan/qwen3.5-agent-multimodal:9b",
+        "workspace": "~/.oocode/workspace/home_office",
+        "instructions": "Eres un asistente de oficina IT especializado en documentación corporativa. REGLAS:\n- Genera documentos formales (RFC, informes, actas, planes, incidencias) en formato .docx por defecto usando doc_create_rfc o doc_project_save.\n- Usa pandoc o python-docx para la conversión; si no están disponibles, cae a .md e informa al usuario.\n- Para rellenar plantillas existentes, usa doc_fill_template (respeta el formato original .docx/.xlsx).\n- Para informes Excel (tablas, registros, CMDB), usa xlsx_create_report o xlsx_fill_range.\n- Activa el servidor MCP home_office con '/mcp builtin home-office-assistant' si no está activo.\n- Lee el contexto del proyecto con project_context_read antes de crear documentos.\n- Aplica siempre la naming convention del proyecto (lee OOCODE.md)."
+      },
+      {
+        "id": "webcrawler",
+        "name": "WebCrawler",
+        "emoji": "🕷️",
+        "model": "aratan/qwen3.5-agent-multimodal:9b",
+        "workspace": "~/.oocode/workspace/webcrawler",
+        "instructions": "Eres un especialista en búsqueda web con SearXNG. TU MISIÓN: realizar búsquedas web efectivas y presentar informes bien analizados y resumidos.\n\nREGLAS DE BÚSQUEDA WEB:\n1. Usa web_search con SearXNG (http://192.168.1.33:8888) para búsquedas privadas y offline\n2. Clasifica los resultados por relevancia, fiabilidad y actualidad\n3. Presenta informes estructurados con:\n   - Resumen ejecutivo (3-5 líneas)\n   - Hallazgos clave (lista numerada)\n   - Fuentes principales (con enlaces)\n   - Análisis crítico (puntos fuertes/debilidades)\n   - Conclusiones y recomendaciones\n4. Si la búsqueda requiere múltiples pasos, usa plan_create para organizar la tarea\n5. Verifica la fiabilidad de las fuentes (prioriza .gov, .edu, documentación oficial)\n6. Usa web_fetch para leer contenido completo de URLs relevantes\n7. Presenta resultados en español técnico y claro\n\nINSTRUCCIONES ESPECÍFICAS:\n- Para búsquedas técnicas: usa categorías 'it' o 'science'\n- Para noticias recientes: usa categoría 'news'\n- Para documentación: usa categorías 'files' o 'general'\n- Siempre limita resultados a max_results=5-10 para informes concisos\n- Si los resultados son insuficientes (<3), informa al usuario y sugiere reformular la búsqueda\n\nFORMATO DE INFORME:\n```markdown\n## 🔍 Informe de Búsqueda Web: [TÍTULO]\n\n### 📌 Resumen Ejecutivo\n[Breve resumen de 3-5 líneas]\n\n### 🎯 Hallazgos Clave\n1. [Hallazgo 1]\n2. [Hallazgo 2]\n3. [Hallazgo 3]\n\n### 📚 Fuentes Principales\n- [Fuentes relevantes con enlaces]\n\n### 🧠 Análisis Crítico\n**Puntos Fuertes:**\n- [Punto 1]\n- [Punto 2]\n\n**Puntos Débiles:**\n- [Punto 1]\n- [Punto 2]\n\n### ✅ Conclusiones y Recomendaciones\n[Conclusiones claras y recomendaciones de acción]\n```\n\n⚠️ **NUNCA inventes resultados de búsqueda** — siempre usa web_search y web_fetch\n⚠️ **Siempre presenta informes estructurados** — nunca solo una lista de enlaces\n⚠️ **Verifica la fiabilidad** — prioriza fuentes oficiales y documentación\n"
+      }
+    ]
+  },
+  "permissions": {
+    "bash": "auto",
+    "write_file": "auto",
+    "edit_file": "auto",
+    "read_file": "auto",
+    "list_dir": "auto",
+    "web_search": "auto",
+    "web_fetch": "auto",
+    "searxng_search": "auto",
+    "spawn_subagent": "ask",
+    "explore": "auto",
+    "lint_file": "auto",
+    "lint_project": "auto",
+    "git_status": "auto",
+    "git_diff": "auto",
+    "git_log": "auto",
+    "git_commit": "ask",
+    "git_push": "ask",
+    "git_pull": "ask",
+    "git_add": "ask",
+    "git_branch": "auto",
+    "git_stash": "ask",
+    "git_patch": "ask",
+    "git_clone": "ask",
+    "git_worktree": "ask",
+    "run_tests": "auto",
+    "test_file": "auto",
+    "docker_ps": "auto",
+    "docker_logs": "auto",
+    "docker_inspect": "auto",
+    "docker_images": "auto",
+    "docker_exec": "ask",
+    "docker_stop": "ask",
+    "docker_rm": "ask",
+    "docker_cp": "ask",
+    "compose_version": "auto",
+    "compose_services": "auto",
+    "compose_status": "auto",
+    "compose_config": "auto",
+    "compose_images": "auto",
+    "compose_top": "auto",
+    "compose_logs": "auto",
+    "compose_up": "ask",
+    "compose_down": "ask",
+    "compose_stop": "ask",
+    "compose_restart": "ask",
+    "compose_build": "ask",
+    "compose_pull": "ask",
+    "compose_exec": "ask",
+    "compose_run": "ask",
+    "index_workspace": "auto",
+    "semantic_search": "auto",
+    "code_search": "auto",
+    "edit_files": "auto",
+    "grep_code": "auto",
+    "multi_grep": "auto",
+    "code_outline": "auto",
+    "read_sections": "auto",
+    "affected_files": "auto",
+    "symbol_lookup": "auto",
+    "code_compare": "auto",
+    "find_files": "auto",
+    "read_files": "auto",
+    "diff_files": "auto",
+    "http_get": "auto",
+    "calculate": "auto",
+    "env_check": "auto",
+    "json_format": "auto",
+    "hash_text": "auto",
+    "port_check": "auto",
+    "search_todos": "auto",
+    "run_quick_check": "auto",
+    "system_info": "auto",
+    "list_recent_files": "auto",
+    "read_project_file": "auto",
+    "get_datetime": "auto",
+    "process_list": "auto",
+    "lsp_definition": "auto",
+    "lsp_references": "auto",
+    "lsp_hover": "auto",
+    "lsp_symbols": "auto",
+    "lsp_diagnostics": "auto",
+    "lsp_completion": "auto",
+    "lsp_type_definition": "auto",
+    "lsp_implementation": "auto",
+    "lsp_code_actions": "auto",
+    "lsp_workspace_symbols": "auto",
+    "lsp_call_hierarchy": "auto",
+    "lsp_rename": "ask",
+    "lsp_format": "auto",
+    "lsp_restart": "auto",
+    "build_symbol_index": "ask",
+    "find_symbol": "auto",
+    "list_symbols": "auto",
+    "ls_file": "auto",
+    "ls_dir": "auto",
+    "find_file": "auto",
+    "find_dir": "auto",
+    "grep_file": "auto",
+    "chmod_file": "ask",
+    "chmod_dir": "ask",
+    "chown_file": "ask",
+    "chown_dir": "ask",
+    "mv_file": "ask",
+    "cp_file": "ask",
+    "rm_file": "ask",
+    "rm_dir": "ask",
+    "mkdir_dir": "auto",
+    "touch_file": "auto",
+    "strace_run": "ask",
+    "gdb_run": "ask",
+    "pdb_run": "ask",
+    "valgrind_run": "ask",
+    "make_run": "auto",
+    "run_script": "ask",
+    "format_code": "ask",
+    "mypy_check": "auto",
+    "python_exec": "auto",
+    "pip_tool": "ask",
+    "npm_tool": "ask",
+    "archive_extract": "ask",
+    "archive_create": "ask",
+    "archive_list": "auto",
+    "file_stat": "auto",
+    "symlink_create": "ask",
+    "readlink": "auto",
+    "patch_apply": "ask",
+    "regex_replace": "auto",
+    "bulk_replace": "auto",
+    "smart_replace": "auto",
+    "context_before_edit": "auto",
+    "pre_edit_check": "auto",
+    "tree": "auto",
+    "analyze_codebase": "auto",
+    "render_markdown": "auto",
+    "xml_format": "auto",
+    "xml_validate": "auto",
+    "gitlint_check": "auto",
+    "ansible_lint": "auto",
+    "efm_config_update": "auto",
+    "count_lines": "auto",
+    "template_fill": "auto",
+    "systemctl_status": "auto",
+    "systemctl_action": "ask",
+    "journalctl": "auto",
+    "net_interfaces": "auto",
+    "net_connections": "auto",
+    "net_ping": "auto",
+    "net_dns": "auto",
+    "disk_usage": "auto",
+    "disk_inodes": "auto",
+    "dir_size": "auto",
+    "lsblk_info": "auto",
+    "user_list": "auto",
+    "user_info": "auto",
+    "group_list": "auto",
+    "who_logged": "auto",
+    "ps_list": "auto",
+    "top_snapshot": "auto",
+    "kill_process": "ask",
+    "fw_status": "auto",
+    "fw_rules": "auto",
+    "fw_allow": "ask",
+    "fw_deny": "ask",
+    "sys_info": "auto",
+    "sys_updates": "auto",
+    "sys_logs": "auto",
+    "env_vars": "auto",
+    "cron_list": "auto",
+    "apt_update": "ask",
+    "apt_upgrade": "ask",
+    "apt_install": "ask",
+    "apt_remove": "ask",
+    "apt_search": "auto",
+    "apt_info": "auto",
+    "apt_list_installed": "auto",
+    "dnf_update": "auto",
+    "dnf_install": "ask",
+    "dnf_remove": "ask",
+    "dnf_search": "auto",
+    "dnf_info": "auto",
+    "rpm_query": "auto",
+    "extract_functions": "auto",
+    "extract_classes": "auto",
+    "extract_imports": "auto",
+    "ast_summary": "auto",
+    "todo_list": "auto",
+    "todo_add": "ask",
+    "todo_done": "auto",
+    "todo_sync": "auto",
+    "changelog_today": "auto",
+    "changelog_session": "auto",
+    "changelog_week": "auto",
+    "clipboard_copy": "auto",
+    "clipboard_paste": "auto",
+    "vault_list": "auto",
+    "vault_get": "auto",
+    "workspace_remember": "auto",
+    "mem_save": "auto",
+    "plan_create": "auto",
+    "task_done": "auto",
+    "git_blame": "auto",
+    "git_rebase": "ask",
+    "git_tag": "ask",
+    "git_cherry_pick": "ask",
+    "json_validate": "auto",
+    "yaml_validate": "auto",
+    "jq_query": "auto",
+    "encode_base64": "auto",
+    "decode_base64": "auto",
+    "url_encode": "auto",
+    "url_decode": "auto",
+    "compute_hash": "auto",
+    "to_base": "auto",
+    "format_json": "auto",
+    "escape_string": "auto",
+    "hex_encode": "auto",
+    "hex_decode": "auto",
+    "snippet_save": "auto",
+    "snippet_get": "auto",
+    "snippet_list": "auto",
+    "snippet_delete": "auto",
+    "tapo_list": "auto",
+    "tapo_status": "auto",
+    "tapo_on_off": "ask",
+    "tapo_set": "ask",
+    "blink_status": "auto",
+    "blink_arm": "ask",
+    "blink_snapshot": "ask",
+    "blink_clips": "auto",
+    "blink_verify": "auto",
+    "alexa_devices": "auto",
+    "alexa_speak": "ask",
+    "alexa_command": "ask",
+    "alexa_volume": "ask",
+    "tuya_list": "auto",
+    "tuya_status": "auto",
+    "tuya_control": "ask",
+    "ha_entities": "auto",
+    "ha_state": "auto",
+    "ha_control": "ask",
+    "ha_automation": "ask",
+    "mqtt_publish": "ask",
+    "mqtt_subscribe": "auto",
+    "esphome_list": "auto",
+    "esphome_control": "ask",
+    "iot_discover": "auto",
+    "nmap_scan": "ask",
+    "port_scan": "auto",
+    "ssl_check": "auto",
+    "whois_lookup": "auto",
+    "dns_enum": "auto",
+    "http_headers": "auto",
+    "nikto_scan": "ask",
+    "gobuster_run": "ask",
+    "curl_request": "auto",
+    "encode_decode": "auto",
+    "hash_crack": "ask",
+    "jwt_decode": "auto",
+    "cert_inspect": "auto",
+    "log_analyze": "auto",
+    "secret_scan": "auto",
+    "cve_lookup": "auto",
+    "xor_decode": "auto",
+    "steganography_check": "auto",
+    "base_convert": "auto",
+    "hex_dump": "auto",
+    "fw_audit": "auto",
+    "ssh_key_audit": "auto",
+    "sudoers_review": "auto",
+    "file_integrity_check": "auto",
+    "doc_convert": "auto",
+    "doc_project_save": "auto",
+    "doc_read": "auto"
+  },
+  "context": {
+    "minKeep": 12,
+    "compactThreshold": 0.8,
+    "maxSummaryChars": 20000,
+    "maxToolResultTokens": 20000,
+    "autoContinueMax": 12,
+    "cache_dir": "~/.oocode/cache",
+    "prompt_cache_enabled": true,
+    "prompt_cache_ttl": 3600,
+    "context_window_configurable": true,
+    "context_window_default": 262144,
+    "context_window_min": 8192,
+    "context_window_max": 262144
+  },
+  "embeddings": {
+    "model": "nomic-embed-text-v2-moe:latest",
+    "maxInputChars": 9000,
+    "similarityThreshold": 0.3,
+    "snippetChars": 1000,
+    "topK": 12,
+    "memoryEmbedEnabled": true
+  },
+  "tools": {
+    "readFileLinesDefault": 5000,
+    "readFileLinesWarnLarge": 10000,
+    "webFetchMaxChars": 100000,
+    "webFetchTimeout": 20,
+    "webSearchMaxResults": 10,
+    "bashMaxOutputChars": 1000000,
+    "codeSearchMaxResults": 800,
+    "codeSearchContextLines": 2000,
+    "codeSearchMaxFilesize": "2M",
+    "toolCacheEnabled": true,
+    "toolCacheMaxSize": 2400
+  },
+  "workspace": {
+    "maxMemoryLines": 600,
+    "maxDailyChars": 32000
+  },
+  "searxng": {
+    "url": "http://192.168.1.33:8888",
+    "enabled": true,
+    "maxResults": 8,
+    "categories": "general",
+    "language": "auto",
+    "safeSearch": 0,
+    "timeout": 30
+  },
+  "logging": {
+    "enabled": true,
+    "file": "~/.oocode/logs/oocode.log",
+    "level": "info",
+    "maxSizeMb": 5,
+    "maxFiles": 3
+  },
+  "plugins": {
+    "enabled": [
+      "changelog",
+      "clipboard",
+      "embeddings_search",
+      "lsp",
+      "searxng",
+      "test_runner",
+      "todo",
+      "tree_sitter",
+      "vault"
+    ]
+  },
+  "skills": {
+    "enabled": [
+      "converters",
+      "snippets"
+    ]
+  },
+  "appearance": {
+    "accentColor": "cyan"
+  },
+  "pluginOptions": {
+    "searxng": {
+      "enabled": true
+    },
+    "lsp": {
+      "requestTimeout": 10.0,
+      "serverCmds": {},
+      "autoStart": [
+        ".py",
+        ".js",
+        ".ts",
+        ".go",
+        ".rs",
+        ".c",
+        ".cpp",
+        ".rb",
+        ".sh",
+        ".json",
+        ".yaml",
+        ".sql",
+        ".css",
+        ".html",
+        ".xml",
+        ".md",
+        ".spec"
+      ]
+    },
+    "linter": {
+      "auto": true,
+      "maxOutput": 10000,
+      "timeout": 30
+    },
+    "git": {
+      "autostage": false,
+      "showDiff": true
+    }
+  },
+  "models": {
+    "systemOverhead": 30000,
+    "configs": {
+      "qwen3.5:9b": {
+        "contextWindow": 262144,
+        "maxTokens": 80000,
+        "params": {
+          "num_ctx": 262144,
+          "temperature": 0.5,
+          "top_k": 20,
+          "top_p": 0.95,
+          "num_predict": 80000
+        },
+        "timeoutSeconds": 900,
+        "thinking": {
+          "think_level": "off",
+          "reasoning": false
+        },
+        "input": [
+          "text",
+          "image"
+        ]
+      },
+      "nexuz/qwen3.5-agent:4b": {
+        "contextWindow": 262144,
+        "maxTokens": 80000,
+        "params": {
+          "num_ctx": 262144,
+          "num_predict": 80000,
+          "repeat_penalty": 1.15,
+          "temperature": 0.4,
+          "top_k": 20,
+          "top_p": 0.9
+        },
+        "timeoutSeconds": 900,
+        "input": [
+          "text",
+          "image"
+        ]
+      },
+      "qwen3.5:4b": {
+        "contextWindow": 262144,
+        "maxTokens": 80000,
+        "params": {
+          "num_ctx": 262144,
+          "temperature": 0.4,
+          "top_k": 20,
+          "top_p": 0.95,
+          "num_predict": 80000
+        },
+        "timeoutSeconds": 900,
+        "input": [
+          "text",
+          "image"
+        ]
+      },
+      "deepseek-r1:8b": {
+        "contextWindow": 32768,
+        "maxTokens": 12288,
+        "params": {
+          "num_ctx": 32768,
+          "temperature": 0.6,
+          "top_k": 20,
+          "top_p": 0.95,
+          "num_predict": 12288
+        },
+        "timeoutSeconds": 900,
+        "input": [
+          "text"
+        ]
+      },
+      "batiai/qwen3.5-9b:latest": {
+        "contextWindow": 262144,
+        "maxTokens": 80000,
+        "params": {
+          "num_ctx": 262144,
+          "top_p": 0.95,
+          "temperature": 0.5,
+          "top_k": 20,
+          "num_predict": 80000
+        },
+        "input": [
+          "text"
+        ],
+        "timeoutSeconds": 900,
+        "thinking": {
+          "think_level": "off",
+          "reasoning": false
+        }
+      },
+      "carstenuhlig/omnicoder-9b:latest": {
+        "contextWindow": 262144,
+        "maxTokens": 80000,
+        "params": {
+          "num_ctx": 262144,
+          "num_predict": 80000,
+          "top_k": 20,
+          "top_p": 0.95,
+          "repeat_penalty": 1.0,
+          "temperature": 0.4
+        },
+        "input": [
+          "text"
+        ],
+        "timeoutSeconds": 900,
+        "thinking": {
+          "think_level": "off",
+          "reasoning": false
+        }
+      },
+      "aratan/qwen3.5-agent-multimodal:9b": {
+        "contextWindow": 262144,
+        "maxTokens": 80000,
+        "params": {
+          "num_ctx": 262144,
+          "num_predict": 80000,
+          "temperature": 0.5,
+          "top_k": 20,
+          "top_p": 0.95
+        },
+        "input": [
+          "text",
+          "image"
+        ],
+        "timeoutSeconds": 900,
+        "thinking": {
+          "think_level": "off",
+          "reasoning": false
+        }
+      }
+    }
+  },
+  "fallback": {
+    "enabled": true,
+    "model": "nexuz/qwen3.5-agent:4b",
+    "timeoutSeconds": 900
+  },
+  "mcp": {
+    "servers": [],
+    "requestTimeout": 30.0,
+    "oocodeAssistant": {
+      "enabled": true
+    },
+    "systemAssistant": {
+      "enabled": true
+    },
+    "homeOfficeAssistant": {
+      "enabled": true
+    },
+    "securityAssistant": {
+      "enabled": true
+    },
+    "iotAssistant": {
+      "enabled": true
+    }
+  },
+  "hooks": {
+    "enabled": true,
+    "builtins": [
+      "diff_after_write",
+      "ctags_after_write",
+      "lint_after_write",
+      "quick_syntax_after_write",
+      "lsp_after_write",
+      "verify_after_edit",
+      "test_suite_delta",
+      "interface_change_detector",
+      "config_syntax_after_write",
+      "git_push_guard",
+      "backup_before_write",
+      "log_tool_calls",
+      "test_after_write",
+      "doc_validate_template_filled",
+      "deadlock_detection",
+      "dead_code_detection",
+      "performance_profiling"
+    ]
+  },
+  "snapshots": {
+    "enabled": true,
+    "maxSnapshots": 40,
+    "saveOnCompact": true
+  },
+  "rag": {
+    "enabled": true,
+    "topK": 12,
+    "similarityThreshold": 0.38,
+    "maxSnippetChars": 20000,
+    "indexInterval": 300.0,
+    "topKComplex": 25,
+    "thresholdComplex": 0.3,
+    "complexMinChars": 150
+  },
+  "vision": {
+    "enabled": true,
+    "showIndicator": true
+  },
+  "chatlog": {
+    "enabled": true,
+    "path": "~/.oocode/logs/chat.log",
+    "maxSizeMb": 10
+  }
+}

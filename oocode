@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# oocode — Ollama Open Code
+# Lanzador del CLI OOCode — funciona tanto ejecutado directamente como via symlink.
+#
+# Uso: oocode [--agent <id>] [--model <modelo>] [--host <url>] [--workspace <ruta>] [dir]
+#
+# Ejemplos:
+#   oocode                          # agente "main" desde ~/.oocode/oocode.json
+#   oocode --agent coding           # agente "coding" con su propio workspace
+#   oocode --model qwen3.5:9b       # sobreescribe el modelo para esta sesión
+#   oocode /home/user/mi-proyecto   # workspace apuntando al proyecto
+
+# readlink -f resuelve el symlink para que el directorio real del repo sea correcto
+# aunque el script esté instalado en /usr/local/bin, ~/.local/bin, etc.
+SCRIPT="$(readlink -f "${BASH_SOURCE[0]}")"
+OOCODE_DIR="$(dirname "$SCRIPT")"
+
+exec python3 "$OOCODE_DIR/oocode.py" "$@"

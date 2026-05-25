@@ -1,0 +1,192 @@
+{
+  "name": "OOCode",
+  "displayName": "OOCode",
+  "description": "Extensión para OOCode — CLI de asistencia de código local con Ollama",
+  "version": "1.0.0",
+  "publisher": "burzumishi",
+  "engines": {
+    "vscode": "^1.84.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:ooCode.status",
+    "onCommand:ooCode.models",
+    "onCommand:ooCode.models.list",
+    "onCommand:ooCode.models.select",
+    "onCommand:ooCode.hooks.list",
+    "onCommand:ooCode.hooks.enable",
+    "onCommand:ooCode.hooks.disable",
+    "onCommand:ooCode.plugins.list",
+    "onCommand:ooCode.plugins.enable",
+    "onCommand:ooCode.plugins.disable",
+    "onCommand:ooCode.subagents.list",
+    "onCommand:ooCode.subagents.spawn",
+    "onCommand:ooCode.subagents.kill",
+    "onCommand:ooCode.webserver.status",
+    "onCommand:ooCode.webserver.start",
+    "onCommand:ooCode.webserver.stop",
+    "onCommand:ooCode.commands.list",
+    "onCommand:ooCode.help"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "ooCode.status",
+        "title": "OOCode: Estado"
+      },
+      {
+        "command": "ooCode.models.list",
+        "title": "OOCode: Listar modelos"
+      },
+      {
+        "command": "ooCode.models.select",
+        "title": "OOCode: Seleccionar modelo"
+      },
+      {
+        "command": "ooCode.hooks.list",
+        "title": "OOCode: Listar hooks"
+      },
+      {
+        "command": "ooCode.hooks.enable",
+        "title": "OOCode: Activar hook"
+      },
+      {
+        "command": "ooCode.hooks.disable",
+        "title": "OOCode: Desactivar hook"
+      },
+      {
+        "command": "ooCode.plugins.list",
+        "title": "OOCode: Listar plugins"
+      },
+      {
+        "command": "ooCode.plugins.enable",
+        "title": "OOCode: Activar plugin"
+      },
+      {
+        "command": "ooCode.plugins.disable",
+        "title": "OOCode: Desactivar plugin"
+      },
+      {
+        "command": "ooCode.subagents.list",
+        "title": "OOCode: Listar subagentes"
+      },
+      {
+        "command": "ooCode.subagents.spawn",
+        "title": "OOCode: Lanzar subagente"
+      },
+      {
+        "command": "ooCode.subagents.kill",
+        "title": "OOCode: Detener subagente"
+      },
+      {
+        "command": "ooCode.webserver.status",
+        "title": "OOCode WebUI: Estado"
+      },
+      {
+        "command": "ooCode.webserver.start",
+        "title": "OOCode WebUI: Iniciar"
+      },
+      {
+        "command": "ooCode.webserver.stop",
+        "title": "OOCode WebUI: Parar"
+      },
+      {
+        "command": "ooCode.commands.list",
+        "title": "OOCode: Listar comandos"
+      },
+      {
+        "command": "ooCode.help",
+        "title": "OOCode: Ayuda"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "ooCode.status",
+          "when": "ooCodeInstalled"
+        },
+        {
+          "command": "ooCode.models.list",
+          "when": "ooCodeInstalled"
+        },
+        {
+          "command": "ooCode.models.select",
+          "when": "ooCodeInstalled"
+        },
+        {
+          "command": "ooCode.hooks.list",
+          "when": "ooCodeInstalled"
+        },
+        {
+          "command": "ooCode.hooks.enable",
+          "when": "ooCodeInstalled"
+        },
+        {
+          "command": "ooCode.hooks.disable",
+          "when": "ooCodeInstalled"
+        },
+        {
+          "command": "ooCode.plugins.list",
+          "when": "ooCodeInstalled"
+        },
+        {
+          "command": "ooCode.plugins.enable",
+          "when": "ooCodeInstalled"
+        },
+        {
+          "command": "ooCode.plugins.disable",
+          "when": "ooCodeInstalled"
+        },
+        {
+          "command": "ooCode.subagents.list",
+          "when": "ooCodeInstalled"
+        },
+        {
+          "command": "ooCode.subagents.spawn",
+          "when": "ooCodeInstalled"
+        },
+        {
+          "command": "ooCode.subagents.kill",
+          "when": "ooCodeInstalled"
+        },
+        {
+          "command": "ooCode.webserver.status",
+          "when": "ooCodeInstalled"
+        },
+        {
+          "command": "ooCode.webserver.start",
+          "when": "ooCodeInstalled"
+        },
+        {
+          "command": "ooCode.webserver.stop",
+          "when": "ooCodeInstalled"
+        },
+        {
+          "command": "ooCode.commands.list",
+          "when": "ooCodeInstalled"
+        },
+        {
+          "command": "ooCode.help",
+          "when": "ooCodeInstalled"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "generate": "vsce package"
+  },
+  "keywords": [
+    "ollama",
+    "ai",
+    "local",
+    "cli",
+    "assistant",
+    "code",
+    "llm"
+  ],
+  "author": "Antonio Cao",
+  "license": "MIT"
+}

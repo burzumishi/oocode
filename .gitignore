@@ -1,0 +1,6 @@
+__pycache__
+*.bak
+.mypy_cache
+.oocode_tags
+.ruby-lsp
+.ruff_cache
