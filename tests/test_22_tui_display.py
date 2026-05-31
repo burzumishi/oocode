@@ -87,7 +87,7 @@ class TestMakeCompactSummary:
         ]
         s = _make_compact_summary(blocks)
         assert "Read 1 file" in s
-        assert "Searched 1 pattern" in s
+        assert "Searched for 1 pattern" in s
         assert "Updated b.py" in s
         assert "Ran 1 command" in s
 
@@ -674,7 +674,7 @@ class TestTurnBlockAccumulation:
     # ── Flush produce una sola ⎿ ───────────────────────────────────────────
 
     def test_flush_produces_single_line(self):
-        """Un flush con N tools emite exactamente 1 línea ⎿."""
+        """Un flush con N tools emite exactamente 1 línea de resumen compacto."""
         loop = self._loop_with_status()
         loop._turn_block = [
             ("read_file", {"path": "a.py"}, "ok", True),
@@ -684,7 +684,7 @@ class TestTurnBlockAccumulation:
         loop._flush_turn_block()
         assert loop._print.call_count == 1
         printed = loop._print.call_args[0][0]
-        assert "⎿" in printed
+        assert "ctrl+o to expand" in printed
 
     def test_flush_merges_reads_and_searches(self):
         """Flush combina lecturas y búsquedas en un solo resumen."""

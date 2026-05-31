@@ -1,6 +1,13 @@
 {
   "ollama": {
-    "host": "http://127.0.0.1:11434"
+    "host": "http://192.168.1.33:11434",
+    "extraHosts": [
+      "http://192.168.1.42:11434"
+    ],
+    "embedHost": "http://192.168.1.42:11434",
+    "subagentRouting": "primary-only",
+    "ollamaRetryCount": 2,
+    "ollamaRetryDelay": 3.0
   },
   "agents": {
     "defaults": {
@@ -323,46 +330,55 @@
     "file_integrity_check": "auto",
     "doc_convert": "auto",
     "doc_project_save": "auto",
-    "doc_read": "auto"
+    "doc_read": "auto",
+    "xlsx_create_report": "auto",
+    "doc_fill_template": "auto",
+    "doc_fill_corporate_template": "auto",
+    "doc_read_template_fields": "auto",
+    "doc_update_section": "auto",
+    "doc_create_rfc": "auto"
   },
   "context": {
     "minKeep": 12,
-    "compactThreshold": 0.8,
+    "compactThreshold": 0.82,
     "maxSummaryChars": 20000,
-    "maxToolResultTokens": 20000,
+    "maxToolResultTokens": 16000,
     "autoContinueMax": 12,
     "cache_dir": "~/.oocode/cache",
     "prompt_cache_enabled": true,
     "prompt_cache_ttl": 3600,
     "context_window_configurable": true,
-    "context_window_default": 262144,
+    "context_window_default": 131072,
     "context_window_min": 8192,
-    "context_window_max": 262144
+    "context_window_max": 131072
   },
   "embeddings": {
     "model": "nomic-embed-text-v2-moe:latest",
-    "maxInputChars": 9000,
+    "maxInputChars": 6000,
     "similarityThreshold": 0.3,
-    "snippetChars": 1000,
-    "topK": 12,
-    "memoryEmbedEnabled": true
+    "snippetChars": 600,
+    "topK": 8,
+    "memoryEmbedEnabled": true,
+    "diskCacheEnabled": true,
+    "diskCacheDir": "~/.oocode/cache",
+    "diskCacheMaxEntries": 2000
   },
   "tools": {
-    "readFileLinesDefault": 5000,
-    "readFileLinesWarnLarge": 10000,
+    "readFileLinesDefault": 8000,
+    "readFileLinesWarnLarge": 15000,
     "webFetchMaxChars": 100000,
     "webFetchTimeout": 20,
     "webSearchMaxResults": 10,
-    "bashMaxOutputChars": 1000000,
-    "codeSearchMaxResults": 800,
+    "bashMaxOutputChars": 800000,
+    "codeSearchMaxResults": 400,
     "codeSearchContextLines": 2000,
     "codeSearchMaxFilesize": "2M",
     "toolCacheEnabled": true,
     "toolCacheMaxSize": 2400
   },
   "workspace": {
-    "maxMemoryLines": 600,
-    "maxDailyChars": 32000
+    "maxMemoryLines": 800,
+    "maxDailyChars": 20000
   },
   "searxng": {
     "url": "http://192.168.1.33:8888",
@@ -440,22 +456,25 @@
     }
   },
   "models": {
-    "systemOverhead": 30000,
+    "systemOverhead": 20000,
+    "repeatPenalty": 0.1,
+    "seed": -1,
     "configs": {
       "qwen3.5:9b": {
-        "contextWindow": 262144,
-        "maxTokens": 80000,
+        "contextWindow": 131072,
+        "maxTokens": 50000,
         "params": {
-          "num_ctx": 262144,
+          "num_ctx": 131072,
           "temperature": 0.5,
           "top_k": 20,
           "top_p": 0.95,
-          "num_predict": 80000
+          "num_predict": 50000
         },
         "timeoutSeconds": 900,
         "thinking": {
           "think_level": "off",
-          "reasoning": false
+          "reasoning": false,
+          "maxThinkingTokens": 6000
         },
         "input": [
           "text",
@@ -463,11 +482,11 @@
         ]
       },
       "nexuz/qwen3.5-agent:4b": {
-        "contextWindow": 262144,
-        "maxTokens": 80000,
+        "contextWindow": 131072,
+        "maxTokens": 50000,
         "params": {
-          "num_ctx": 262144,
-          "num_predict": 80000,
+          "num_ctx": 131072,
+          "num_predict": 50000,
           "repeat_penalty": 1.15,
           "temperature": 0.4,
           "top_k": 20,
@@ -480,14 +499,14 @@
         ]
       },
       "qwen3.5:4b": {
-        "contextWindow": 262144,
-        "maxTokens": 80000,
+        "contextWindow": 131072,
+        "maxTokens": 50000,
         "params": {
-          "num_ctx": 262144,
+          "num_ctx": 131072,
           "temperature": 0.4,
           "top_k": 20,
           "top_p": 0.95,
-          "num_predict": 80000
+          "num_predict": 50000
         },
         "timeoutSeconds": 900,
         "input": [
@@ -511,14 +530,14 @@
         ]
       },
       "batiai/qwen3.5-9b:latest": {
-        "contextWindow": 262144,
-        "maxTokens": 80000,
+        "contextWindow": 131072,
+        "maxTokens": 50000,
         "params": {
-          "num_ctx": 262144,
+          "num_ctx": 131072,
           "top_p": 0.95,
           "temperature": 0.5,
           "top_k": 20,
-          "num_predict": 80000
+          "num_predict": 50000
         },
         "input": [
           "text"
@@ -526,15 +545,16 @@
         "timeoutSeconds": 900,
         "thinking": {
           "think_level": "off",
-          "reasoning": false
+          "reasoning": false,
+          "maxThinkingTokens": 6000
         }
       },
       "carstenuhlig/omnicoder-9b:latest": {
-        "contextWindow": 262144,
-        "maxTokens": 80000,
+        "contextWindow": 131072,
+        "maxTokens": 50000,
         "params": {
-          "num_ctx": 262144,
-          "num_predict": 80000,
+          "num_ctx": 131072,
+          "num_predict": 50000,
           "top_k": 20,
           "top_p": 0.95,
           "repeat_penalty": 1.0,
@@ -546,15 +566,16 @@
         "timeoutSeconds": 900,
         "thinking": {
           "think_level": "off",
-          "reasoning": false
+          "reasoning": false,
+          "maxThinkingTokens": 6000
         }
       },
       "aratan/qwen3.5-agent-multimodal:9b": {
-        "contextWindow": 262144,
-        "maxTokens": 80000,
+        "contextWindow": 131072,
+        "maxTokens": 50000,
         "params": {
-          "num_ctx": 262144,
-          "num_predict": 80000,
+          "num_ctx": 131072,
+          "num_predict": 50000,
           "temperature": 0.5,
           "top_k": 20,
           "top_p": 0.95
@@ -566,7 +587,50 @@
         "timeoutSeconds": 900,
         "thinking": {
           "think_level": "off",
-          "reasoning": false
+          "reasoning": false,
+          "maxThinkingTokens": 6000
+        }
+      },
+      "x/flux2-klein:4b": {
+        "contextWindow": 131072,
+        "maxTokens": 50000,
+        "params": {
+          "num_ctx": 131072,
+          "num_predict": 50000,
+          "temperature": 0.7,
+          "top_k": 20,
+          "top_p": 0.95
+        },
+        "input": [
+          "text",
+          "image"
+        ],
+        "timeoutSeconds": 900,
+        "thinking": {
+          "think_level": "off",
+          "reasoning": false,
+          "maxThinkingTokens": 6000
+        }
+      },
+      "x/flux2-klein:9b": {
+        "contextWindow": 131072,
+        "maxTokens": 50000,
+        "params": {
+          "num_ctx": 131072,
+          "num_predict": 50000,
+          "temperature": 0.7,
+          "top_k": 20,
+          "top_p": 0.95
+        },
+        "input": [
+          "text",
+          "image"
+        ],
+        "timeoutSeconds": 900,
+        "thinking": {
+          "think_level": "off",
+          "reasoning": false,
+          "maxThinkingTokens": 6000
         }
       }
     }
@@ -624,11 +688,11 @@
   },
   "rag": {
     "enabled": true,
-    "topK": 12,
+    "topK": 15,
     "similarityThreshold": 0.38,
     "maxSnippetChars": 20000,
     "indexInterval": 300.0,
-    "topKComplex": 25,
+    "topKComplex": 30,
     "thresholdComplex": 0.3,
     "complexMinChars": 150
   },
@@ -640,5 +704,54 @@
     "enabled": true,
     "path": "~/.oocode/logs/chat.log",
     "maxSizeMb": 10
+  },
+  "webui": {
+    "enabled": true,
+    "host": "0.0.0.0",
+    "port": 4000,
+    "logFile": "~/.oocode/logs/webui.log",
+    "logMaxSizeMb": 5
+  },
+  "subagents": {
+    "maxConcurrent": 2,
+    "maxTeams": 1,
+    "maxTeamSize": 2,
+    "recentTtl": 1800,
+    "defaultPriority": 0
+  },
+  "backup": {
+    "enabled": true,
+    "dir": "~/.oocode/backup",
+    "maxFiles": 50,
+    "extensions": [
+      ".py",
+      ".js",
+      ".ts",
+      ".jsx",
+      ".tsx",
+      ".go",
+      ".rs",
+      ".c",
+      ".cpp",
+      ".h",
+      ".hpp",
+      ".java",
+      ".rb",
+      ".php",
+      ".cs",
+      ".sh",
+      ".bash",
+      ".pl",
+      ".pm",
+      ".sql",
+      ".md",
+      ".txt",
+      ".json",
+      ".yaml",
+      ".yml",
+      ".toml",
+      ".html",
+      ".css"
+    ]
   }
 }

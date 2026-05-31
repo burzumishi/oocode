@@ -125,10 +125,6 @@ class RuntimeSettings:
             return base + "\nMuestra tu razonamiento paso a paso."
         return base
 
-    def elevated_permissions(self) -> dict[str, str]:
-        """Obsoleto — la lógica completa vive en AgentLoop.run() usando DEFAULT_CONFIG."""
-        return {}
-
     def summary_line(self) -> str:
         parts = []
         if self.think_level != "off":

@@ -26,4 +26,23 @@ oocode = "oocode:main"
 
 [tool.setuptools]
 py-modules = ["oocode", "config"]
-packages   = ["agent", "tools", "ui", "plugins", "skills", "workspace"]
+packages   = [
+    "agent",
+    "tools",
+    "ui",
+    "plugins",
+    "skills",
+    "workspace",
+    "webui",
+    "mcp_servers",
+]
+
+[tool.setuptools.package-data]
+# catalog.json se distribuye con mcp_servers para el comando /mcp catalog
+mcp_servers = ["catalog.json"]
+# webui/static/ puede contener assets JS/CSS en el futuro
+webui = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths    = ["tests"]
+benchmark_dir = "~/.oocode/benchmarks"

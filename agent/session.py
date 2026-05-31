@@ -8,6 +8,9 @@ from typing import Optional
 from config import CONFIG_DIR
 
 SESSIONS_ROOT = CONFIG_DIR / "sessions"
+SESSIONS_ROOT.mkdir(parents=True, exist_ok=True)  # garantizar que existe al importar
+
+_RESULT_PREVIEW_CHARS = 200   # chars de preview del resultado en el log de sesión
 
 
 def _now_iso() -> str:
@@ -198,7 +201,7 @@ class SessionManager:
             "timestamp": _now_iso(),
             "name": name,
             "args": args,
-            "result_preview": result[:200],
+            "result_preview": result[:_RESULT_PREVIEW_CHARS],
         })
 
     def log_usage(self, input_tokens: int, output_tokens: int) -> None:
@@ -308,6 +311,65 @@ class SessionManager:
             "compactions": self.compaction_count,
         }
         self._index_file.write_text(json.dumps(index, indent=2, ensure_ascii=False))
+
+
+def find_last_session_with_messages(agent_id: str) -> Optional[str]:
+    """Devuelve el session_id de la sesión más reciente con mensajes de usuario/assistant."""
+    sessions_dir = SESSIONS_ROOT / agent_id
+    index_file   = sessions_dir / "sessions.json"
+    if not index_file.exists():
+        return None
+    try:
+        index = json.loads(index_file.read_text())
+    except Exception:
+        return None
+
+    # Ordenar por started_at descendente (más reciente primero)
+    entries = sorted(
+        index.values(),
+        key=lambda s: s.get("started_at", ""),
+        reverse=True,
+    )
+    for entry in entries:
+        sid = entry.get("session_id", "")
+        if not sid:
+            continue
+        jsonl = sessions_dir / f"{sid}.jsonl"
+        if not jsonl.exists():
+            continue
+        # Comprobar que tiene al menos un mensaje de conversación
+        try:
+            for line in jsonl.read_text().splitlines():
+                if not line.strip():
+                    continue
+                event = json.loads(line)
+                if event.get("type") == "message" and event.get("message", {}).get("role") in ("user", "assistant"):
+                    return sid
+        except Exception:
+            continue
+    return None
+
+
+def find_session_by_prefix(agent_id: str, prefix: str) -> Optional[str]:
+    """Devuelve el session_id completo que empieza por `prefix` (case-insensitive)."""
+    sessions_dir = SESSIONS_ROOT / agent_id
+    # Primero buscar JSONL exacto con el prefijo
+    prefix_lower = prefix.lower()
+    for jsonl in sessions_dir.glob("*.jsonl"):
+        if jsonl.stem.lower().startswith(prefix_lower):
+            return jsonl.stem
+    # Luego en el índice
+    index_file = sessions_dir / "sessions.json"
+    if not index_file.exists():
+        return None
+    try:
+        index = json.loads(index_file.read_text())
+        for sid in index:
+            if sid.lower().startswith(prefix_lower):
+                return sid
+    except Exception:
+        pass
+    return None
 
 
 def start_background_session(agent_id: str, task: str, priority: int = 0,

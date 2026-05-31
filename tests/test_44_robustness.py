@@ -60,7 +60,7 @@ def _make_loop():
     loop._turn_block_has_header = False
     loop._turn_written_scripts = set()
     loop._tool_current_file = ""
-    loop._task_modified_files = set()
+    loop._session_reads = []
     loop._task_last_test = ""
     loop._last_user_msg = ""
     return loop
@@ -170,30 +170,29 @@ class TestToolSchemaFiltering:
 # ── 2. Tracking de estado (checkpoint) ───────────────────────────────────────
 
 class TestTaskCheckpointTracking:
-    """_task_modified_files y _task_last_test se inicializan y rastrean."""
+    """_session_reads (is_edit=True) y _task_last_test se inicializan y rastrean."""
 
-    def test_init_empty_modified_files(self):
-        """El set de ficheros modificados empieza vacío."""
+    def test_init_empty_session_reads(self):
+        """La lista de lecturas/ediciones empieza vacía."""
         loop = _make_loop()
-        assert loop._task_modified_files == set()
+        assert loop._session_reads == []
 
     def test_init_empty_test_result(self):
         """El resultado de tests empieza vacío."""
         loop = _make_loop()
         assert loop._task_last_test == ""
 
-    def test_modified_files_is_set(self):
-        """_task_modified_files es un set."""
+    def test_modified_files_derived_from_session_reads(self):
+        """Los ficheros modificados se derivan de _session_reads con is_edit=True."""
         loop = _make_loop()
-        assert isinstance(loop._task_modified_files, set)
-
-    def test_can_add_to_modified_files(self):
-        """Se puede añadir rutas al set de ficheros modificados."""
-        loop = _make_loop()
-        loop._task_modified_files.add("/home/user/project/main.py")
-        loop._task_modified_files.add("/home/user/project/config.py")
-        assert len(loop._task_modified_files) == 2
-        assert "/home/user/project/main.py" in loop._task_modified_files
+        loop._session_reads = [
+            ("/home/user/project/main.py", None, True),
+            ("/home/user/project/config.py", None, True),
+            ("/home/user/project/notes.txt", 5, False),  # solo lectura
+        ]
+        edited = {p for p, _, is_edit in loop._session_reads if is_edit and p}
+        assert len(edited) == 2
+        assert "/home/user/project/main.py" in edited
 
     def test_can_set_test_result(self):
         """Se puede establecer el resultado de tests."""
@@ -214,7 +213,7 @@ class TestCheckpointHintInGuidance:
         """Sin auto-continue (count=0), no se muestra checkpoint."""
         loop = _make_loop()
         loop._auto_continue_count = 0
-        loop._task_modified_files = {"/project/loop.py"}
+        loop._session_reads = [("/project/loop.py", None, True)]
         loop._last_tool_calls = [("read_file", "{}", "ok")]
         result = self._guidance(loop)
         assert "CHECKPOINT" not in result
@@ -223,7 +222,7 @@ class TestCheckpointHintInGuidance:
         """Con auto-continue pero sin ficheros modificados, no hay checkpoint."""
         loop = _make_loop()
         loop._auto_continue_count = 2
-        loop._task_modified_files = set()
+        loop._session_reads = []
         loop._last_tool_calls = [("read_file", "{}", "ok")]
         result = self._guidance(loop)
         assert "CHECKPOINT" not in result
@@ -232,7 +231,10 @@ class TestCheckpointHintInGuidance:
         """Con auto-continue ≥1 y ficheros modificados → aparece CHECKPOINT."""
         loop = _make_loop()
         loop._auto_continue_count = 1
-        loop._task_modified_files = {"/project/agent/loop.py", "/project/config.py"}
+        loop._session_reads = [
+            ("/project/agent/loop.py", None, True),
+            ("/project/config.py", None, True),
+        ]
         loop._last_tool_calls = [("edit_file", "{}", "ok")]
         result = self._guidance(loop)
         assert "CHECKPOINT" in result
@@ -242,7 +244,7 @@ class TestCheckpointHintInGuidance:
         """Si hay resultado de tests, se incluye en el checkpoint."""
         loop = _make_loop()
         loop._auto_continue_count = 2
-        loop._task_modified_files = {"/project/main.py"}
+        loop._session_reads = [("/project/main.py", None, True)]
         loop._task_last_test = "42 passed, 0 failed"
         loop._last_tool_calls = [("run_tests", "{}", "42 passed")]
         result = self._guidance(loop)
@@ -252,7 +254,7 @@ class TestCheckpointHintInGuidance:
         """Sin resultado de tests, el checkpoint no menciona tests."""
         loop = _make_loop()
         loop._auto_continue_count = 1
-        loop._task_modified_files = {"/project/main.py"}
+        loop._session_reads = [("/project/main.py", None, True)]
         loop._task_last_test = ""
         loop._last_tool_calls = [("edit_file", "{}", "ok")]
         result = self._guidance(loop)
@@ -268,7 +270,7 @@ class TestStructuredCompaction:
     def test_state_section_present_with_modified_files(self):
         """Con ficheros modificados, el prompt de compactación los incluye."""
         loop = _make_loop()
-        loop._task_modified_files = {"/project/loop.py", "/project/config.py"}
+        loop._session_reads = [("/project/loop.py", None, True), ("/project/config.py", None, True)]
         loop._task_last_test = ""
         loop._plan_tasks = []
 
@@ -300,7 +302,7 @@ class TestStructuredCompaction:
     def test_state_section_includes_test_result(self):
         """Con resultado de tests, el prompt lo incluye."""
         loop = _make_loop()
-        loop._task_modified_files = {"/project/main.py"}
+        loop._session_reads = [("/project/main.py", None, True)]
         loop._task_last_test = "100 passed, 0 failed"
         loop._plan_tasks = []
 
@@ -331,7 +333,7 @@ class TestStructuredCompaction:
     def test_no_state_section_when_nothing_modified(self):
         """Sin ficheros modificados ni tests, no se añade sección de estado."""
         loop = _make_loop()
-        loop._task_modified_files = set()
+        loop._session_reads = []
         loop._task_last_test = ""
         loop._plan_tasks = []
 

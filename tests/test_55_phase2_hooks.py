@@ -10,32 +10,25 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 class TestPhase2Hooks:
     """Tests para los nuevos hooks de robustez y optimización."""
 
-    def test_deadlock_detection_not_implemented_yet(self):
-        """Verifica que el hook de deadlock detection está documentado pero no implementado."""
+    def test_deadlock_detection_ignores_non_write_tool(self):
+        """El hook no actúa sobre herramientas que no son de escritura."""
         from tools.hooks import _builtin_deadlock_detection
-        
-        # El hook debería existir pero retornar None
+
         result = _builtin_deadlock_detection("test_tool", {}, "result")
-        
-        # Debería retornar None (no implementado)
         assert result is None
 
-    def test_dead_code_detection_not_implemented_yet(self):
-        """Verifica que el hook de dead code detection está documentado pero no implementado."""
+    def test_dead_code_detection_ignores_non_write_tool(self):
+        """El hook no actúa sobre herramientas que no son de escritura."""
         from tools.hooks import _builtin_dead_code_detection
-        
+
         result = _builtin_dead_code_detection("test_tool", {}, "result")
-        
-        # Debería retornar None (no implementado)
         assert result is None
 
-    def test_performance_profiling_not_implemented_yet(self):
-        """Verifica que el hook de performance profiling está documentado pero no implementado."""
+    def test_performance_profiling_ignores_non_write_tool(self):
+        """El hook no actúa sobre herramientas que no son de escritura."""
         from tools.hooks import _builtin_performance_profiling
-        
+
         result = _builtin_performance_profiling("test_tool", {}, "result")
-        
-        # Debería retornar None (no implementado)
         assert result is None
 
     def test_hooks_registered_in_builtins(self):

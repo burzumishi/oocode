@@ -166,7 +166,7 @@ class TestWriteFilePrecheck:
     def test_home_project_passes(self):
         loop = _make_loop()
         result = loop._precheck_tool_call("write_file", {
-            "path": "~/myproject/src/main.py",
+            "path": "/home/user/myproject/src/main.py",
             "content": "print('hello')"
         })
         assert result is None

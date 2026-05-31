@@ -44,10 +44,10 @@ def build_search_schemas(
 ) -> list[tuple]:
     """Devuelve schemas de búsqueda con defaults inyectados desde config."""
 
-    def _web_search(query: str, max_results: int = web_search_max_results) -> str:
+    def _web_search(query: str, max_results: int = web_search_max_results, **_) -> str:
         return web_search(query, max_results)
 
-    def _web_fetch(url: str, max_chars: int = web_fetch_max_chars) -> str:
+    def _web_fetch(url: str, max_chars: int = web_fetch_max_chars, **_) -> str:
         return web_fetch(url, max_chars, timeout=web_fetch_timeout)
 
     return [

@@ -27,26 +27,27 @@ Built-in hooks disponibles (activar via config hooks.builtins):
 import fnmatch
 import re as _re
 import shutil as _shutil
+import threading
 from typing import Callable, Any, Optional
 
 
 PreHookFn  = Callable[[str, dict], Optional[dict]]   # (name, args) → args | None
 PostHookFn = Callable[[str, dict, str], Optional[str]]  # (name, args, result) → result | None
 
-# ── Redirección TUI: el loop inyecta self._print para que hooks usen el canal ─
-# Set by agent/loop.py at the start of each run(); reset to None at end.
-_hook_print_fn = None
+# Estado por hilo: cada agente/subagente tiene su propio canal de impresión y
+# sus propias estructuras de estado mutable (backup_pending, icd_snapshots).
+# Usar threading.local() evita que subagentes concurrentes se interfieran.
+_tl = threading.local()
 
 
 def set_hook_print_fn(fn) -> None:
     """Configura la función de impresión para hooks (TUI-aware). None = REPL mode."""
-    global _hook_print_fn
-    _hook_print_fn = fn
+    _tl.hook_print_fn = fn
 
 
 def _hprint(markup) -> None:
     """Imprime via el canal de hooks: self._print en TUI, console.print en REPL."""
-    fn = _hook_print_fn
+    fn = getattr(_tl, "hook_print_fn", None)
     if fn is not None:
         fn(markup)
     else:
@@ -56,7 +57,7 @@ def _hprint(markup) -> None:
 
 def _is_tui_mode() -> bool:
     """True si el agente está en modo TUI (loop gestiona el diff inline)."""
-    return _hook_print_fn is not None
+    return getattr(_tl, "hook_print_fn", None) is not None
 
 
 # ── Built-in hooks ────────────────────────────────────────────────────────────
@@ -86,7 +87,16 @@ def _is_write_tool(name: str) -> bool:
     )
 
 # Último resultado completo de lint — accesible desde ui/app.py (Ctrl+O)
+# Lock: escrito desde el hilo del agente, leído desde el hilo TUI (Ctrl+O).
 _last_lint_output: str = ""
+_last_lint_output_lock = threading.Lock()
+
+
+def get_last_lint_output() -> str:
+    """Lee _last_lint_output de forma thread-safe."""
+    with _last_lint_output_lock:
+        return _last_lint_output
+
 
 # Linters disponibles por extensión de fichero
 _LINTERS: dict[str, list[list[str]]] = {
@@ -351,8 +361,9 @@ def _builtin_lint_after_write(tool_name: str, args: dict, result: str) -> Option
     if not lint_out:
         return None
 
-    global _last_lint_output
-    _last_lint_output = lint_out
+    with _last_lint_output_lock:
+        global _last_lint_output
+        _last_lint_output = lint_out
 
     has_err = "✗" in lint_out
     if has_err:
@@ -548,12 +559,38 @@ _BACKUP_EXTS = frozenset({
     ".toml", ".html", ".css",
 })
 
-# {resolved_path_str: bak_path_str} — populated by pre, consumed by post
-_backup_pending: dict[str, str] = {}
+def _backup_pending() -> dict[str, str]:
+    """Dict por hilo: el pre-hook del backup escribe aquí, el post-hook lo limpia.
+    Thread-local para que subagentes concurrentes no se interfieran entre sí."""
+    d = getattr(_tl, "backup_pending", None)
+    if d is None:
+        _tl.backup_pending = {}
+        d = _tl.backup_pending
+    return d
+
+
+def _get_backup_dir() -> "Path":
+    """Devuelve el directorio de backups desde config, creándolo si no existe."""
+    from pathlib import Path as _Path
+    try:
+        from config import CONFIG_DIR, CONFIG_FILE
+        import json as _json
+        if CONFIG_FILE.exists():
+            _raw = _json.loads(CONFIG_FILE.read_text())
+            _bd = _raw.get("backup", {}).get("dir", "")
+            if _bd:
+                d = _Path(_bd).expanduser()
+                d.mkdir(parents=True, exist_ok=True)
+                return d
+    except Exception:
+        pass
+    d = _Path.home() / ".oocode" / "backup"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def _builtin_backup_pre(tool_name: str, args: dict) -> Optional[dict]:
-    """Pre-hook: crea copia .bak antes de modificar ficheros existentes."""
+    """Pre-hook: crea copia .bak en ~/.oocode/backup/ antes de modificar ficheros."""
     if not _is_modify_tool(tool_name):
         return args
     paths: list[str] = []
@@ -564,14 +601,17 @@ def _builtin_backup_pre(tool_name: str, args: dict) -> Optional[dict]:
         for edit in args.get("edits", []):
             if isinstance(edit, dict) and edit.get("path"):
                 paths.append(edit["path"])
+    pending = _backup_pending()
     for path in paths:
         try:
             from pathlib import Path as _Path
             src = _Path(path).expanduser().resolve()
             if src.exists() and src.suffix.lower() in _BACKUP_EXTS:
-                bak = src.with_suffix(src.suffix + ".bak")
+                backup_dir = _get_backup_dir()
+                # Nombre único: <filename>.<ext>.bak (sobreescribe la versión anterior)
+                bak = backup_dir / (src.name + ".bak")
                 _shutil.copy2(src, bak)
-                _backup_pending[str(src)] = str(bak)
+                pending[str(src)] = str(bak)
         except Exception:
             pass
     return args
@@ -579,19 +619,20 @@ def _builtin_backup_pre(tool_name: str, args: dict) -> Optional[dict]:
 
 def _builtin_backup_post(tool_name: str, args: dict, result: str) -> Optional[str]:
     """Post-hook: elimina .bak creado por el pre si la escritura tuvo éxito."""
-    if not _backup_pending:
+    pending = _backup_pending()
+    if not pending:
         return None
     failed = "Error" in result or "fallida" in result or "rollback" in result
     if failed:
-        _backup_pending.clear()
+        pending.clear()
         return None
     from pathlib import Path as _Path
-    for src_str, bak_str in list(_backup_pending.items()):
+    for src_str, bak_str in list(pending.items()):
         try:
             _Path(bak_str).unlink(missing_ok=True)
         except Exception:
             pass
-    _backup_pending.clear()
+    pending.clear()
     return None
 
 
@@ -936,7 +977,9 @@ def _builtin_test_after_write(tool_name: str, args: dict, result: str) -> Option
     Desactivado por defecto — activar con /hooks builtin test_after_write.
     Se omite automáticamente si test_suite_delta está activo (_suite_snapshot is not None).
     """
-    if _suite_snapshot is not None:
+    with _suite_snapshot_lock:
+        _snap_active = _suite_snapshot is not None
+    if _snap_active:
         return None  # test_suite_delta está activo — evitar doble ejecución
     if not _is_modify_tool(tool_name):
         return None
@@ -1069,13 +1112,17 @@ def _builtin_size_check_after_write(tool_name: str, args: dict, result: str) -> 
 
 _suite_snapshot: dict[str, str] | None = None   # {test_id: "PASSED"|"FAILED"|"ERROR"}
 _suite_workdir: str = ""
+# Lock: protege _suite_snapshot y _suite_workdir frente a acceso concurrente desde
+# múltiples subagentes (el pre-hook usa double-check para evitar captura doble).
+_suite_snapshot_lock = threading.Lock()
 
 
 def reset_suite_snapshot() -> None:
     """Resetea el baseline de la suite (llámalo en /new o cuando cambies de proyecto)."""
     global _suite_snapshot, _suite_workdir
-    _suite_snapshot = None
-    _suite_workdir = ""
+    with _suite_snapshot_lock:
+        _suite_snapshot = None
+        _suite_workdir = ""
 
 
 def _find_suite_workdir(path: str) -> str:
@@ -1135,8 +1182,10 @@ def _builtin_test_suite_delta_pre(tool_name: str, args: dict) -> dict:
     global _suite_snapshot, _suite_workdir
     if not _is_write_tool(tool_name):
         return args
-    if _suite_snapshot is not None:
-        return args  # baseline ya capturado
+    # Fast-path: baseline ya capturado (check sin lock — string read es atómico en CPython)
+    with _suite_snapshot_lock:
+        if _suite_snapshot is not None:
+            return args
 
     path = args.get("file_path") or args.get("path", "")
     if not path:
@@ -1149,17 +1198,25 @@ def _builtin_test_suite_delta_pre(tool_name: str, args: dict) -> dict:
         return args
 
     workdir = _find_suite_workdir(path)
+    # Captura fuera del lock (operación lenta: ejecuta pytest)
     captured = _run_suite_capture(workdir)
     if captured is not None:
-        _suite_snapshot = captured
-        _suite_workdir = workdir
-        try:
-            _hprint(
-                f"\n  [dim]◎  test_suite_delta: baseline "
-                f"— {len(captured)} test(s)[/dim]\n"
-            )
-        except Exception:
-            pass
+        with _suite_snapshot_lock:
+            # Double-check: otro subagente puede haber capturado mientras esperábamos
+            if _suite_snapshot is None:
+                _suite_snapshot = captured
+                _suite_workdir = workdir
+                did_capture = True
+            else:
+                did_capture = False
+        if did_capture:
+            try:
+                _hprint(
+                    f"\n  [dim]◎  test_suite_delta: baseline "
+                    f"— {len(captured)} test(s)[/dim]\n"
+                )
+            except Exception:
+                pass
     return args
 
 
@@ -1176,14 +1233,15 @@ def _builtin_test_suite_delta_post(
         return None
     if result.startswith("Error") or "rollback" in result:
         return None
-    if _suite_snapshot is None:
-        return None
+    with _suite_snapshot_lock:
+        if _suite_snapshot is None:
+            return None
+        baseline = dict(_suite_snapshot)   # copia para comparar fuera del lock
+        workdir  = _suite_workdir
 
-    current = _run_suite_capture(_suite_workdir)
+    current = _run_suite_capture(workdir)
     if current is None:
         return None
-
-    baseline = _suite_snapshot
 
     regressions = sorted(
         t for t in current
@@ -1228,12 +1286,20 @@ def _builtin_test_suite_delta_post(
 
 # ── interface_change_detector — AST signature diff + caller search ────────────
 
-_icd_snapshots: dict[str, str] = {}   # {abs_path: content_before_write}
+def _icd_snapshots() -> dict[str, str]:
+    """Dict por hilo: {abs_path: content_before_write}.
+    Thread-local para que subagentes concurrentes no compartan snapshots."""
+    d = getattr(_tl, "icd_snapshots", None)
+    if d is None:
+        _tl.icd_snapshots = {}
+        d = _tl.icd_snapshots
+    return d
 
 
 def reset_icd_snapshots() -> None:
-    """Resetea las capturas de ficheros (llámalo en /new o cuando cambies de proyecto)."""
-    _icd_snapshots.clear()
+    """Resetea las capturas del hilo actual (llámalo en /new o al cambiar de proyecto)."""
+    if hasattr(_tl, "icd_snapshots"):
+        _tl.icd_snapshots.clear()
 
 
 def _icd_sig_str(args_node) -> str:
@@ -1405,14 +1471,15 @@ def _builtin_icd_pre(tool_name: str, args: dict) -> dict:
     """Pre-hook: captura el contenido del fichero .py antes de modificarlo."""
     if not _is_write_tool(tool_name):
         return args
+    snaps = _icd_snapshots()
     for path in _icd_get_path(tool_name, args):
         from pathlib import Path as _P
         p = _P(path)
         if p.suffix.lower() != ".py" or not p.exists():
             continue
-        if path not in _icd_snapshots:
+        if path not in snaps:
             try:
-                _icd_snapshots[path] = p.read_text(errors="replace")
+                snaps[path] = p.read_text(errors="replace")
             except Exception:
                 pass
     return args
@@ -1428,8 +1495,9 @@ def _builtin_icd_post(tool_name: str, args: dict, result: str) -> Optional[str]:
     from pathlib import Path as _P
     warnings: list[str] = []
 
+    snaps = _icd_snapshots()
     for path in _icd_get_path(tool_name, args):
-        before_text = _icd_snapshots.get(path)
+        before_text = snaps.get(path)
         if before_text is None:
             continue
         p = _P(path)
@@ -1764,499 +1832,557 @@ def _builtin_doc_validate_template_filled(tool_name: str, args: dict, result: st
     return None
 
 
-# ── Hooks de la Fase 2 (documentados como no implementados aún) ──
+# ── Hooks de la Fase 2 ────────────────────────────────────────────────────────
 
 def _builtin_deadlock_detection(tool_name: str, args: dict, result: str) -> Optional[str]:
     """Post-hook: detección de deadlocks potenciales.
-    
+
     Analiza AST para detectar:
-    - Patrones de locks concurrentes (RLock, Semaphore, Lock)
-    - Llamadas recursivas profundas
-    - Condiciones de carrera potenciales
-    
+    - acquire() sin release() equivalente (excluye bloques `with` que los gestionan implícitamente)
+    - Función recursiva que mantiene un lock activo (posible deadlock con RLock)
+    - Primitiva de sincronización instanciada dentro de un bucle (Lock() nuevo en cada iteración)
+    - Módulos con ≥5 primitivas de sincronización sin orden documentado
+
     Solo actúa sobre ficheros .py con escritura exitosa.
     """
     if not _is_write_tool(tool_name):
         return None
     if "Error" in result or "fallida" in result or "rollback" in result:
         return None
-    
+
     import ast
-    import re
     from pathlib import Path as _P
-    
+
     _p = args.get("file_path") or args.get("path", "")
     if not _p:
         _edits = args.get("edits", [])
         _p = next((e.get("path", "") for e in _edits if isinstance(e, dict) and e.get("path")), "")
     if not _p or not _p.endswith(".py"):
         return None
-    
+
     try:
         content = _P(_p).read_text(encoding="utf-8")
         tree = ast.parse(content)
     except SyntaxError:
         return None
-    
+
     warnings: list[str] = []
-    
-    # 1. Detectar uso de locks (threading.Lock, RLock, Semaphore, Condition)
-    lock_patterns = [
-        r'threading\.(?:Lock|RLock|Semaphore|Condition|Barrier|Event)',
-        r'__import\("threading"\)\.(?:Lock|RLock|Semaphore|Condition)',
-    ]
-    
-    for pattern in lock_patterns:
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                if isinstance(node.func, ast.Attribute):
-                    if re.search(pattern, ast.unparse(node.func), re.IGNORECASE):
-                        warnings.append(
-                            f"  ⚠ Lock detectado: {ast.unparse(node.func)}"
-                            f" — revisa si hay adquisición múltiple no protegida."
-                        )
-    
-    # 2. Detectar llamadas recursivas profundas (más de 10 niveles)
-    MAX_RECURSION_DEPTH = 10  # Variable para documentación
-    
-    def count_recursion_depth(node: ast.AST, depth: int = 0, max_depth: int = MAX_RECURSION_DEPTH) -> int:
-        """Devuelve la profundidad máxima de recursión."""
-        if isinstance(node, ast.FunctionDef) or isinstance(node, ast.AsyncFunctionDef):
-            # Buscar llamadas a esta función dentro de sí misma
-            func_name = node.name
-            for child in ast.walk(node):
-                if isinstance(child, ast.Call):
-                    if isinstance(child.func, ast.Name) and child.func.id == func_name:
-                        return max(depth + 1, count_recursion_depth(child, depth + 1, max_depth))
-        return max_depth
-    
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            depth = count_recursion_depth(node)
-            if depth > max_depth:
-                warnings.append(
-                    f"  ⚠ Función recursiva profunda: {node.name} (profundidad: {depth})"
-                    f" — considera iteración o memoización."
-                )
-    
-    # 3. Detectar acceso a variables compartidas sin lock
-    shared_vars: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    shared_vars.add(target.id)
-    
-    for node in ast.walk(tree):
-        if isinstance(node, ast.For):
-            if isinstance(node.target, ast.Name) and node.target.id in shared_vars:
-                if isinstance(node.iter, ast.Call):
+    _LOCK_TYPES = frozenset({
+        "Lock", "RLock", "Semaphore", "BoundedSemaphore", "Condition", "Event",
+    })
+    _LOOP_TYPES = (ast.For, ast.While)
+
+    def _ids_inside_with(func_node: ast.AST) -> set[int]:
+        """Devuelve IDs de nodos que son descendientes directos de bloques `with`."""
+        inside: set[int] = set()
+        for node in ast.walk(func_node):
+            if isinstance(node, (ast.With, ast.AsyncWith)):
+                for child in ast.walk(node):
+                    if child is not node:
+                        inside.add(id(child))
+        return inside
+
+    # 1. Por función: acquire() sin release() fuera de `with`; recursión con lock
+    for func_node in ast.walk(tree):
+        if not isinstance(func_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        func_name = func_node.name
+        _in_with = _ids_inside_with(func_node)
+
+        acquires: list[int] = []
+        releases: list[int] = []
+        lock_vars: set[str] = set()
+
+        for node in ast.walk(func_node):
+            if id(node) in _in_with:
+                continue  # gestionado por el context manager — excluir
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "acquire"
+            ):
+                acquires.append(getattr(node, "lineno", 0))
+                if isinstance(node.func.value, ast.Name):
+                    lock_vars.add(node.func.value.id)
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "release"
+            ):
+                releases.append(getattr(node, "lineno", 0))
+
+        if acquires and len(acquires) > len(releases):
+            warnings.append(
+                f"  ⚠ {func_name}(): {len(acquires)} acquire() vs {len(releases)} release()"
+                f" (líneas {acquires[:3]}) — usa `with lock:` en su lugar."
+            )
+
+        # Recursión directa con lock activo (posible deadlock con RLock)
+        if lock_vars:
+            for node in ast.walk(func_node):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == func_name
+                    and node is not func_node  # no es la definición misma
+                ):
                     warnings.append(
-                        f"  ⚠ Iteración sobre variable compartida: {node.target.id}"
-                        f" — usa lock para proteger el bucle."
+                        f"  ⚠ {func_name}(): llamada recursiva directa con lock activo"
+                        f" ({', '.join(sorted(lock_vars))}) — posible deadlock con RLock."
                     )
-    
+                    break
+
+    # 2. Primitiva de sincronización instanciada dentro de un bucle
+    for loop in ast.walk(tree):
+        if not isinstance(loop, _LOOP_TYPES):
+            continue
+        loop_line = getattr(loop, "lineno", "?")
+        for node in ast.walk(loop):
+            if node is loop:
+                continue
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            name_hit = (
+                (isinstance(fn, ast.Attribute) and fn.attr in _LOCK_TYPES)
+                or (isinstance(fn, ast.Name) and fn.id in _LOCK_TYPES)
+            )
+            if name_hit:
+                lock_name = fn.attr if isinstance(fn, ast.Attribute) else fn.id
+                warnings.append(
+                    f"  ⚠ {lock_name}() instanciado en bucle (línea {loop_line})"
+                    f" — crea un nuevo lock en cada iteración, probablemente un bug."
+                )
+                break  # una advertencia por bucle
+
+    # 3. Módulo con ≥5 instanciaciones de primitivas de sincronización
+    lock_count = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            fn = node.func
+            if (isinstance(fn, ast.Attribute) and fn.attr in _LOCK_TYPES) or (
+                isinstance(fn, ast.Name) and fn.id in _LOCK_TYPES
+            ):
+                lock_count += 1
+    if lock_count >= 5:
+        warnings.append(
+            f"  ⚠ {lock_count} primitivas de sincronización en el módulo"
+            f" — documenta el orden de adquisición consistente para evitar deadlocks."
+        )
+
     if warnings:
         report = "\n[deadlock_detection] Potenciales deadlocks o condiciones de carrera:\n"
-        for w in warnings[:10]:
+        for w in warnings[:8]:
             report += w + "\n"
-        if len(warnings) > 10:
-            report += f"  … y {len(warnings) - 10} más"
+        if len(warnings) > 8:
+            report += f"  … y {len(warnings) - 8} más"
         return result + report
     return None
 
 
 def _builtin_dead_code_detection(tool_name: str, args: dict, result: str) -> Optional[str]:
     """Post-hook: detección de código no utilizado.
-    
+
     Analiza AST para detectar:
-    - Funciones/variables definidas pero nunca usadas
-    - Importaciones sin uso
-    - Códigos muertos en bloques condicionales nunca alcanzados
-    
+    - Importaciones sin uso en el módulo (respetando __all__ y TYPE_CHECKING)
+    - Bloques inalcanzables (if False:, while False:)
+    - Código inalcanzable tras return/raise/continue/break
+    - Funciones/métodos privados definidos pero nunca llamados en el mismo módulo
+
     Solo actúa sobre ficheros .py con escritura exitosa.
     """
     if not _is_write_tool(tool_name):
         return None
     if "Error" in result or "fallida" in result or "rollback" in result:
         return None
-    
+
     import ast
     from pathlib import Path as _P
-    
+
     _p = args.get("file_path") or args.get("path", "")
     if not _p:
         _edits = args.get("edits", [])
         _p = next((e.get("path", "") for e in _edits if isinstance(e, dict) and e.get("path")), "")
     if not _p or not _p.endswith(".py"):
         return None
-    
+
     try:
         content = _P(_p).read_text(encoding="utf-8")
         tree = ast.parse(content)
     except SyntaxError:
         return None
-    
+
     warnings: list[str] = []
-    
-    # 1. Detectar funciones/variables definidas pero nunca usadas
-    defined_names: set[str] = set()
-    used_names: set[str] = set()
-    
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
+
+    def _is_type_checking_block(node: ast.AST) -> bool:
+        """True si el nodo es `if TYPE_CHECKING:` o `if typing.TYPE_CHECKING:`."""
+        if not isinstance(node, ast.If):
+            return False
+        t = node.test
+        return (
+            (isinstance(t, ast.Name) and t.id == "TYPE_CHECKING")
+            or (isinstance(t, ast.Attribute) and t.attr == "TYPE_CHECKING")
+        )
+
+    def _collect_type_checking_ids(tree: ast.AST) -> set[int]:
+        """IDs de nodos que están dentro de bloques TYPE_CHECKING."""
+        inside: set[int] = set()
+        for node in ast.walk(tree):
+            if _is_type_checking_block(node):
+                for child in ast.walk(node):
+                    if child is not node:
+                        inside.add(id(child))
+        return inside
+
+    _tc_ids = _collect_type_checking_ids(tree)
+
+    # ── 1. Importaciones sin uso ──────────────────────────────────────────────
+    # Recopilar nombres importados fuera de TYPE_CHECKING
+    imported: dict[str, int] = {}  # local_name → lineno
     for node in ast.walk(tree):
-        # Registrar definiciones
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            defined_names.add(node.name)
-        elif isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    defined_names.add(target.id)
-        elif isinstance(node, ast.AnnAssign):
-            if isinstance(node.target, ast.Name):
-                defined_names.add(node.target.id)
-        elif isinstance(node, ast.NamedExpr):
-            defined_names.add(node.target.id)
-        
-        # Registrar usos (excluyendo definiciones)
-        if isinstance(node, ast.Name):
-            if node.id in defined_names:
-                # Verificar si es uso o definición
-                parent = node
-                depth = 0
-                while hasattr(parent, 'parent') if hasattr(parent, 'parent') else False:
-                    depth += 1
-                    if depth > 100:  # Evitar bucles infinitos
-                        break
-                if node.id in used_names:
-                    used_names.add(node.id)
-    
-    # 2. Detectar importaciones sin uso
-    import_nodes: list[ast.AST] = []
-    for node in ast.walk(tree):
+        if id(node) in _tc_ids:
+            continue  # import solo para type hints — no avisar
         if isinstance(node, ast.Import):
             for alias in node.names:
-                import_nodes.append(alias.name)
+                local = alias.asname if alias.asname else alias.name.split(".")[0]
+                imported[local] = node.lineno
         elif isinstance(node, ast.ImportFrom):
-            module = node.module or ""
             for alias in node.names:
-                import_nodes.append(f"{module}.{alias.name}" if module else alias.name)
-    
-    # Verificar usos de imports
-    for name in import_nodes:
-        if name not in used_names and name not in defined_names:
-            warnings.append(
-                f"  ⚠ Importación sin uso: {name}"
-                f" — considera eliminar o usar el módulo."
+                if alias.name == "*":
+                    continue
+                local = alias.asname if alias.asname else alias.name
+                imported[local] = node.lineno
+
+    # Recopilar todos los nombres usados (fuera de las propias declaraciones import)
+    used_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        if isinstance(node, ast.Name):
+            used_names.add(node.id)
+        elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            used_names.add(node.value.id)
+
+    # Añadir los nombres en __all__ como "usados" (re-exportaciones)
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(t, ast.Name) and t.id == "__all__"
+                for t in node.targets
             )
-    
-    # 3. Detectar bloques dead (if/else con código nunca alcanzado)
-    # Análisis mejorado de condiciones falsas
-    constant_false_patterns = [
-        r'if\s+False:',
-        r'if\s+0:',
-        r'if\s+\(\s*0\s*\):',
-        r'if\s+not\s+True:',
-        r'if\s+\(\s*not\s+True\s*\):',
-        r'if\s+""',
-        r"if\s+''",
-        r'if\s+None:',
-        r'if\s+\(\s*not\s+\w+\s*\):',
-    ]
-    
-    for pattern in constant_false_patterns:
-        import re
-        matches = re.findall(pattern, content)
-        for match in matches:
-            line_num = content[:content.find(match)].count('\n') + 1
+            and isinstance(node.value, (ast.List, ast.Tuple))
+        ):
+            for elt in node.value.elts:
+                if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                    used_names.add(elt.value)
+
+    for name, lineno in sorted(imported.items(), key=lambda x: x[1]):
+        if name not in used_names and not name.startswith("_"):
             warnings.append(
-                f"  ⚠ Bloque muerto en {line_num}: {match.strip()}"
-                f" — código nunca se ejecutará."
+                f"  ⚠ Import sin uso (línea {lineno}): '{name}' — considera eliminar."
             )
-    
-    # 4. Detectar funciones/variables globales sin uso (análisis más completo)
-    global_defs: set[str] = set()
-    global_uses: set[str] = set()
-    
-    # Extraer todas las definiciones globales
+
+    # ── 2. Bloques literalmente inalcanzables ────────────────────────────────
+    def _is_always_false(test: ast.AST) -> bool:
+        if isinstance(test, ast.Constant):
+            return not bool(test.value)
+        if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+            return isinstance(test.operand, ast.Constant) and bool(test.operand.value)
+        return False
+
     for node in ast.walk(tree):
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    global_defs.add(target.id)
-        elif isinstance(node, ast.AnnAssign):
-            if isinstance(node.target, ast.Name):
-                global_defs.add(node.target.id)
-        elif isinstance(node, ast.Expr):
-            if isinstance(node.value, ast.Call):
-                # Funciones globales llamadas
-                if isinstance(node.value.func, ast.Name):
-                    global_uses.add(node.value.func.id)
-        elif isinstance(node, ast.Attribute):
-            # Métodos globales llamados
-            if isinstance(node.value, ast.Name):
-                global_uses.add(node.value.id)
-    
-    # Verificar definiciones globales sin uso
-    for name in global_defs:
-        if name not in global_uses:
+        if _is_type_checking_block(node):
+            continue  # if TYPE_CHECKING: es intencional
+        if isinstance(node, ast.If) and _is_always_false(node.test):
             warnings.append(
-                f"  ⚠ Variable global definida pero nunca usada: {name}"
-                f" — considera eliminar o usar la variable."
+                f"  ⚠ Bloque muerto (línea {node.lineno}): `if {ast.unparse(node.test)}:`"
+                f" — el cuerpo nunca se ejecuta."
             )
-    
-    # 5. Detectar listas/sets/dicts vacíos o sin uso
-    empty_collections: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.List, ast.Set, ast.Dict)):
-            if len(node.elts) == 0:
-                # Buscar el nombre de la variable
-                if isinstance(node, ast.Assign):
-                    for target in node.targets:
-                        if isinstance(target, ast.Name):
-                            empty_collections.add(target.id)
-                elif isinstance(node, ast.AnnAssign):
-                    if isinstance(node.target, ast.Name):
-                        empty_collections.add(node.target.id)
-    
-    for name in empty_collections:
-        warnings.append(
-            f"  ⚠ Colección vacía definida: {name}"
-            f" — considera si realmente es necesaria."
-        )
-    
-    # 6. Detectar try/except vacío (catch-all sin manejo de excepciones)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Try):
-            if node.handlers and not any(h.type is None for h in node.handlers):
-                # Hay handlers pero no hay except: (catch-all)
-                for handler in node.handlers:
-                    if handler.type is None:
-                        warnings.append(
-                            f"  ⚠ try/except vacío en línea {node.lineno}:"
-                            f" — catch-all sin manejo de excepciones específicas."
-                        )
-    
-    # 7. Detectar if/else con else vacío
-    for node in ast.walk(tree):
-        if isinstance(node, ast.If):
-            if node.orelse and not node.orelse:
-                # else vacío
+        elif isinstance(node, ast.While) and _is_always_false(node.test):
+            warnings.append(
+                f"  ⚠ Bucle muerto (línea {node.lineno}): `while {ast.unparse(node.test)}:`"
+                f" — el cuerpo nunca se ejecuta."
+            )
+
+    # ── 3. Código inalcanzable tras return/raise/continue/break ──────────────
+    def _check_unreachable(stmts: list) -> None:
+        for i, stmt in enumerate(stmts[:-1]):
+            if isinstance(stmt, (ast.Return, ast.Raise, ast.Continue, ast.Break)):
+                nxt = stmts[i + 1]
+                # Ignorar docstrings sueltos tras return/raise (patrones legítimos)
+                if isinstance(nxt, ast.Expr) and isinstance(nxt.value, ast.Constant):
+                    continue
                 warnings.append(
-                    f"  ⚠ if sin else en línea {node.lineno}:"
-                    f" — bloque else vacío, considera eliminar."
+                    f"  ⚠ Código inalcanzable (línea {nxt.lineno}): sentencia tras"
+                    f" `{type(stmt).__name__.lower()}` nunca se ejecuta."
                 )
-    
-    # 4. Detectar código muerto en otros lenguajes
-    
-    # C/C++
-    if _p.endswith(('.c', '.h', '.cpp', '.hpp')):
-        content = _P(_p).read_text(encoding='utf-8')
-        c_warnings: list[str] = []
-        
-        # Detectar funciones no usadas (basado en includes)
-        if 'stdbool.h' in content or 'stdbool.h' in content:
-            # Verificar funciones bool usadas
-            if 'if (false)' in content.lower():
-                c_warnings.append(
-                    f"  ⚠ Código muerto en C: 'if (false)' encontrado"
-                    f" — bloque nunca se ejecutará."
-                )
-        
-        # Detectar macros sin usar
-        if '#define' in content:
-            # Verificar macros obsoletas
-            if '#define const' in content:
-                c_warnings.append(
-                    f"  ⚠ Macro obsoleta en C: '#define const' encontrado"
-                    f" — usa 'const' nativo en lugar de macro."
-                )
-        
-        if c_warnings:
-            warnings.extend(c_warnings)
-    
-    # Shell/Bash
-    elif _p.endswith('.sh'):
-        content = _P(_p).read_text(encoding='utf-8')
-        sh_warnings: list[str] = []
-        
-        # Detectar if con condiciones siempre falsas
-        if 'if [ 0 = 1 ]' in content or 'if [ false ]' in content:
-            sh_warnings.append(
-                f"  ⚠ Código muerto en Shell: 'if [ 0 = 1 ]' o similar encontrado"
-                f" — bloque nunca se ejecutará."
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            _check_unreachable(node.body)
+        if isinstance(node, (ast.For, ast.While, ast.If, ast.With)):
+            if hasattr(node, "body"):
+                _check_unreachable(node.body)
+            if getattr(node, "orelse", None):
+                _check_unreachable(node.orelse)
+        if isinstance(node, ast.Try):
+            _check_unreachable(node.body)
+            for handler in node.handlers:
+                _check_unreachable(handler.body)
+
+    # ── 4. Funciones privadas definidas pero nunca llamadas ───────────────────
+    # Solo funciones de módulo (no métodos de clase) con nombre _xxx
+    # Excluye: __dunder__, funciones marcadas con @staticmethod/@classmethod
+    # y funciones que empiezan por "_" solo si están completamente sin usar.
+    top_level_privates: dict[str, int] = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            nm = node.name
+            if nm.startswith("_") and not nm.startswith("__"):
+                top_level_privates[nm] = node.lineno
+
+    # Recopilar todas las llamadas y referencias a nombres en el árbol
+    all_called: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            fn = node.func
+            if isinstance(fn, ast.Name):
+                all_called.add(fn.id)
+            elif isinstance(fn, ast.Attribute):
+                all_called.add(fn.attr)
+        # También referencias directas como argumento (partial, callbacks)
+        if isinstance(node, ast.Name):
+            all_called.add(node.id)
+
+    for fname, flineno in top_level_privates.items():
+        if fname not in all_called:
+            warnings.append(
+                f"  ⚠ Función privada sin uso (línea {flineno}): `{fname}()`"
+                f" — nunca llamada en este módulo, considera eliminarla."
             )
-        
-        # Detectar comentarios obsoletos
-        if '# TODO' in content or '# FIXME' in content:
-            sh_warnings.append(
-                f"  ⚠ Comentarios obsoletos en Shell: TODO/FIXME encontrados"
-                f" — considera completar o eliminar."
-            )
-        
-        if sh_warnings:
-            warnings.extend(sh_warnings)
-    
-    # JavaScript
-    elif _p.endswith(('.js', '.ts', '.jsx', '.tsx')):
-        content = _P(_p).read_text(encoding='utf-8')
-        js_warnings: list[str] = []
-        
-        # Detectar if con condiciones siempre falsas
-        if 'if (false)' in content.lower():
-            js_warnings.append(
-                f"  ⚠ Código muerto en JS: 'if (false)' encontrado"
-                f" — bloque nunca se ejecutará."
-            )
-        
-        # Detectar console.log sin uso en producción
-        if 'console.log' in content and 'console.error' not in content:
-            # Verificar si hay exportaciones
-            if 'export' in content or 'module.exports' in content:
-                js_warnings.append(
-                    f"  ⚠ console.log en código exportado: considera usar logger en lugar."
-                )
-        
-        if js_warnings:
-            warnings.extend(js_warnings)
-    
-    # C# / Rust / Go / Java
-    elif _p.endswith(('.cs', '.rs', '.go', '.java')):
-        content = _P(_p).read_text(encoding='utf-8')
-        other_warnings: list[str] = []
-        
-        # Detectar if con condiciones siempre falsas
-        if 'if (false)' in content.lower() or 'if (0)' in content:
-            other_warnings.append(
-                f"  ⚠ Código muerto: 'if (false)' o 'if (0)' encontrado"
-                f" — bloque nunca se ejecutará."
-            )
-        
-        # Detectar código en bloques nunca alcanzados
-        if 'if (\'\')' in content or 'if ("" )' in content:
-            other_warnings.append(
-                f"  ⚠ Código muerto: cadena vacía en condición"
-                f" — bloque nunca se ejecutará."
-            )
-        
-        if other_warnings:
-            warnings.extend(other_warnings)
-    
+
     if warnings:
         report = "\n[dead_code_detection] Código potencialmente no utilizado:\n"
-        for w in warnings[:10]:
+        for w in warnings[:8]:
             report += w + "\n"
-        if len(warnings) > 10:
-            report += f"  … y {len(warnings) - 10} más"
+        if len(warnings) > 8:
+            report += f"  … y {len(warnings) - 8} más"
         return result + report
     return None
 
 
 def _builtin_performance_profiling(tool_name: str, args: dict, result: str) -> Optional[str]:
     """Post-hook: profiling de rendimiento.
-    
+
     Analiza AST para detectar:
-    - Operaciones costosas (list comprehensions grandes, operaciones I/O)
-    - Bucles anidados ineficientes
-    - Funciones sin cacheo (memoización)
-    - Operaciones de cadena no optimizadas
-    
+    - Bucles anidados en cualquier profundidad (complejidad O(n²) o peor)
+    - Operaciones I/O (open/read/write) dentro de bucles
+    - Concatenación de strings con += en bucles (usa list + join)
+    - Búsqueda `in` sobre lista/tupla literal grande (usa set)
+    - len() llamado ≥2 veces sobre el mismo objeto dentro del mismo bucle
+    - re.compile() o compilación de patrones costosos dentro de bucles
+    - Operaciones costosas repetidas en bucle (json.loads/dumps, sorted, etc.)
+
     Solo actúa sobre ficheros .py con escritura exitosa.
     """
     if not _is_write_tool(tool_name):
         return None
     if "Error" in result or "fallida" in result or "rollback" in result:
         return None
-    
+
     import ast
     from pathlib import Path as _P
-    
+
     _p = args.get("file_path") or args.get("path", "")
     if not _p:
         _edits = args.get("edits", [])
         _p = next((e.get("path", "") for e in _edits if isinstance(e, dict) and e.get("path")), "")
     if not _p or not _p.endswith(".py"):
         return None
-    
+
     try:
         content = _P(_p).read_text(encoding="utf-8")
         tree = ast.parse(content)
     except SyntaxError:
         return None
-    
+
     warnings: list[str] = []
-    
-    # 1. Detectar list comprehensions grandes (>100 elementos)
+
+    _LOOP_TYPES = (ast.For, ast.While)
+    _IO_ATTRS = frozenset({"read", "readline", "readlines", "write", "writelines", "seek", "flush"})
+    _IO_FUNCS = frozenset({"open", "print"})
+    # Funciones/métodos costosos que no deberían estar en el camino caliente de un bucle
+    _EXPENSIVE_ATTRS = frozenset({"compile"})     # re.compile, etc.
+    _EXPENSIVE_FUNCS = frozenset({"sorted", "reversed"})
+    _EXPENSIVE_DOTTED = frozenset({               # module.func — se detecta por .attr
+        "loads", "dumps",                         # json.loads / json.dumps
+    })
+
+    def _is_direct_child_loop(outer: ast.AST) -> list[ast.AST]:
+        """Todos los bucles anidados directamente en cualquier cuerpo del outer loop."""
+        inner: list[ast.AST] = []
+        for child in ast.walk(outer):
+            if child is outer:
+                continue
+            if isinstance(child, _LOOP_TYPES):
+                inner.append(child)
+                # No seguir bajando — el primero encontrado basta para el aviso
+                break
+        return inner
+
+    # ── 1. Bucles anidados O(n²) — busca en todo el subárbol, no sólo body ──
+    reported_loops: set[int] = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.ListComp):
-            # Contar iterables
-            iterables = sum(1 for expr in node.generators if isinstance(expr.iter, (ast.Call, ast.Name)))
-            if iterables > 2:
+        if not isinstance(node, _LOOP_TYPES) or id(node) in reported_loops:
+            continue
+        outer_line = getattr(node, "lineno", "?")
+        inner_loops = _is_direct_child_loop(node)
+        if inner_loops:
+            inner_line = getattr(inner_loops[0], "lineno", "?")
+            warnings.append(
+                f"  ⚠ Bucles anidados (líneas {outer_line}–{inner_line}):"
+                f" complejidad O(n²) — considera reformular con comprensiones o numpy."
+            )
+            reported_loops.add(id(node))
+
+    # ── 2. I/O dentro de bucles ───────────────────────────────────────────────
+    for node in ast.walk(tree):
+        if not isinstance(node, _LOOP_TYPES):
+            continue
+        lineno = getattr(node, "lineno", "?")
+        for child in ast.walk(node):
+            if child is node or not isinstance(child, ast.Call):
+                continue
+            fn = child.func
+            if isinstance(fn, ast.Attribute) and fn.attr in _IO_ATTRS:
                 warnings.append(
-                    f"  ⚠ List comprehension con {iterables} iterables — considera usar list(zip(...))"
+                    f"  ⚠ I/O en bucle (línea {lineno}): `.{fn.attr}()`"
+                    f" — precarga los datos fuera del bucle."
                 )
-    
-    # 2. Detectar operaciones I/O dentro de bucles
+                break
+            if isinstance(fn, ast.Name) and fn.id in _IO_FUNCS:
+                warnings.append(
+                    f"  ⚠ I/O en bucle (línea {lineno}): `{fn.id}()`"
+                    f" — precarga los datos fuera del bucle."
+                )
+                break
+
+    # ── 3. String += en bucle ─────────────────────────────────────────────────
+    # Solo avisa si la variable target fue inicializada a "" en el mismo ámbito,
+    # o si el valor de la augassign es claramente un string (Constant str).
+    # Esto evita falsos positivos con `total += x` (int/float).
+    def _likely_str_concat(aug: ast.AugAssign) -> bool:
+        """True si el += parece una concatenación de strings."""
+        val = aug.value
+        if isinstance(val, ast.Constant) and isinstance(val.value, str):
+            return True
+        if isinstance(val, ast.JoinedStr):  # f-string
+            return True
+        if isinstance(val, ast.Call):
+            fn = val.func
+            if isinstance(fn, ast.Name) and fn.id == "str":
+                return True
+            if isinstance(fn, ast.Attribute) and fn.attr in ("join", "format", "strip",
+                                                               "lstrip", "rstrip", "replace"):
+                return True
+        return False
+
     for node in ast.walk(tree):
-        if isinstance(node, ast.For):
-            for child in ast.walk(node):
-                if isinstance(child, ast.Call):
-                    if isinstance(child.func, ast.Attribute):
-                        if child.func.attr in ("read", "write", "open", "seek"):
-                            warnings.append(
-                                f"  ⚠ Operación I/O dentro de bucle — considera precargar datos."
-                            )
-    
-    # 3. Detectar funciones sin decorador @cache o @lru_cache
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            # Verificar si tiene decoradores de cache
-            has_cache = False
-            for decorator in node.decorator_list:
-                if isinstance(decorator, ast.Call):
-                    if isinstance(decorator.func, ast.Attribute):
-                        if decorator.func.attr in ("cache", "lru_cache"):
-                            has_cache = True
-                            break
-                elif isinstance(decorator, ast.Name):
-                    if decorator.id in ("cache", "lru_cache"):
-                        has_cache = True
-                        break
-            
-            # Si no tiene cache y tiene parámetros, advertir
-            if not has_cache and node.args.args:
-                # Verificar si es una función que probablemente debería cachearse
-                func_name = node.name
-                if any(kw in func_name.lower() for kw in ["compute", "calculate", "get", "fetch", "lookup"]):
+        if not isinstance(node, _LOOP_TYPES):
+            continue
+        loop_line = getattr(node, "lineno", "?")
+        for child in ast.walk(node):
+            if child is node:
+                continue
+            if isinstance(child, ast.AugAssign) and isinstance(child.op, ast.Add):
+                if _likely_str_concat(child):
                     warnings.append(
-                        f"  ⚠ Función {func_name} sin cacheo — considera @cache o @lru_cache."
+                        f"  ⚠ Concatenación string con `+=` en bucle"
+                        f" (línea {getattr(child, 'lineno', loop_line)}):"
+                        f" usa list.append() + ''.join() al final para O(n) vs O(n²)."
                     )
-    
-    # 4. Detectar concatenación de cadenas en bucles
+                    break
+
+    # ── 4. `x in [a, b, c, d, ...]` con 4+ elementos ────────────────────────
     for node in ast.walk(tree):
-        if isinstance(node, ast.For):
-            for child in ast.walk(node):
-                if isinstance(child, ast.BinOp) and isinstance(child.op, ast.Add):
-                    # Verificar si es concatenación de cadenas (Python 3.8+ usa ast.Constant)
-                    if isinstance(child.left, ast.Constant) and isinstance(child.right, ast.Constant):
-                        if isinstance(child.left.value, str) or isinstance(child.right.value, str):
-                            warnings.append(
-                                f"  ⚠ Concatenación de cadenas en bucle — usa f-strings o list.join()."
-                            )
-    
-    # 5. Detectar diccionarios grandes sin pre-asignación
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Dict):
-            if len(node.keys) > 100:
+        if not isinstance(node, ast.Compare):
+            continue
+        if not any(isinstance(op, ast.In) for op in node.ops):
+            continue
+        for comp in node.comparators:
+            if isinstance(comp, (ast.List, ast.Tuple)) and len(comp.elts) >= 4:
                 warnings.append(
-                    f"  ⚠ Diccionario con {len(node.keys)} elementos — considera pre-asignar."
+                    f"  ⚠ `in` sobre literal de {len(comp.elts)} elementos"
+                    f" (línea {getattr(node, 'lineno', '?')}) — usa `in {{...}}` para O(1)."
                 )
-    
+
+    # ── 5. len() repetido sobre el mismo objeto en el MISMO bucle ─────────────
+    for node in ast.walk(tree):
+        if not isinstance(node, _LOOP_TYPES):
+            continue
+        len_counts: dict[str, int] = {}
+        for child in ast.walk(node):
+            if (
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Name)
+                and child.func.id == "len"
+                and child.args
+                and isinstance(child.args[0], ast.Name)
+            ):
+                n = child.args[0].id
+                len_counts[n] = len_counts.get(n, 0) + 1
+        for name, count in len_counts.items():
+            if count >= 2:
+                loop_line = getattr(node, "lineno", "?")
+                warnings.append(
+                    f"  ⚠ len({name}) llamado {count}× en bucle (línea {loop_line})"
+                    f" — cachea: `_n = len({name})` antes del bucle."
+                )
+
+    # ── 6. re.compile() y operaciones costosas dentro de bucles ──────────────
+    for node in ast.walk(tree):
+        if not isinstance(node, _LOOP_TYPES):
+            continue
+        loop_line = getattr(node, "lineno", "?")
+        for child in ast.walk(node):
+            if child is node or not isinstance(child, ast.Call):
+                continue
+            fn = child.func
+            # re.compile(), re.match(), re.search() — siempre mejor compilar fuera
+            if isinstance(fn, ast.Attribute) and fn.attr in _EXPENSIVE_ATTRS:
+                mod = fn.value
+                mod_name = mod.id if isinstance(mod, ast.Name) else ""
+                warnings.append(
+                    f"  ⚠ `{mod_name}.{fn.attr}()` en bucle (línea {loop_line})"
+                    f" — mueve la compilación fuera del bucle para reutilizar el objeto compilado."
+                )
+                break
+            # sorted(), reversed() — pueden ser caros en cada iteración
+            if isinstance(fn, ast.Name) and fn.id in _EXPENSIVE_FUNCS:
+                warnings.append(
+                    f"  ⚠ `{fn.id}()` en bucle (línea {loop_line})"
+                    f" — si ordenas siempre la misma colección, ordena una sola vez fuera del bucle."
+                )
+                break
+            # json.loads / json.dumps dentro de bucles
+            if isinstance(fn, ast.Attribute) and fn.attr in _EXPENSIVE_DOTTED:
+                mod = fn.value
+                mod_name = mod.id if isinstance(mod, ast.Name) else ""
+                warnings.append(
+                    f"  ⚠ `{mod_name}.{fn.attr}()` en bucle (línea {loop_line})"
+                    f" — considera procesar la serialización fuera del bucle cuando sea posible."
+                )
+                break
+
     if warnings:
         report = "\n[performance_profiling] Oportunidades de optimización:\n"
-        for w in warnings[:10]:
+        for w in warnings[:8]:
             report += w + "\n"
-        if len(warnings) > 10:
-            report += f"  … y {len(warnings) - 10} más"
+        if len(warnings) > 8:
+            report += f"  … y {len(warnings) - 8} más"
         return result + report
     return None
 
@@ -2380,20 +2506,23 @@ _BUILTINS: dict[str, tuple[str, str, Any]] = {
         "*",
         _builtin_doc_validate_template_filled,
     ),
-    # Hooks de la Fase 2 (documentados como no implementados aún)
     "deadlock_detection": (
-        # Hook pendiente: requiere AST parsing para detectar deadlocks potenciales.
-        # No implementado aún — requiere análisis de llamadas recursivas y locks.
+        # Detecta acquire() sin release(), recursión con lock activo y módulos con
+        # muchas primitivas de sincronización. Desactivado por defecto.
         "post",
         "*",
         _builtin_deadlock_detection,
     ),
     "dead_code_detection": (
+        # Detecta imports sin uso, bloques `if False:` y código inalcanzable tras
+        # return/raise. Desactivado por defecto.
         "post",
         "*",
         _builtin_dead_code_detection,
     ),
     "performance_profiling": (
+        # Detecta bucles anidados O(n²), I/O en bucles, += de strings, `in lista`
+        # grande y len() repetido. Desactivado por defecto.
         "post",
         "*",
         _builtin_performance_profiling,
@@ -2501,6 +2630,7 @@ class HookManager:
 
     def run_post(self, tool_name: str, args: dict, result: str) -> str:
         """Ejecuta los post-hooks. Devuelve el resultado (posiblemente modificado)."""
+        args = dict(args)  # copia defensiva: consistente con run_pre; hooks no deben mutar args del caller
         current = result
         for pattern, fn in self._post:
             if fnmatch.fnmatch(tool_name, pattern):

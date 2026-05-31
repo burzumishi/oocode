@@ -124,7 +124,17 @@ SLASH_HELP: dict[str, dict[str, str]] = {
     },
     "Agentes y modelos": {
         "/agents":                          "Lista agentes definidos en oocode.json",
-        "/agent <id>":                      "Muestra info del agente especificado",
+        "/agent <id>":                      "Muestra info del agente especificado (workspace, modelo)",
+        "/agent new <id> [nombre] [desc]":  "Crea nuevo agente con workspace propio (usa LLM para personalizar)",
+        "/agent reset <id> [descripción]":  "Resetea workspace del agente a plantillas originales",
+        "/switch <id>":                     "Cambia el agente activo en runtime (recarga workspace y sesión)",
+        "/agent team":                      "Lista equipos de agentes (AgentTeam) persistidos",
+        "/agent team <id>":                 "Estado detallado de un equipo",
+        "/agent team create <id> <lead> <members>": "Crea equipo: lead=coding members=coding,reasoning",
+        "/agent team add <id> <tarea> <agente>":    "Añade subtask a un equipo existente",
+        "/agent team done <id> <stid> [resultado]": "Marca subtask como completada",
+        "/agent team run <id>":             "Ejecuta todas las subtasks pendientes del equipo",
+        "/agent team delete <id>":          "Elimina un equipo del disco",
         "/model [nombre]":                  "Muestra o cambia modelo principal (auto-detecta config)",
         "/model timeout [segundos]":        "Configura el timeout del modelo activo en oocode.json",
         "/model fallback [nombre]":         "Configura modelo de reserva por timeout (auto-detecta config)",
@@ -166,9 +176,15 @@ SLASH_HELP: dict[str, dict[str, str]] = {
         "/lsp restart <ext|nombre>":    "Reinicia el servidor LSP de la extensión o servidor",
         "/lsp enable <nombre>":         "Habilita el servidor en autoStart (se inicia con OOCode)",
         "/lsp disable <nombre>":        "Deshabilita el servidor del autoStart",
-        "/mcp":                   "Estado del pool MCP: servidores y tools registradas",
-        "/mcp reload <nombre>":   "Recarga la lista de tools de un servidor MCP",
-        "/mcp restart <nombre>":  "Para y reinicia un servidor MCP",
+        "/mcp":                         "Estado del pool MCP: servidores y tools registradas",
+        "/mcp catalog [query]":         "Lista servidores MCP del catálogo (filtro opcional)",
+        "/mcp install <id> [args...]":  "Añade servidor del catálogo a oocode.json y lo arranca",
+        "/mcp add <name> <cmd...>":     "Añade servidor MCP personalizado (cmd libre)",
+        "/mcp remove <nombre>":         "Elimina servidor de oocode.json",
+        "/mcp enable/disable <nombre>": "Activa/desactiva servidor en oocode.json",
+        "/mcp check <id>":              "Verifica prerequisitos del servidor en el catálogo",
+        "/mcp reload <nombre>":         "Recarga la lista de tools de un servidor MCP",
+        "/mcp restart <nombre>":        "Para y reinicia un servidor MCP",
         "/rag":                 "Estado del índice RAG del workspace",
         "/rag reindex":         "Fuerza re-indexación completa del workspace",
         "/rag enable":          "Activa la inyección RAG en el system prompt",
@@ -288,7 +304,9 @@ def handle_slash(command: str, agent_loop, config) -> bool:
 
     # ── Agentes y modelos ─────────────────────────────────────────────────────
     elif cmd in ("/agents", "/agent"):
-        _cmd_agent(args, config)
+        _cmd_agent(args, config, agent_loop)
+    elif cmd == "/switch":
+        _cmd_switch(args, config, agent_loop)
     elif cmd == "/model":
         _cmd_model(args, config, agent_loop)
     elif cmd == "/models":
@@ -544,7 +562,7 @@ def _cmd_checkpoint(agent_loop) -> None:
                 f"\n### Checkpoint manual\n{summary}\n"
             )
             console.print("  [green]✓[/green]  Checkpoint guardado en memoria diaria.")
-            console.print(f"  [dim]{summary[:200]}{'…' if len(summary) > 200 else ''}[/dim]")
+            console.print(f"  [dim]{summary}[/dim]")
         else:
             console.print("  [yellow]⚠[/yellow]  El modelo no generó resumen. Intenta de nuevo.")
     except Exception as e:
@@ -648,9 +666,10 @@ def _mem_search(query: str, memory) -> None:
         console.print("  [yellow]Uso:[/yellow]  /mem search <consulta>")
         return
     if not memory._embed or not memory._embed.is_available():
+        _em = getattr(memory._embed, "_model", "embed model") if memory._embed else "embed model"
         console.print(
-            "  [red]✗[/red]  Embeddings no disponibles. "
-            "Comprueba que nomic-embed-text-v2-moe está en el servidor Ollama."
+            f"  [red]✗[/red]  Embeddings no disponibles. "
+            f"Comprueba que [cyan]{_em}[/cyan] está en el servidor Ollama."
         )
         return
     console.print(f"  [dim cyan]Buscando: {query[:60]}…[/dim cyan]")
@@ -901,12 +920,31 @@ def _cmd_activation(args: str, rt: RuntimeSettings) -> None:
 
 # ── Agentes y modelos ─────────────────────────────────────────────────────────
 
-def _cmd_agent(args: str, config) -> None:
-    if args:
-        target = next((a for a in config.agents if a.id == args), None)
+def _cmd_agent(args: str, config, agent_loop=None) -> None:
+    parts = args.strip().split(maxsplit=1) if args.strip() else []
+
+    # ── /agent team … ────────────────────────────────────────────────────────
+    if parts and parts[0].lower() == "team":
+        _cmd_agent_team(parts[1] if len(parts) > 1 else "", config, agent_loop)
+        return
+
+    # ── /agent new <id> [nombre] [descripción] ───────────────────────────────
+    if parts and parts[0].lower() == "new":
+        _cmd_agent_new(parts[1] if len(parts) > 1 else "", config, agent_loop)
+        return
+
+    # ── /agent reset <id> [descripción] ─────────────────────────────────────
+    if parts and parts[0].lower() == "reset":
+        _cmd_agent_reset(parts[1] if len(parts) > 1 else "", config, agent_loop)
+        return
+
+    # ── /agent <id> ──────────────────────────────────────────────────────────
+    if parts:
+        target = next((a for a in config.agents if a.id == parts[0]), None)
         if not target:
             ids = ", ".join(a.id for a in config.agents)
-            console.print(f"  [red]✗[/red]  Agente [bold]{args}[/bold] no existe. Disponibles: {ids}")
+            console.print(f"  [red]✗[/red]  Agente [bold]{parts[0]}[/bold] no existe. Disponibles: {ids}")
+            console.print(f"  [dim]Crea uno nuevo con:[/dim] [cyan]/agent new <id> [nombre] [descripción][/cyan]")
             return
         console.print(
             f"  [bold cyan]{target.emoji} {target.name}[/bold cyan]  [dim]({target.id})[/dim]\n"
@@ -915,6 +953,579 @@ def _cmd_agent(args: str, config) -> None:
         )
     else:
         print_agents(config.agents, config.agent_id)
+
+
+def _emoji_for_role(desc: str) -> str:
+    """Elige emoji automáticamente según la descripción del rol."""
+    desc_l = desc.lower()
+    if any(w in desc_l for w in ("security", "seguridad", "pentest", "hacking")):
+        return "🔐"
+    if any(w in desc_l for w in ("home", "office", "ofici", "document", "excel", "word")):
+        return "🏠"
+    if any(w in desc_l for w in ("iot", "hardware", "device", "sensor", "arduino", "esp")):
+        return "⚡"
+    if any(w in desc_l for w in ("web", "frontend", "react", "vue", "html", "css")):
+        return "🌐"
+    if any(w in desc_l for w in ("data", "analysis", "analisis", "ml", "machine", "ai", "model")):
+        return "📊"
+    if any(w in desc_l for w in ("devops", "docker", "kubernetes", "deploy", "ci", "infra")):
+        return "⚙️"
+    if any(w in desc_l for w in ("test", "qa", "quality", "calidad")):
+        return "🧪"
+    if any(w in desc_l for w in ("reason", "think", "logic", "analytic", "analysis", "razon")):
+        return "🧠"
+    if any(w in desc_l for w in ("write", "writer", "doc", "text", "content", "escri")):
+        return "✍️"
+    return "🤖"
+
+
+def _cmd_agent_new(args: str, config, agent_loop=None) -> None:  # noqa: C901
+    """Crea un nuevo agente con workspace propio.
+
+    Uso: /agent new <id> [nombre] [descripción de la función]
+    """
+    import shutil
+    from config import CONFIG_DIR
+    from workspace.manager import WorkspaceManager
+
+    parts = args.strip().split(maxsplit=2) if args.strip() else []
+    if not parts:
+        console.print("  [yellow]Uso:[/yellow]  /agent new <id> [nombre] [descripción]")
+        console.print("  [dim]Ejemplo:[/dim]  /agent new devops DevOps \"gestión de infraestructura y Docker\"")
+        return
+
+    agent_id  = parts[0].strip().lower().replace(" ", "-")
+    agent_name = parts[1].strip() if len(parts) > 1 else agent_id.capitalize()
+    description = parts[2].strip() if len(parts) > 2 else ""
+
+    # Validar id
+    if not agent_id.replace("-", "").replace("_", "").isalnum():
+        console.print(f"  [red]✗[/red]  ID inválido: [bold]{agent_id}[/bold] — solo letras, números, guiones")
+        return
+    if any(a.id == agent_id for a in config.agents):
+        console.print(f"  [red]✗[/red]  Agente [bold]{agent_id}[/bold] ya existe. Usa [cyan]/agent reset {agent_id}[/cyan] para resetear.")
+        return
+
+    emoji = _emoji_for_role(description or agent_name)
+    ws_path = str(CONFIG_DIR / "workspace" / agent_id)
+
+    console.print(f"\n  Creando agente [bold cyan]{emoji} {agent_name}[/bold cyan]  [dim]({agent_id})[/dim]")
+    if description:
+        console.print(f"  [dim]Función:[/dim] {description}")
+    console.print(f"  [dim]Workspace:[/dim] {ws_path}\n")
+
+    # Crear workspace desde templates
+    ws = WorkspaceManager(
+        ws_path,
+        agent_name=agent_name,
+        agent_emoji=emoji,
+        ollama_host=config.ollama_host,
+        permissions=config.permissions,
+        max_memory_lines=config.ws_max_memory_lines,
+        max_daily_chars=config.ws_max_daily_chars,
+    )
+    created = ws.init(overwrite=False, use_examples=False)
+
+    # Si hay descripción y hay LLM disponible, personalizar con LLM
+    if description and agent_loop is not None:
+        console.print("  [dim]Consultando LLM para personalizar workspace…[/dim]")
+        try:
+            _personalize_workspace_with_llm(ws_path, agent_id, agent_name, emoji, description, config)
+        except Exception as _e:
+            console.print(f"  [yellow]⚠[/yellow]  LLM no disponible para personalización: {_e}")
+            console.print("  [dim]Workspace creado con plantillas estándar.[/dim]")
+
+    # Registrar agente en oocode.json
+    _add_agent_to_config(agent_id, agent_name, emoji, ws_path, config)
+
+    console.print(f"\n  [green]✓[/green]  Agente [bold]{agent_id}[/bold] creado — {len(created)} ficheros")
+    for f in created:
+        console.print(f"    [dim cyan]+[/dim cyan] {ws_path}/{f}")
+    console.print(f"\n  [dim]Usa[/dim] [cyan]/switch {agent_id}[/cyan] para activarlo.")
+
+
+def _cmd_agent_reset(args: str, config, agent_loop=None) -> None:  # noqa: C901
+    """Resetea el workspace de un agente a las plantillas originales.
+
+    Uso: /agent reset <id> [nueva_descripción]
+    """
+    from config import CONFIG_DIR
+    from workspace.manager import WorkspaceManager
+
+    parts = args.strip().split(maxsplit=1) if args.strip() else []
+    if not parts:
+        ids = ", ".join(a.id for a in config.agents)
+        console.print("  [yellow]Uso:[/yellow]  /agent reset <id> [nueva descripción]")
+        console.print(f"  [dim]Agentes disponibles:[/dim] {ids}")
+        return
+
+    agent_id = parts[0].strip()
+    new_desc  = parts[1].strip() if len(parts) > 1 else ""
+    target = next((a for a in config.agents if a.id == agent_id), None)
+    if not target:
+        ids = ", ".join(a.id for a in config.agents)
+        console.print(f"  [red]✗[/red]  Agente [bold]{agent_id}[/bold] no existe. Disponibles: {ids}")
+        return
+
+    console.print(
+        f"\n  [bold yellow]⚠  ¿Resetear workspace de [cyan]{target.emoji} {target.name}[/cyan]?[/bold yellow]\n"
+        f"  Esto sobreescribirá IDENTITY.md, SOUL.md, USER.md, TOOLS.md, HEARTBEAT.md y AGENTS.md.\n"
+        f"  [dim]MEMORY.md y memory/ se conservan.[/dim]\n"
+    )
+    try:
+        confirm = Prompt.ask("  Confirma", choices=["s", "n"], default="n")
+    except (KeyboardInterrupt, EOFError):
+        console.print("  Cancelado.")
+        return
+    if confirm != "s":
+        console.print("  Cancelado.")
+        return
+
+    ws = WorkspaceManager(
+        target.workspace,
+        agent_name=target.name,
+        agent_emoji=target.emoji,
+        ollama_host=config.ollama_host,
+        permissions=config.permissions,
+        max_memory_lines=config.ws_max_memory_lines,
+        max_daily_chars=config.ws_max_daily_chars,
+    )
+    desc = new_desc or f"agente {target.id}"
+    # Regenerar ficheros de identidad (overwrite=True, excepto MEMORY.md)
+    from workspace.manager import WORKSPACE_FILES, _identity, _soul, _user, _agents, _heartbeat, _tools, _memory
+    ws_path = Path(target.workspace).expanduser()
+    ws_path.mkdir(parents=True, exist_ok=True)
+    (ws_path / "memory").mkdir(exist_ok=True)
+
+    regenerated = []
+    for filename in WORKSPACE_FILES:
+        if filename == "MEMORY.md":
+            continue  # Preservar memoria
+        fpath = ws_path / filename
+        old_content = fpath.read_text() if fpath.exists() else ""
+        if filename == "IDENTITY.md":
+            content = _identity(target.name, target.emoji)
+        elif filename == "SOUL.md":
+            content = _soul(target.name)
+        elif filename == "USER.md":
+            content = _user()
+        elif filename == "AGENTS.md":
+            content = _agents(target.name, target.workspace)
+        elif filename == "HEARTBEAT.md":
+            content = _heartbeat()
+        elif filename == "TOOLS.md":
+            content = _tools(target.name, config.ollama_host, config.permissions)
+        else:
+            continue
+        fpath.write_text(content)
+        if content != old_content:
+            regenerated.append((filename, old_content, content))
+
+    # Mostrar diffs de los ficheros cambiados
+    if regenerated:
+        import difflib
+        console.print()
+        for fname, old_c, new_c in regenerated:
+            old_lines = old_c.splitlines(keepends=True)
+            new_lines = new_c.splitlines(keepends=True)
+            diff = list(difflib.unified_diff(old_lines, new_lines,
+                                             fromfile=f"{fname} (antes)",
+                                             tofile=f"{fname} (después)",
+                                             n=1))
+            if diff:
+                console.print(f"  [bold dim]  {fname}[/bold dim]")
+                for dl in diff[:40]:  # máx 40 líneas por fichero para no saturar
+                    dl_s = dl.rstrip("\n")
+                    if dl_s.startswith("+++") or dl_s.startswith("---"):
+                        console.print(f"    [dim]{dl_s}[/dim]")
+                    elif dl_s.startswith("+"):
+                        console.print(f"    [green]{dl_s}[/green]")
+                    elif dl_s.startswith("-"):
+                        console.print(f"    [red]{dl_s}[/red]")
+                    elif dl_s.startswith("@@"):
+                        console.print(f"    [dim cyan]{dl_s}[/dim cyan]")
+                    else:
+                        console.print(f"    [dim]{dl_s}[/dim]")
+                if len(diff) > 40:
+                    console.print(f"    [dim](… {len(diff)-40} líneas más)[/dim]")
+        console.print()
+
+    # Si hay descripción y LLM disponible, personalizar
+    if new_desc and agent_loop is not None:
+        console.print("  [dim]Consultando LLM para personalizar workspace…[/dim]")
+        try:
+            _personalize_workspace_with_llm(target.workspace, agent_id, target.name, target.emoji, new_desc, config)
+        except Exception as _e:
+            console.print(f"  [yellow]⚠[/yellow]  LLM no disponible: {_e}")
+
+    console.print(f"\n  [green]✓[/green]  Workspace de [bold]{agent_id}[/bold] reseteado")
+    for fname, _, _ in regenerated:
+        console.print(f"    [dim yellow]↻[/dim yellow] {fname}")
+    if not regenerated:
+        console.print("  [dim]Sin cambios (los ficheros ya eran los predeterminados).[/dim]")
+
+
+def _personalize_workspace_with_llm(
+    ws_path: str, agent_id: str, agent_name: str, emoji: str,
+    description: str, config
+) -> None:
+    """Llama al LLM para personalizar los ficheros del workspace según la descripción del agente."""
+    prompt = (
+        f"Eres un asistente de configuración de OOCode. Genera el contenido personalizado para un agente con:\n"
+        f"- ID: {agent_id}\n"
+        f"- Nombre: {agent_name}\n"
+        f"- Emoji: {emoji}\n"
+        f"- Función/Descripción: {description}\n\n"
+        f"Genera los siguientes ficheros de workspace en formato Markdown. "
+        f"Sé conciso, práctico y especializado en la función indicada.\n\n"
+        f"Responde con exactamente este formato (usa los separadores exactos):\n\n"
+        f"===IDENTITY.md===\n"
+        f"[contenido de IDENTITY.md personalizado para este agente]\n\n"
+        f"===SOUL.md===\n"
+        f"[contenido de SOUL.md con la personalidad y enfoque del agente]\n\n"
+        f"===HEARTBEAT.md===\n"
+        f"[contenido de HEARTBEAT.md con tareas de mantenimiento relevantes para este agente]\n\n"
+        f"===TOOLS.md===\n"
+        f"[sección inicial de TOOLS.md con notas de entorno específicas para este agente]\n"
+    )
+    client = ollama.Client(host=config.ollama_host)
+    resp = client.chat(
+        model=config.model or "qwen3:latest",
+        messages=[{"role": "user", "content": prompt}],
+        options={"temperature": 0.7, "num_predict": 2000},
+    )
+    content = resp.get("message", {}).get("content", "") if isinstance(resp, dict) else resp.message.content
+
+    # Parsear respuesta y escribir ficheros
+    ws = Path(ws_path)
+    sections = {"IDENTITY.md": "", "SOUL.md": "", "HEARTBEAT.md": "", "TOOLS.md": ""}
+    current = None
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("===") and stripped.endswith("==="):
+            fname = stripped[3:-3].strip()
+            if fname in sections:
+                current = fname
+                continue
+        if current:
+            sections[current] += line + "\n"
+
+    for fname, body in sections.items():
+        body = body.strip()
+        if body and len(body) > 50:  # solo escribir si hay contenido real
+            (ws / fname).write_text(body + "\n")
+            console.print(f"    [dim green]✦[/dim green] {fname} personalizado por LLM")
+
+
+def _add_agent_to_config(agent_id: str, agent_name: str, emoji: str, ws_path: str, config) -> None:
+    """Añade el nuevo agente a ~/.oocode/oocode.json."""
+    from config import CONFIG_FILE
+    raw = json.loads(CONFIG_FILE.read_text()) if CONFIG_FILE.exists() else {}
+    agents_sec = raw.setdefault("agents", {})
+    agents_list = agents_sec.setdefault("list", [])
+    # Evitar duplicados
+    if not any(a.get("id") == agent_id for a in agents_list):
+        agents_list.append({
+            "id":        agent_id,
+            "name":      agent_name,
+            "emoji":     emoji,
+            "workspace": ws_path,
+        })
+    CONFIG_FILE.write_text(json.dumps(raw, indent=2, ensure_ascii=False))
+    # Actualizar la lista en el config en memoria
+    from config import AgentDef
+    from pathlib import Path as _P
+    new_def = AgentDef(id=agent_id, name=agent_name, emoji=emoji, workspace=ws_path)
+    if not any(a.id == agent_id for a in config.agents):
+        config.agents.append(new_def)
+
+
+def _cmd_switch(args: str, config, agent_loop) -> None:
+    """Cambia el agente activo en runtime recargando workspace, sesión y memoria."""
+    from config import OOConfig, MEMORY_DIR
+    from workspace.manager import WorkspaceManager
+    from agent.session import SessionManager
+    from agent.memory import MemorySystem
+    from agent.embeddings import EmbeddingClient
+
+    if not args.strip():
+        ids = ", ".join(a.id for a in config.agents)
+        console.print(f"  [yellow]Uso:[/yellow]  /switch <id>   Disponibles: {ids}")
+        return
+
+    new_id = args.strip().split()[0]
+    target = next((a for a in config.agents if a.id == new_id), None)
+    if not target:
+        ids = ", ".join(a.id for a in config.agents)
+        console.print(f"  [red]✗[/red]  Agente [bold]{new_id}[/bold] no existe. Disponibles: {ids}")
+        return
+
+    if new_id == config.agent_id:
+        console.print(f"  [dim]Ya estás en el agente [bold]{new_id}[/bold][/dim]")
+        return
+
+    # Guardar sesión actual antes de cambiar
+    try:
+        agent_loop.session.end()
+    except Exception:
+        pass
+
+    # Cargar config del nuevo agente
+    new_cfg = OOConfig.load(agent_id=new_id)
+
+    # Crear nuevo WorkspaceManager
+    new_ws = WorkspaceManager(
+        new_cfg.workspace,
+        new_cfg.agent_name,
+        new_cfg.agent_emoji,
+        ollama_host=new_cfg.ollama_host,
+        permissions=new_cfg.permissions,
+        max_memory_lines=new_cfg.ws_max_memory_lines,
+        max_daily_chars=new_cfg.ws_max_daily_chars,
+    )
+    if not new_ws.exists():
+        created = new_ws.init()
+        console.print(f"  [green]✓[/green]  Workspace inicializado: {', '.join(created)}")
+
+    # Crear nueva sesión y memoria para el nuevo agente
+    new_session = SessionManager(new_id)
+    agent_memory_dir = MEMORY_DIR / new_id
+    agent_memory_dir.mkdir(parents=True, exist_ok=True)
+    embed_client = EmbeddingClient(
+        host=new_cfg.ollama_host,
+        model=new_cfg.embed_model,
+        max_input_chars=new_cfg.embed_max_input_chars,
+        disk_cache_enabled=new_cfg.embed_disk_cache_enabled,
+        disk_cache_dir=new_cfg.embed_disk_cache_dir,
+        disk_cache_max=new_cfg.embed_disk_cache_max,
+        ram_cache_max=new_cfg.embed_ram_cache_max,
+    )
+    new_memory = MemorySystem(
+        embed_client=embed_client if new_cfg.memory_embed_enabled else None,
+        similarity_threshold=new_cfg.embed_similarity_threshold,
+        snippet_chars=new_cfg.embed_snippet_chars,
+        top_k=new_cfg.embed_top_k,
+        memory_dir=agent_memory_dir,
+    )
+
+    # Actualizar agent_loop con el nuevo agente
+    agent_loop.config  = new_cfg
+    agent_loop.ws      = new_ws
+    agent_loop.session = new_session
+    agent_loop.memory  = new_memory
+
+    # Resetear contexto para empezar limpio con el nuevo agente
+    agent_loop.context.clear()
+    agent_loop._last_response  = ""
+    agent_loop._last_tool_calls = []
+    agent_loop._turn_mem_snippet = None
+    agent_loop._turn_rag_snippet = None
+
+    # Actualizar config global para el REPL (la referencia compartida)
+    for attr in ("agent_id", "agent_name", "agent_emoji", "model", "workspace",
+                 "agent_instructions", "ollama_host"):
+        setattr(config, attr, getattr(new_cfg, attr))
+
+    # Iniciar nueva sesión
+    new_ws.mark_new_session()
+    new_session.start(new_cfg.model or "", new_cfg.workspace)
+
+    console.print(
+        f"\n  [bold cyan]{target.emoji} Cambiado a {target.name}[/bold cyan]  "
+        f"[dim]({new_id})[/dim]\n"
+        f"  [dim]workspace:[/dim] {target.workspace}\n"
+        f"  [dim]modelo:[/dim]    {target.model or '(heredado)'}\n"
+    )
+
+
+def _cmd_agent_team(args: str, config, agent_loop=None) -> None:  # noqa: C901
+    """Gestión de AgentTeams: list, status, create, add, done, run, delete."""
+    from agent.tasks import (
+        AgentTeam, create_team, load_team, add_subtask as _add_subtask,
+        complete_subtask as _complete_subtask, get_team_status,
+        list_teams, delete_team,
+    )
+    from rich.table import Table
+    from rich import box as rbox
+
+    parts = args.strip().split(maxsplit=1) if args.strip() else []
+    sub   = parts[0].lower() if parts else "list"
+    rest  = parts[1] if len(parts) > 1 else ""
+
+    STATUS_STYLE = {"idle": "dim", "active": "bold green", "completed": "cyan", "failed": "bold red"}
+    STATUS_ICON  = {"idle": "·", "active": "⚡", "completed": "✓", "failed": "✗"}
+
+    # ── list ──────────────────────────────────────────────────────────────────
+    if sub in ("", "list"):
+        teams = list_teams()
+        console.print()
+        if not teams:
+            console.print("  [dim]No hay equipos de agentes creados.[/dim]")
+            console.print("  [dim]Usa[/dim] [cyan]/agent team create <id> <lead> <miembros>[/cyan]")
+            console.print()
+            return
+        t = Table(box=rbox.SIMPLE, show_header=True, padding=(0, 1))
+        t.add_column("ID",       style="bold cyan", width=28)
+        t.add_column("Lead",     style="white",      width=12)
+        t.add_column("Miembros", style="dim",         width=24)
+        t.add_column("Estado",   style="bold",        width=12)
+        t.add_column("Subtasks", style="dim",         width=10, justify="right")
+        for team in teams:
+            col  = STATUS_STYLE.get(team["status"], "dim")
+            icon = STATUS_ICON.get(team["status"], "·")
+            pending_str = f"[yellow]{team['pending']} pendientes[/yellow]" if team["pending"] else "—"
+            t.add_row(
+                team["team_id"],
+                team["lead"],
+                ", ".join(team["members"]),
+                f"[{col}]{icon} {team['status']}[/{col}]",
+                f"{team['subtasks']} ({pending_str})",
+            )
+        console.print(t)
+        console.print("  [dim]→  /agent team <id>  ·  /agent team run <id>  ·  /agent team delete <id>[/dim]")
+        console.print()
+        return
+
+    # ── create <id> <lead> <members> ─────────────────────────────────────────
+    if sub == "create":
+        cparts = rest.strip().split(maxsplit=2)
+        if len(cparts) < 2:
+            console.print("  [yellow]Uso:[/yellow]  /agent team create <id> <lead> [miembro1,miembro2]")
+            return
+        team_id = cparts[0]
+        lead    = cparts[1]
+        members = [m.strip() for m in cparts[2].split(",")] if len(cparts) > 2 else [lead]
+        valid   = [a.id for a in config.agents]
+        bad     = [m for m in [lead] + members if m not in valid]
+        if bad:
+            console.print(
+                f"  [red]✗[/red]  Agentes desconocidos: {', '.join(bad)}\n"
+                f"  [dim]Disponibles: {', '.join(valid)}[/dim]"
+            )
+            return
+        create_team(team_id, lead, list(dict.fromkeys([lead] + members)))
+        console.print(
+            f"  [green]✓[/green]  Equipo [bold cyan]{team_id}[/bold cyan] creado.\n"
+            f"  [dim]Lead: {lead} | Miembros: {', '.join(members)}[/dim]\n"
+            f"  [dim]→  /agent team add {team_id} <tarea> <agente>[/dim]"
+        )
+        return
+
+    # ── add <id> <tarea> <agente> ─────────────────────────────────────────────
+    if sub == "add":
+        aparts = rest.strip().split(maxsplit=2)
+        if len(aparts) < 3:
+            console.print("  [yellow]Uso:[/yellow]  /agent team add <id> <descripción tarea> <agente>")
+            return
+        team_id, description, assignee = aparts[0], aparts[1], aparts[2]
+        result = _add_subtask(team_id, description, assignee)
+        if "error" in result:
+            console.print(f"  [red]✗[/red]  {result['error']}")
+            return
+        console.print(
+            f"  [green]✓[/green]  Subtask [bold cyan]{result['id']}[/bold cyan] añadida.\n"
+            f"  [dim]→ {description} [asignada: {assignee}][/dim]"
+        )
+        return
+
+    # ── done <id> <subtask_id> [resultado] ───────────────────────────────────
+    if sub == "done":
+        dparts = rest.strip().split(maxsplit=2)
+        if len(dparts) < 2:
+            console.print("  [yellow]Uso:[/yellow]  /agent team done <team-id> <subtask-id> [resultado]")
+            return
+        team_id   = dparts[0]
+        subtask_id = dparts[1]
+        result_str = dparts[2] if len(dparts) > 2 else "completado manualmente"
+        r = _complete_subtask(team_id, subtask_id, result_str)
+        if "error" in r:
+            console.print(f"  [red]✗[/red]  {r['error']}")
+            return
+        console.print(f"  [green]✓[/green]  Subtask [bold cyan]{subtask_id}[/bold cyan] completada.")
+        return
+
+    # ── run <id> ──────────────────────────────────────────────────────────────
+    if sub == "run":
+        team_id = rest.strip().split()[0] if rest.strip() else ""
+        if not team_id:
+            console.print("  [yellow]Uso:[/yellow]  /agent team run <id>")
+            return
+        runner = getattr(agent_loop, "subagent_runner", None) if agent_loop else None
+        if runner is None:
+            console.print("  [red]✗[/red]  SubAgentRunner no disponible en este contexto.")
+            return
+        from agent.tasks import _load_team_obj as _lt
+        team = _lt(team_id)
+        if team is None:
+            console.print(f"  [red]✗[/red]  Equipo [bold]{team_id}[/bold] no encontrado.")
+            return
+        pending = team.get_pending_subtasks()
+        if not pending:
+            console.print(f"  [dim]Equipo [bold]{team_id}[/bold] no tiene subtasks pendientes.[/dim]")
+            return
+        console.print(
+            f"  [bold cyan]⚡  Ejecutando equipo {team_id}[/bold cyan]  "
+            f"[dim]{len(pending)} subtask(s) pendiente(s)[/dim]"
+        )
+        results = team.execute(runner)
+        console.print()
+        for st_id, res in results.items():
+            icon = "[red]✗[/red]" if res.startswith("[error]") else "[green]✓[/green]"
+            preview = res[:80].strip()
+            console.print(f"  {icon}  [dim]{st_id}[/dim]  {preview}")
+        console.print()
+        return
+
+    # ── delete <id> ──────────────────────────────────────────────────────────
+    if sub == "delete":
+        team_id = rest.strip().split()[0] if rest.strip() else ""
+        if not team_id:
+            console.print("  [yellow]Uso:[/yellow]  /agent team delete <id>")
+            return
+        if delete_team(team_id):
+            console.print(f"  [green]✓[/green]  Equipo [bold cyan]{team_id}[/bold cyan] eliminado.")
+        else:
+            console.print(f"  [red]✗[/red]  Equipo [bold]{team_id}[/bold] no encontrado.")
+        return
+
+    # ── <id> → detalle del equipo ─────────────────────────────────────────────
+    status_data = get_team_status(sub)
+    if "error" in status_data:
+        console.print(f"  [red]✗[/red]  {status_data['error']}")
+        console.print("  [dim]Subcomandos disponibles: list | create | add | done | run | delete[/dim]")
+        return
+
+    team_data = load_team(sub)
+    col  = STATUS_STYLE.get(status_data["status"], "dim")
+    icon = STATUS_ICON.get(status_data["status"], "·")
+    console.print()
+    console.print(
+        f"  [bold cyan]{sub}[/bold cyan]  "
+        f"[{col}]{icon} {status_data['status']}[/{col}]"
+    )
+    console.print(f"  [dim]Lead:[/dim] {status_data['lead']}  [dim]Miembros:[/dim] {', '.join(status_data['members'])}")
+    console.print(
+        f"  [dim]Subtasks:[/dim] {status_data['completed_subtasks']} completadas / "
+        f"[yellow]{status_data['pending_subtasks']} pendientes[/yellow]"
+    )
+
+    if team_data and team_data.get("subtasks"):
+        console.print()
+        t = Table(box=rbox.SIMPLE, show_header=True, padding=(0, 1))
+        t.add_column("ID",       style="bold cyan", width=10)
+        t.add_column("Agente",   style="white",      width=12)
+        t.add_column("Estado",   style="bold",        width=12)
+        t.add_column("Tarea",    style="dim",         width=50)
+        for st in team_data["subtasks"]:
+            sc   = STATUS_STYLE.get(st["status"], "dim")
+            si   = STATUS_ICON.get(st["status"], "·")
+            task = st["description"]
+            t.add_row(st["id"], st.get("assign_to", "?"), f"[{sc}]{si} {st['status']}[/{sc}]", task)
+        console.print(t)
+
+    if status_data["pending_subtasks"] > 0:
+        console.print(f"  [dim]→  /agent team run {sub}  para ejecutar subtasks pendientes[/dim]")
+    console.print()
 
 
 def _detect_input_types(minfo: dict, model_name: str) -> list[str]:
@@ -1396,13 +2007,12 @@ def _cmd_subagents(args: str, agent_loop, config) -> None:
             t.add_column("Steers",  style="dim",         width=7,  justify="right")
             t.add_column("Tarea",   style="dim",         width=52)
             for s in running:
-                task_short = (s.task[:50] + "…") if len(s.task) > 50 else s.task
                 t.add_row(
                     s.short_id(),
                     f"{s.agent_emoji} {s.agent_name}",
                     f"{s.elapsed():.0f}s",
                     str(s.steer_count) if s.steer_count else "—",
-                    task_short,
+                    s.task,
                 )
             console.print(t)
 
@@ -1423,14 +2033,13 @@ def _cmd_subagents(args: str, agent_loop, config) -> None:
                 col  = STATUS_STYLE.get(s.status, "dim")
                 icon = STATUS_ICON.get(s.status, "·")
                 ago  = _fmt_ago(s.finished_ago() or 0)
-                task_short = (s.task[:38] + "…") if len(s.task) > 38 else s.task
                 t2.add_row(
                     s.short_id(),
                     f"{s.agent_emoji} {s.agent_name}",
                     f"[{col}]{icon} {s.status}[/{col}]",
                     f"{s.elapsed():.0f}s",
                     ago,
-                    task_short,
+                    s.task,
                 )
             console.print(t2)
 
@@ -1571,7 +2180,7 @@ def _cmd_subagents(args: str, agent_loop, config) -> None:
 def _cmd_crestodian(args: str, agent_loop, config) -> None:
     """Gestor del workspace: muestra y permite editar ficheros de identidad."""
     from workspace.manager import WORKSPACE_FILES
-    ws_path = Path(config.workspace)
+    ws_path = Path(config.workspace).expanduser()
 
     if not args:
         console.print()
@@ -1625,7 +2234,7 @@ def _cmd_resume(agent_loop) -> None:
             ctx.summary = ctx.summary[-ctx.max_summary_chars:]
         ctx.messages.clear()
         console.print("  [green]✓[/green]  Conversación resumida y contexto limpiado.")
-        console.print(f"  [dim]{summary[:300]}{'…' if len(summary) > 300 else ''}[/dim]")
+        console.print(f"  [dim]{summary}[/dim]")
         console.print("  [dim](El resumen se inyecta en el próximo turno)[/dim]")
     except Exception as e:
         console.print(f"  [red]✗[/red]  Error: {e}")
@@ -1755,6 +2364,8 @@ def _cmd_btw(args: str, agent_loop) -> None:
         min_keep=cfg.compact_min_keep,
         compact_threshold=cfg.compact_threshold,
         max_summary_chars=cfg.max_summary_chars,
+        high_water=cfg.context_high_water,
+        tool_max_chars=cfg.context_tool_max_chars,
     )
     console.print(f"  [dim cyan]↯ btw:[/dim cyan]  [dim]{args[:80]}[/dim]")
     try:
@@ -2267,6 +2878,455 @@ _REQUIRED_PACKAGES = [
     "cryptography",
 ]
 
+# ── WebUI ────────────────────────────────────────────────────────────────
+_WEBUI_PACKAGES = [
+    "flask", "werkzeug",
+]
+
+# ── Home Office O365 Python packages ─────────────────────────────────────
+_HO_PY_PKGS_ALL = [
+    ("openpyxl",    ["openpyxl"],           "openpyxl",     "Home Office — hojas Excel            pip install openpyxl"),
+    ("docx",        ["python-docx"],        "docx",         "Home Office — documentos .docx       pip install python-docx"),
+    ("pptx",        ["python-pptx"],        "pptx",         "Home Office — presentaciones .pptx   pip install python-pptx"),
+    ("matplotlib",  ["matplotlib"],         "matplotlib",   "Home Office — gráficas dinámicas     pip install matplotlib"),
+    ("markdown",    ["Markdown","markdown"],"markdown",     "Home Office — Markdown→HTML          pip install markdown"),
+]
+
+
+def run_doctor_standalone(config) -> bool:  # noqa: C901
+    """Doctor sin agent_loop — para oocode --doctor antes de entrar al REPL."""
+    import importlib.metadata
+    import shutil as _sh
+    from pathlib import Path as _P
+
+    console.print()
+    console.rule("[bold cyan]OOCode Doctor — Diagnóstico del sistema[/bold cyan]", style="blue")
+    console.print()
+
+    checks: list[tuple[str, str, str]] = []
+
+    def ok(s: str, m: str)   -> None: checks.append((s, "ok",   m))
+    def warn(s: str, m: str) -> None: checks.append((s, "warn", m))
+    def fail(s: str, m: str) -> None: checks.append((s, "fail", m))
+
+    def _which(cmd): return _sh.which(cmd)
+
+    # ── Ollama ─────────────────────────────────────────────────────────────────
+    import ollama as _oll  # siempre disponible (está en _REQUIRED_PACKAGES)
+    _mn: list[str] = []
+    try:
+        _cl = _oll.Client(host=config.ollama_host)
+        _d  = _cl.list()
+        _ms = _d.get("models", []) if isinstance(_d, dict) else list(_d.models)
+        _mn = [(m.model if hasattr(m, "model") else m["name"]) for m in _ms]
+        ok("Ollama", f"Conectado en {config.ollama_host}  ({len(_mn)} modelos)")
+        if config.model:
+            if config.model in _mn:
+                ok("Ollama", f"Modelo [cyan]{config.model}[/cyan] disponible")
+            else:
+                fail("Ollama", f"Modelo configurado no encontrado: {config.model}")
+        else:
+            warn("Ollama", "Sin modelo configurado — usa /model")
+        if config.embed_model in _mn:
+            ok("Ollama", f"Embeddings [cyan]{config.embed_model}[/cyan] disponible")
+        else:
+            warn("Ollama", f"Embedding model no encontrado: {config.embed_model}  "
+                           f"[dim](ollama pull {config.embed_model})[/dim]")
+        if config.fallback_active_config:
+            if config.fallback_model in _mn:
+                ok("Ollama", f"Fallback [cyan]{config.fallback_model}[/cyan] disponible  "
+                             f"[dim](timeout {config.fallback_timeout}s)[/dim]")
+            else:
+                fail("Ollama", f"Fallback model no encontrado: {config.fallback_model}")
+        elif config.fallback_model:
+            warn("Ollama", f"Fallback configurado pero desactivado: {config.fallback_model}")
+        if config.ollama_embed_host:
+            ok("Ollama", f"Embeddings en host dedicado: {config.ollama_embed_host}")
+    except Exception as _e:
+        fail("Ollama", f"No se puede conectar con {config.ollama_host}: {_e}")
+
+    _routing = getattr(config, "ollama_subagent_routing", "round-robin")
+    _extra_hosts = getattr(config, "ollama_extra_hosts", [])
+    if _routing == "primary-only":
+        if _extra_hosts:
+            ok("Ollama+", f"Routing subagentes: [cyan]{_routing}[/cyan]  "
+                          f"[dim]({len(_extra_hosts)} host(s) extra — no se prueban en primary-only)[/dim]")
+        else:
+            warn("Ollama+", f"Sin hosts extra configurados  [dim](ollama.extraHosts en oocode.json)[/dim]")
+    else:
+        for _xhost in _extra_hosts:
+            if not _xhost:
+                continue
+            try:
+                _xcl = _oll.Client(host=_xhost)
+                _xd  = _xcl.list()                               # una sola llamada
+                _xms = _xd.get("models", []) if isinstance(_xd, dict) else list(_xd.models)
+                _xmn = [(m.model if hasattr(m, "model") else m["name"]) for m in _xms]
+                ok("Ollama+", f"Host extra {_xhost}  ({len(_xmn)} modelos)")
+            except Exception as _xe:
+                warn("Ollama+", f"Host extra no responde — {_xhost}: {_xe}")
+        if _extra_hosts:
+            ok("Ollama+", f"Routing subagentes: [cyan]{_routing}[/cyan]  "
+                          f"[dim]({len(_extra_hosts)} host(s) extra)[/dim]")
+        else:
+            warn("Ollama+", f"Sin hosts extra configurados  [dim](ollama.extraHosts en oocode.json)[/dim]")
+
+    # ── Python packages requeridos ─────────────────────────────────────────────
+    for _pkg in _REQUIRED_PACKAGES:
+        try:
+            _ver = importlib.metadata.version(_pkg)
+            ok("Python", f"{_pkg} {_ver}")
+        except importlib.metadata.PackageNotFoundError:
+            fail("Python", f"{_pkg} no instalado  [dim]pip install {_pkg}[/dim]")
+
+    # ── Python packages opcionales por MCP habilitado ─────────────────────────
+    def _pkg_ok(names: list, import_path: str) -> tuple[bool, str]:
+        for n in names:
+            try:
+                return True, importlib.metadata.version(n)
+            except importlib.metadata.PackageNotFoundError:
+                pass
+        try:
+            importlib.import_module(import_path.split(".")[0])
+            return True, "apt"
+        except ImportError:
+            return False, ""
+
+    if getattr(config, "mcp_home_office_assistant_enabled", False):
+        for _disp, _meta, _imp, _desc in _HO_PY_PKGS_ALL:
+            _found, _ver = _pkg_ok(_meta, _imp)
+            if _found:
+                ok("Home Office Python", f"{_disp} {_ver}")
+            else:
+                warn("Home Office Python", f"{_disp} no instalado  [dim]{_desc}[/dim]")
+        for _cmd, _cdesc, _cinst in [
+            ("pandoc",    "conversión de documentos", "apt install pandoc"),
+            ("tesseract", "OCR imagen→texto",         "apt install tesseract-ocr"),
+            ("pdftotext", "texto desde PDF",           "apt install poppler-utils"),
+        ]:
+            if _which(_cmd):
+                ok("Home Office Tools", f"{_cmd}  [dim]{_cdesc}[/dim]")
+            else:
+                warn("Home Office Tools", f"{_cmd} no encontrado  [dim]{_cdesc}  →  {_cinst}[/dim]")
+
+    if getattr(config, "webui_enabled", False):
+        for _wpkg in _WEBUI_PACKAGES:
+            try:
+                _wver = importlib.metadata.version(_wpkg)
+                ok("WebUI Python", f"{_wpkg} {_wver}")
+            except importlib.metadata.PackageNotFoundError:
+                fail("WebUI Python", f"{_wpkg} no instalado  [dim]pip install {_wpkg}[/dim]")
+
+    # ── CLI tools esenciales ───────────────────────────────────────────────────
+    for _cmd, _desc, _req in [
+        ("git",      "git_status/commit/…",        True),
+        ("rg",       "grep_code — ripgrep",         False),
+        ("python3",  "python_exec",                 True),
+        ("pip",      "pip_tool",                    True),
+        ("make",     "make_run",                    True),
+        ("patch",    "patch_apply",                 True),
+        ("tar",      "archive_extract/create",      True),
+        ("docker",   "docker_ps/exec/…",            False),
+        ("ctags",    "build_symbol_index",          False),
+        ("jq",       "json_format",                 False),
+        ("curl",     "http_get",                    False),
+    ]:
+        if _which(_cmd):
+            ok("Tools", f"{_cmd}  [dim]{_desc}[/dim]")
+        elif _req:
+            fail("Tools", f"{_cmd} no encontrado  [dim]{_desc}[/dim]")
+        else:
+            warn("Tools", f"{_cmd} no encontrado (opcional)  [dim]{_desc}[/dim]")
+
+    # ── Linters ────────────────────────────────────────────────────────────────
+    _LINTERS_SA = [
+        ("ruff",         ".py",                "pip install ruff"),
+        ("mypy",         ".py",                "pip install mypy"),
+        ("eslint",       ".js .ts .jsx .tsx",  "npm i -g eslint"),
+        ("shellcheck",   ".sh .bash",          "apt install shellcheck"),
+        ("cargo",        ".rs",                "rustup"),
+        ("go",           ".go",                "apt install golang"),
+        ("cppcheck",     ".c .cpp .h",         "apt install cppcheck"),
+        ("splint",       ".c .h",              "apt install splint"),
+        ("rubocop",      ".rb",                "gem install rubocop"),
+        ("sqlfluff",     ".sql",               "pip install sqlfluff"),
+        ("ktlint",       ".kt",                "brew install ktlint  o  https://github.com/pinterest/ktlint"),
+        ("perl",         ".pl .pm",            "apt install perl"),
+        ("perlcritic",   ".pl .pm",            "cpan Perl::Critic"),
+        ("yamllint",     ".yaml .yml",         "pip install yamllint"),
+        ("ansible-lint", ".yaml .yml",         "apt install ansible-lint"),
+        ("jsonlint",     ".json",              "apt install jsonlint  (o npm i -g jsonlint)"),
+    ]
+    _lint_ok_sa = [b for b, _, _ in _LINTERS_SA if _which(b)]
+    _lint_miss_sa = [(b, e, i) for b, e, i in _LINTERS_SA if not _which(b)]
+    if _lint_ok_sa:
+        ok("Linters", f"Instalados: {', '.join(_lint_ok_sa)}")
+    for _lb, _le, _li in _lint_miss_sa:
+        warn("Linters", f"{_lb} no encontrado  [dim]{_le}  →  {_li}[/dim]")
+
+    # ── efm-langserver backends ────────────────────────────────────────────────
+    _EFM_SA = [
+        ("efm-langserver",  "LSP general",           "apt install efm-langserver"),
+        ("xmllint",         ".xml .xsl .svg",         "apt install libxml2-utils"),
+        ("markdownlint",    ".md",                    "npm i -g markdownlint-cli"),
+        ("rpmlint",         ".spec",                  "apt install rpmlint"),
+        ("rstcheck",        ".rst",                   "pip install rstcheck"),
+        ("chktex",          ".tex",                   "apt install chktex"),
+        ("hadolint",        ".dockerfile",            "apt install hadolint"),
+        ("tflint",          ".tf",                    "ver tflint.io"),
+        ("gitlint",         "git commits",            "apt install gitlint"),
+    ]
+    _efm_ok_sa = [b for b, _, _ in _EFM_SA if _which(b)]
+    _efm_miss_sa = [(b, e, i) for b, e, i in _EFM_SA if not _which(b)]
+    if _efm_ok_sa:
+        ok("efm-langserver", f"Backends instalados: {', '.join(_efm_ok_sa)}")
+    for _eb, _ee, _ei in _efm_miss_sa:
+        warn("efm-langserver", f"{_eb} no encontrado  [dim]{_ee}  →  {_ei}[/dim]")
+
+    # ── Formatters ─────────────────────────────────────────────────────────────
+    _FMTS_SA = [
+        ("black",        ".py",               "pip install black"),
+        ("isort",        ".py imports",       "pip install isort"),
+        ("prettier",     ".js .ts .css .html","npm i -g prettier"),
+        ("gofmt",        ".go",               "apt install golang"),
+        ("rustfmt",      ".rs",               "rustup component add rustfmt"),
+        ("clang-format", ".c .cpp .h",        "apt install clang-format"),
+        ("ktlint",       ".kt",               "https://github.com/pinterest/ktlint"),
+        ("rubocop",      ".rb",               "gem install rubocop"),
+        ("sqlfluff",     ".sql",              "pip install sqlfluff"),
+    ]
+    _fmt_ok_sa = [b for b, _, _ in _FMTS_SA if _which(b)]
+    _fmt_miss_sa = [(b, e, i) for b, e, i in _FMTS_SA if not _which(b)]
+    if _fmt_ok_sa:
+        ok("Formatters", f"Instalados: {', '.join(_fmt_ok_sa)}")
+    for _fb, _fe, _fi in _fmt_miss_sa:
+        warn("Formatters", f"{_fb} no encontrado  [dim]{_fe}  →  {_fi}[/dim]")
+
+    # ── MCP server files ───────────────────────────────────────────────────────
+    _mcp_dir = _P(__file__).parent.parent / "mcp_servers"
+    for _srv_name, _enabled_attr in [
+        ("oocode_assistant",      "mcp_oocode_assistant_enabled"),
+        ("system_assistant",      "mcp_system_assistant_enabled"),
+        ("home_office_assistant", "mcp_home_office_assistant_enabled"),
+        ("security_assistant",    "mcp_security_assistant_enabled"),
+        ("iot_assistant",         "mcp_iot_assistant_enabled"),
+    ]:
+        _f = _mcp_dir / f"{_srv_name}.py"
+        _en = getattr(config, _enabled_attr, False)
+        if _f.exists():
+            if _en:
+                ok("MCP files", f"{_srv_name}.py  [dim]habilitado[/dim]")
+            else:
+                warn("MCP files", f"{_srv_name}.py  [dim]desactivado en config[/dim]")
+        else:
+            if _en:
+                fail("MCP files", f"{_srv_name}.py no encontrado (habilitado en config)")
+            else:
+                warn("MCP files", f"{_srv_name}.py no encontrado")
+
+    # ── Config ─────────────────────────────────────────────────────────────────
+    from config import CONFIG_FILE
+    if CONFIG_FILE.exists():
+        ok("Config", f"oocode.json  [dim]{CONFIG_FILE}[/dim]")
+    else:
+        fail("Config", f"oocode.json no encontrado: {CONFIG_FILE}")
+    _ws = _P(config.workspace).expanduser()
+    ok("Config", f"Workspace  [dim]{_ws}[/dim]") if _ws.exists() else warn("Config", f"Workspace no existe: {_ws}")
+    if config.project_dir:
+        _pd = _P(config.project_dir)
+        ok("Config", f"Proyecto  [dim]{_pd}[/dim]  "
+                     + ("[green]OOCODE.md[/green]" if (_pd / "OOCODE.md").exists() else "[dim]sin OOCODE.md[/dim]"))
+
+    # ── IoT MCP Python + CLI ───────────────────────────────────────────────────
+    if getattr(config, "mcp_iot_assistant_enabled", False):
+        for _pkg, _meta, _imp, _desc in [
+            ("kasa",     ["kasa"],      "kasa",      "IoT MCP — TAPO luces/enchufes TP-Link  (sudo apt install python3-kasa)"),
+            ("blinkpy",  ["blinkpy"],   "blinkpy",   "IoT MCP — cámaras Blink/Amazon Ring   (sudo apt install python3-blinkpy)"),
+            ("aiohttp",  ["aiohttp"],   "aiohttp",   "IoT MCP — HTTP async (requerido por blinkpy)"),
+            ("tinytuya", ["tinytuya"],  "tinytuya",  "IoT MCP — dispositivos Tuya/Smart Life  (pip install tinytuya)"),
+            ("paho",     ["paho-mqtt"], "paho.mqtt", "IoT MCP — broker MQTT  (sudo apt install python3-paho-mqtt)"),
+        ]:
+            _f, _v = _pkg_ok(_meta, _imp)
+            if _f:
+                ok("IoT MCP Python", f"{_pkg} {_v}")
+            else:
+                warn("IoT MCP Python", f"{_pkg} no instalado  [dim]{_desc}[/dim]")
+        if _which("avahi-browse"):
+            ok("IoT MCP Tools", "avahi-browse  [dim]descubrimiento mDNS[/dim]")
+        else:
+            warn("IoT MCP Tools", "avahi-browse no encontrado  [dim]apt install avahi-utils[/dim]")
+
+    # ── Security MCP CLI ────────────────────────────────────────────────────────
+    if getattr(config, "mcp_security_assistant_enabled", False):
+        for _cmd, _desc, _inst in [
+            ("nmap",       "escaneo de puertos",     "apt install nmap"),
+            ("nikto",      "análisis web",           "apt install nikto"),
+            ("gobuster",   "fuerza bruta dirs",      "apt install gobuster"),
+            ("hashcat",    "cracking de hashes",     "apt install hashcat"),
+            ("whois",      "info de dominio",        "apt install whois"),
+            ("dig",        "consultas DNS",          "apt install dnsutils"),
+            ("openssl",    "certificados y crypto",  "apt install openssl"),
+            ("trufflehog", "secrets en git",         "pip install trufflehog"),
+            ("gitleaks",   "secrets en código",      "https://github.com/gitleaks/gitleaks"),
+            ("steghide",   "esteganografía",         "apt install steghide"),
+            ("xxd",        "hex dump",               "apt install xxd"),
+        ]:
+            if _which(_cmd):
+                ok("Security MCP Tools", f"{_cmd}  [dim]{_desc}[/dim]")
+            else:
+                warn("Security MCP Tools", f"{_cmd} no encontrado  [dim]{_desc}  →  {_inst}[/dim]")
+
+    # ── Home Office packages — siempre verificar (no solo si está habilitado) ──
+    if not getattr(config, "mcp_home_office_assistant_enabled", False):
+        for _disp, _meta, _imp, _desc in _HO_PY_PKGS_ALL:
+            _found, _ver = _pkg_ok(_meta, _imp)
+            if _found:
+                ok("Home Office Python (opcional)", f"{_disp} {_ver}")
+            else:
+                warn("Home Office Python (opcional)", f"{_disp} no instalado  [dim]{_desc}[/dim]")
+
+    # ── LSP servers ────────────────────────────────────────────────────────────
+    _LSP_SA = {
+        "pylsp":                       ("pip install python-lsp-server",           ".py"),
+        "typescript-language-server":  ("npm i -g typescript-language-server",     ".js .ts .jsx .tsx"),
+        "gopls":                       ("go install golang.org/x/tools/gopls@latest", ".go"),
+        "rust-analyzer":               ("rustup component add rust-analyzer",       ".rs"),
+        "clangd":                      ("apt install clangd",                       ".c .cpp .h"),
+        "jdtls":                       ("apt install default-jdk + sdk install jdtls", ".java"),
+        "ruby-lsp":                    ("gem install ruby-lsp",                     ".rb"),
+        "csharp-ls":                   ("dotnet tool install -g csharp-ls",         ".cs"),
+        "kotlin-language-server":      ("sdk install kotlin  (sdkman.io)",          ".kt"),
+        "bash-language-server":        ("npm i -g bash-language-server",            ".sh .bash .mk"),
+        "yaml-language-server":        ("npm i -g yaml-language-server",            ".yaml .yml"),
+        "vscode-json-language-server": ("npm i -g vscode-langservers-extracted",    ".json"),
+        "vscode-css-language-server":  ("npm i -g vscode-langservers-extracted",    ".css .scss .less"),
+        "vscode-html-language-server": ("npm i -g vscode-langservers-extracted",    ".html"),
+        "perl-language-server":        ("cpan PLS",                                ".pl .pm"),
+        "sql-language-server":         ("npm i -g sql-language-server",             ".sql"),
+        "lua-language-server":         ("apt install lua-language-server",          ".lua"),
+        "intelephense":                ("npm i -g intelephense",                    ".php"),
+        "taplo":                       ("cargo install taplo-cli",                  ".toml"),
+        "efm-langserver":              ("apt install efm-langserver",               ".xml .md .spec .rst .tex"),
+        "marksman":                    ("snap install marksman",                    ".md extra"),
+    }
+    _lsp_ok_sa = []
+    _lsp_miss_sa = []
+    for _lcmd, (_lhint, _lexts) in _LSP_SA.items():
+        if _which(_lcmd):
+            _lsp_ok_sa.append(_lcmd)
+        else:
+            _lsp_miss_sa.append((_lcmd, _lexts, _lhint))
+    if _lsp_ok_sa:
+        ok("LSP servers", f"Instalados: {', '.join(_lsp_ok_sa)}")
+    for _lcmd, _lexts, _lhint in _lsp_miss_sa:
+        warn("LSP servers", f"{_lcmd} no encontrado  [dim]{_lexts}  →  {_lhint}[/dim]")
+
+    # ── Agentes y workspaces ───────────────────────────────────────────────────
+    for _ag in config.agents:
+        _ws_p = _P(_ag.workspace).expanduser()
+        _has_id = (_ws_p / "IDENTITY.md").exists()
+        if _ws_p.exists() and _has_id:
+            ok("Agentes", f"{_ag.emoji} {_ag.id}  [dim]{_ag.workspace}[/dim]")
+        elif _ws_p.exists():
+            warn("Agentes", f"{_ag.emoji} {_ag.id}  workspace sin IDENTITY.md  [dim]→  /switch {_ag.id}  para inicializar[/dim]")
+        else:
+            warn("Agentes", f"{_ag.emoji} {_ag.id}  workspace no existe  [dim]{_ag.workspace}[/dim]")
+
+    # ── Hooks ─────────────────────────────────────────────────────────────────
+    if config.hooks_enabled:
+        try:
+            from tools.hooks import _BUILTINS
+            _active_hooks_sa = set(config.hooks_builtins) if config.hooks_builtins else set()
+            _hook_on_sa  = [h for h in _BUILTINS if h in _active_hooks_sa]
+            _hook_off_sa = [h for h in _BUILTINS if h not in _active_hooks_sa]
+            ok("Hooks", f"{len(_hook_on_sa)} activos · {len(_hook_off_sa)} inactivos  "
+                        f"[dim](de {len(_BUILTINS)} built-ins)[/dim]")
+        except Exception as _e:
+            warn("Hooks", f"No se pudo verificar hooks: {_e}")
+    else:
+        warn("Hooks", "Sistema de hooks desactivado  [dim](hooks.enabled=false)[/dim]")
+
+    # ── Logging y chatlog ──────────────────────────────────────────────────────
+    try:
+        if log.is_enabled():
+            ok("Config", f"Log activo  [dim]{log.log_file_path()}[/dim]")
+        else:
+            warn("Config", "Logging desactivado  [dim](logging.enabled=false)[/dim]")
+    except Exception:
+        pass
+    if config.chatlog_enabled:
+        ok("Config", "Chatlog activo  [dim](chatlog.enabled=true)[/dim]")
+    else:
+        warn("Config", "Chatlog desactivado  [dim](chatlog.enabled=false en oocode.json)[/dim]")
+
+    # ── SearXNG ────────────────────────────────────────────────────────────────
+    if config.searxng_url:
+        try:
+            import requests as _req
+            _r = _req.get(f"{config.searxng_url.rstrip('/')}/search",
+                          params={"q":"test","format":"json"}, timeout=4,
+                          headers={"Accept":"application/json"})
+            _r.raise_for_status()
+            ok("SearXNG", f"Conectado en {config.searxng_url}")
+        except Exception as _e:
+            fail("SearXNG", f"Error conectando con {config.searxng_url}: {_e}")
+    else:
+        warn("SearXNG", "No configurado  [dim](searxng.url en oocode.json)[/dim]")
+
+    # ── Sesiones ────────────────────────────────────────────────────────────────
+    try:
+        from agent.session import SESSIONS_ROOT
+        if SESSIONS_ROOT.exists():
+            _agent_dirs = [d for d in SESSIONS_ROOT.iterdir() if d.is_dir()]
+            _total_sess = sum(len(list(d.glob("*.jsonl"))) for d in _agent_dirs)
+            ok("Sesiones", f"Directorio OK  [dim]{SESSIONS_ROOT}[/dim]  ({_total_sess} sesiones en {len(_agent_dirs)} agente(s))")
+        else:
+            warn("Sesiones", f"Directorio no existe  [dim]{SESSIONS_ROOT}[/dim]  (se creará al iniciar)")
+    except Exception as _e:
+        warn("Sesiones", f"No se pudo verificar: {_e}")
+
+    # ── Visión / portapapeles ──────────────────────────────────────────────────
+    _clip_found = False
+    for _cmd, _desc, _inst in [
+        ("xclip",    "portapapeles X11 — Ctrl+P en TUI para pegar imágenes",    "apt install xclip"),
+        ("xsel",     "portapapeles X11 alternativo",                              "apt install xsel"),
+        ("wl-paste", "portapapeles Wayland — Ctrl+P en TUI para pegar imágenes", "apt install wl-clipboard"),
+    ]:
+        if _which(_cmd):
+            ok("Vision / Portapapeles", f"{_cmd}  [dim]{_desc}[/dim]")
+            _clip_found = True
+    if not _clip_found:
+        warn("Vision / Portapapeles",
+             "Sin herramienta de portapapeles  [dim]apt install xclip  (X11) o apt install wl-clipboard  (Wayland)[/dim]")
+    try:
+        _pil_ver = importlib.metadata.version("Pillow")
+        ok("Vision / Portapapeles", f"Pillow {_pil_ver}  [dim]procesamiento de imágenes[/dim]")
+    except importlib.metadata.PackageNotFoundError:
+        warn("Vision / Portapapeles",
+             "Pillow no instalado (opcional)  [dim]pip install Pillow[/dim]")
+
+    # ── Render ─────────────────────────────────────────────────────────────────
+    _ICONS = {"ok": "[green]✓[/green]", "warn": "[yellow]⚠[/yellow]", "fail": "[red]✗[/red]"}
+    _cur = ""
+    for _s, _st, _m in checks:
+        if _s != _cur:
+            console.print(f"  [bold dim]{_s}[/bold dim]")
+            _cur = _s
+        console.print(f"    {_ICONS[_st]}  {_m}")
+
+    n_ok   = sum(1 for _, s, _ in checks if s == "ok")
+    n_warn = sum(1 for _, s, _ in checks if s == "warn")
+    n_fail = sum(1 for _, s, _ in checks if s == "fail")
+    console.print()
+    console.print(
+        f"  [dim]Resultado:[/dim]  "
+        f"[green]{n_ok} OK[/green]  "
+        f"[yellow]{n_warn} avisos[/yellow]  "
+        f"[red]{n_fail} errores[/red]"
+    )
+    console.print()
+    return n_fail == 0
+
 
 def _cmd_doctor(config, agent_loop) -> None:  # noqa: C901
     import shutil as _sh
@@ -2315,9 +3375,39 @@ def _cmd_doctor(config, agent_loop) -> None:  # noqa: C901
         elif config.fallback_model:
             warn("Ollama", f"Fallback configurado pero desactivado: {config.fallback_model}")
 
+        if config.ollama_embed_host:
+            ok("Ollama", f"Embeddings en host dedicado: {config.ollama_embed_host}")
         #_client.close()
     except Exception as _e:
         fail("Ollama", f"No se puede conectar con {config.ollama_host}: {_e}")
+
+    _routing_full = getattr(config, "ollama_subagent_routing", "round-robin")
+    _extra_full   = getattr(config, "ollama_extra_hosts", [])
+    if _routing_full == "primary-only":
+        if _extra_full:
+            ok("Ollama+", f"Routing subagentes: [cyan]{_routing_full}[/cyan]  "
+                          f"[dim]({len(_extra_full)} host(s) extra — no se prueban en primary-only)[/dim]")
+        else:
+            warn("Ollama+", "Sin hosts extra configurados  "
+                            "[dim](ollama.extraHosts en oocode.json)[/dim]")
+    else:
+        for _xhost in _extra_full:
+            if not _xhost:
+                continue
+            try:
+                _xcl  = ollama.Client(host=_xhost)
+                _xd   = _xcl.list()
+                _xms  = _xd.get("models", []) if isinstance(_xd, dict) else list(_xd.models)
+                _xmn  = [(m.model if hasattr(m, "model") else m["name"]) for m in _xms]
+                ok("Ollama+", f"Host extra {_xhost}  ({len(_xmn)} modelos)")
+            except Exception as _xe:
+                warn("Ollama+", f"Host extra no responde — {_xhost}: {_xe}")
+        if _extra_full:
+            ok("Ollama+", f"Routing subagentes: [cyan]{_routing_full}[/cyan]  "
+                          f"[dim]({len(_extra_full)} host(s) extra)[/dim]")
+        else:
+            warn("Ollama+", "Sin hosts extra configurados  "
+                            "[dim](ollama.extraHosts en oocode.json)[/dim]")
 
     # ── 2. MCP — servidores bundled y externos ────────────────────────────────
     _mcp_pool = getattr(agent_loop, "_mcp_pool", None)
@@ -2437,13 +3527,17 @@ def _cmd_doctor(config, agent_loop) -> None:  # noqa: C901
             "bash-language-server":            "npm i -g bash-language-server",
             "yaml-language-server":            "npm i -g yaml-language-server",
             "vscode-json-language-server":     "npm i -g vscode-langservers-extracted",
-            "vscode-markdown-language-server": "npm i -g vscode-langservers-extracted  (instala también json/html/css)",
+            "vscode-css-language-server":      "npm i -g vscode-langservers-extracted",
+            "vscode-html-language-server":     "npm i -g vscode-langservers-extracted",
+            # vscode-markdown-language-server roto en Node 22 → se usa efm-langserver+markdownlint
+            # cmake-language-server roto con pygls v2 → no hay LSP cmake disponible
             # csharp-ls reemplaza OmniSharp — requiere dotnet SDK
             "csharp-ls":                       "apt install dotnet-sdk-8.0  &&  dotnet tool install -g csharp-ls",
             "kotlin-language-server":          "sdk install kotlin  (sdkman.io)",
             "sourcekit-lsp":                   "xcode-select --install  (solo macOS)",
             "lua-language-server":             "apt install lua-language-server",
-            "cmake-language-server":           "pip install cmake-language-server",
+            "intelephense":                    "npm i -g intelephense",
+            "taplo":                           "cargo install taplo-cli",
             # efm-langserver — LSP para xml/md/rst/tex/dockerfile/tf/spec/office
             "efm-langserver":                  "apt install efm-langserver",
         }
@@ -2469,6 +3563,7 @@ def _cmd_doctor(config, agent_loop) -> None:  # noqa: C901
         ("splint",       ".c .h",              "apt install splint"),
         ("rubocop",      ".rb",                "gem install rubocop"),
         ("sqlfluff",     ".sql",               "pip install sqlfluff"),
+        ("ktlint",       ".kt",                "brew install ktlint  o  https://github.com/pinterest/ktlint"),
         ("perl",         ".pl .pm",            "apt install perl"),
         ("perlcritic",   ".pl .pm",            "cpan Perl::Critic"),
         ("yamllint",     ".yaml .yml",         "pip install yamllint"),
@@ -2523,6 +3618,7 @@ def _cmd_doctor(config, agent_loop) -> None:  # noqa: C901
         ("gofmt",        ".go",               "apt install golang"),
         ("rustfmt",      ".rs",               "rustup component add rustfmt"),
         ("clang-format", ".c .cpp .h",        "apt install clang-format"),
+        ("ktlint",       ".kt",               "https://github.com/pinterest/ktlint"),
         ("rubocop",      ".rb",               "gem install rubocop"),
         ("sqlfluff",     ".sql",              "pip install sqlfluff"),
     ]
@@ -2637,7 +3733,7 @@ def _cmd_doctor(config, agent_loop) -> None:  # noqa: C901
     else:
         fail("Config", f"oocode.json no encontrado: {CONFIG_FILE}")
 
-    _ws_path = Path(config.workspace)
+    _ws_path = Path(config.workspace).expanduser()
     if _ws_path.exists():
         ok("Config", f"Workspace  [dim]{_ws_path}[/dim]")
     else:
@@ -2798,8 +3894,11 @@ def _cmd_doctor(config, agent_loop) -> None:  # noqa: C901
             ("paho",     ["paho-mqtt"],      "paho.mqtt",      "IoT MCP — broker MQTT  (sudo apt install python3-paho-mqtt)"),
         ]
         _HO_PY_PKGS = [
-            ("openpyxl", ["openpyxl"],       "openpyxl",       "Home Office MCP — hojas de cálculo Excel  (pip install openpyxl)"),
-            ("markdown", ["Markdown", "markdown"], "markdown", "Home Office MCP — Markdown→HTML  (pip install markdown)"),
+            ("openpyxl",   ["openpyxl"],            "openpyxl",   "Home Office MCP — hojas de cálculo Excel   pip install openpyxl"),
+            ("docx",       ["python-docx"],          "docx",       "Home Office MCP — documentos .docx         pip install python-docx"),
+            ("pptx",       ["python-pptx"],          "pptx",       "Home Office MCP — presentaciones .pptx     pip install python-pptx"),
+            ("matplotlib", ["matplotlib"],           "matplotlib", "Home Office MCP — gráficas dinámicas       pip install matplotlib"),
+            ("markdown",   ["Markdown", "markdown"], "markdown",   "Home Office MCP — Markdown→HTML             pip install markdown"),
         ]
 
         def _pkg_ok(names: list, import_path: str) -> tuple[bool, str]:
@@ -2868,6 +3967,44 @@ def _cmd_doctor(config, agent_loop) -> None:  # noqa: C901
                     ok("Home Office MCP Tools", f"{_cmd}  [dim]{_desc}[/dim]")
                 else:
                     warn("Home Office MCP Tools", f"{_cmd} no encontrado  [dim]{_desc}  →  {_inst}[/dim]")
+
+    # ── 16. WebUI ────────────────────────────────────────────────────────────────
+    if getattr(config, "webui_enabled", False):
+        ok("WebUI", f"Activo en http://{config.webui_host}:{config.webui_port}")
+    else:
+        warn("WebUI", "Desactivado  [dim](/webserver start)[/dim]")
+
+    # ── 17. Sesiones ──────────────────────────────────────────────────────────
+    try:
+        from agent.session import SESSIONS_ROOT as _SR
+        if _SR.exists():
+            _adirs = [d for d in _SR.iterdir() if d.is_dir()]
+            _tsess = sum(len(list(d.glob("*.jsonl"))) for d in _adirs)
+            ok("Sesiones", f"Directorio OK  [dim]{_SR}[/dim]  ({_tsess} sesiones en {len(_adirs)} agente(s))")
+        else:
+            warn("Sesiones", f"Directorio no existe  [dim]{_SR}[/dim]  (se creará al iniciar)")
+    except Exception as _se:
+        warn("Sesiones", f"No se pudo verificar: {_se}")
+
+    # ── 18. Visión / portapapeles ─────────────────────────────────────────────
+    _clip_ok = False
+    for _vc, _vd, _vi in [
+        ("xclip",    "portapapeles X11 — Ctrl+P en TUI",    "apt install xclip"),
+        ("xsel",     "portapapeles X11 alternativo",         "apt install xsel"),
+        ("wl-paste", "portapapeles Wayland — Ctrl+P en TUI", "apt install wl-clipboard"),
+    ]:
+        if _which(_vc):
+            ok("Vision / Portapapeles", f"{_vc}  [dim]{_vd}[/dim]")
+            _clip_ok = True
+    if not _clip_ok:
+        warn("Vision / Portapapeles",
+             "Sin herramienta de portapapeles  [dim]apt install xclip  (X11) o apt install wl-clipboard  (Wayland)[/dim]")
+    try:
+        _pil = importlib.metadata.version("Pillow")
+        ok("Vision / Portapapeles", f"Pillow {_pil}  [dim]procesamiento de imágenes[/dim]")
+    except importlib.metadata.PackageNotFoundError:
+        warn("Vision / Portapapeles",
+             "Pillow no instalado (opcional)  [dim]pip install Pillow[/dim]")
 
     # ── Renderizado ───────────────────────────────────────────────────────────
     _ICONS = {"ok": "[green]✓[/green]", "warn": "[yellow]⚠[/yellow]", "fail": "[red]✗[/red]"}
@@ -3038,12 +4175,12 @@ def _cmd_config_panel(args: str, config, rt: RuntimeSettings) -> None:
             config.model = raw_choice
             console.print(f"  [green]✓[/green]  Modelo → [bold cyan]{config.model}[/bold cyan]")
 
-    # ── Overrides de sesión (modelOptions) ────────────────────────────────────
-    # Sobreescriben los params per-modelo para esta sesión; no se persisten por modelo.
+    # ── Defaults globales de modelos (models.repeatPenalty / seed) ────────────
+    # Aplican a todos los modelos si no tienen repeat_penalty/seed en params.
     console.print()
     console.print(
-        "  [bold dim]── modelOptions (overrides de sesión)[/bold dim]  "
-        "[dim](sobreescriben per-modelo | Enter = mantener | «-» = reset)[/dim]"
+        "  [bold dim]── Defaults globales de modelos[/bold dim]  "
+        "[dim](aplican si el modelo no los define | Enter = mantener | «-» = quitar)[/dim]"
     )
 
     def _ask_opt(label: str, current_val, cast_fn):
@@ -3059,13 +4196,8 @@ def _cmd_config_panel(args: str, config, rt: RuntimeSettings) -> None:
         except (ValueError, TypeError):
             return current_val
 
-    config.model_temperature    = _ask_opt("temperature  (0.0–2.0, défault 0.8)", config.model_temperature, float)
-    config.model_top_p          = _ask_opt("top_p        (0.0–1.0)", config.model_top_p, float)
-    config.model_top_k          = _ask_opt("top_k        (entero ≥1)", config.model_top_k, int)
-    config.model_num_ctx        = _ask_opt("num_ctx      (tokens de contexto)", config.model_num_ctx, int)
-    config.model_num_predict    = _ask_opt("num_predict  (tokens a generar, -1=∞)", config.model_num_predict, int)
     config.model_repeat_penalty = _ask_opt("repeat_penalty (1.0=sin penalización)", config.model_repeat_penalty, float)
-    config.model_seed           = _ask_opt("seed         (-1=aleatorio)", config.model_seed, int)
+    config.model_seed           = _ask_opt("seed           (-1=aleatorio)", config.model_seed, int)
 
     console.print("  [bold dim]── Parámetros por modelo ──[/bold dim]")
     if config.active_model_config:
@@ -3652,102 +4784,151 @@ def _cmd_review(agent_loop, config) -> None:
 
 
 def _cmd_webserver(args: str, config, agent_loop) -> None:
-    """Levanta el WebUI en puerto 4000."""
-    from webui.app import app
-    
-    # Verificar si Flask está instalado
+    """Levanta/detiene el WebUI daemon (host/puerto/log leídos de oocode.json vía config)."""
+    import sys as _sys
+
+    # Verificar que Flask está instalado
     try:
-        import flask
+        import flask  # noqa: F401
     except ImportError:
         console.print(
             "  [yellow]⚠[/yellow]  Flask no instalado. Instala con: pip install flask\n"
-            "  [dim]Uso: /webserver start — Levanta el WebUI en puerto 4000[/dim]\n"
-            "  [dim]Uso: /webserver stop — Para el WebUI[/dim]\n"
-            "  [dim]Uso: /webserver status — Estado del WebUI[/dim]"
+            "  [dim]Uso: /webserver start — Levanta el WebUI[/dim]\n"
+            "  [dim]Uso: /webserver stop  — Para el WebUI[/dim]\n"
+            "  [dim]Uso: /webserver status — Estado actual[/dim]"
         )
         return
-    
-    # Estado actual
-    state_file = Path.home() / ".oocode" / "webui_state.json"
-    state = {}
-    if state_file.exists():
+
+    # Leer configuración desde config (persistida en oocode.json)
+    _host = getattr(config, "webui_host", "0.0.0.0")
+    _port = int(getattr(config, "webui_port", 4000))
+    _log_file_str = getattr(config, "webui_log_file", "")
+    _log_path = (
+        Path(_log_file_str).expanduser()
+        if _log_file_str
+        else Path.home() / ".oocode" / "logs" / "webserver.log"
+    )
+
+    # webui_state.json — estado de RUNTIME (pid, started, uptime), no persiste en oocode.json
+    # oocode.json["webui"]["enabled"] — configuración PERSISTENTE (arranca al iniciar)
+    _state_file = Path.home() / ".oocode" / "webui_state.json"
+
+    def _load_state() -> dict:
+        if _state_file.exists():
+            try:
+                with open(_state_file) as _f:
+                    return json.load(_f)
+            except Exception:
+                pass
+        return {}
+
+    def _save_state(s: dict) -> None:
+        _state_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(_state_file, "w") as _f:
+            json.dump(s, _f, indent=2)
+
+    def _save_webui_config(enabled: bool) -> None:
+        """Persiste webui.enabled directamente en oocode.json."""
+        _cfg_path = Path.home() / ".oocode" / "oocode.json"
         try:
-            with open(state_file, 'r') as f:
-                state = json.load(f)
+            _data = json.loads(_cfg_path.read_text()) if _cfg_path.exists() else {}
+            _data.setdefault("webui", {})["enabled"] = enabled
+            _cfg_path.write_text(json.dumps(_data, indent=2, ensure_ascii=False))
         except Exception:
             pass
-    
+        try:
+            object.__setattr__(config, "webui_enabled", enabled)
+        except Exception:
+            pass
+
+    state = _load_state()
+
     if args in ("", "status"):
         if state.get("running"):
+            elapsed = int(datetime.now().timestamp() - state.get("started_ts", datetime.now().timestamp()))
             console.print(
-                "  [green]✓[/green]  WebUI activo en http://localhost:4000\n"
-                "  [dim]Proceso: [cyan]" + str(state.get("pid", "unknown")) + "[/cyan] | "
-                "Tiempo: [cyan]" + str(state.get("uptime", "unknown")) + "[/cyan][/dim]\n"
+                f"  [green]✓[/green]  WebUI activo en http://{_host}:{_port}\n"
+                f"  [dim]PID: [cyan]{state.get('pid', '?')}[/cyan] | "
+                f"Uptime: [cyan]{elapsed}s[/cyan] | "
+                f"Log: [cyan]{_log_path}[/cyan][/dim]\n"
                 "  [dim]Uso: /webserver stop — Para el WebUI[/dim]"
             )
         else:
             console.print(
-                "  [yellow]⚠[/yellow]  WebUI no activo\n"
-                "  [dim]Uso: /webserver start — Levanta el WebUI en puerto 4000[/dim]"
+                f"  [yellow]⚠[/yellow]  WebUI no activo (config: {_host}:{_port})\n"
+                "  [dim]Uso: /webserver start — Levanta el WebUI[/dim]"
             )
         return
-    
+
     elif args == "start":
-        console.print("  [dim]Iniciando WebUI en puerto 4000...[/dim]\n")
-        state_file.parent.mkdir(parents=True, exist_ok=True)
-        state = {
-            "running": True,
-            "pid": os.getpid(),
-            "started": datetime.now().isoformat(),
-            "uptime": 0,
-        }
-        with open(state_file, 'w') as f:
-            json.dump(state, f, indent=2)
-        
-        # Levantar en segundo plano
-        import threading
-        def run_server():
-            app.run(host='0.0.0.0', port=4000, debug=False, use_reloader=False, threaded=True)
-        thread = threading.Thread(target=run_server, daemon=True)
-        thread.start()
-        
-        state["uptime"] = 0
-        with open(state_file, 'w') as f:
-            json.dump(state, f, indent=2)
-        
-        console.print(
-            "  [green]✓[/green]  WebUI iniciado en http://localhost:4000\n"
-            "  [dim]Abre http://localhost:4000 en tu navegador[/dim]"
-        )
-    
-    elif args == "stop":
-        # Simular parada (en producción, matar proceso)
-        if state_file.exists():
-            os.remove(state_file)
-            console.print("  [green]✓[/green]  WebUI parado\n")
-        else:
-            console.print("  [yellow]⚠[/yellow]  WebUI no activo\n")
-    
-    elif args == "restart":
-        if state_file.exists():
-            os.remove(state_file)
-            console.print("  [green]✓[/green]  WebUI reiniciando...\n")
-            # Reiniciar
-            run_server()
-            state = {
-                "running": True,
-                "pid": os.getpid(),
-                "started": datetime.now().isoformat(),
-                "uptime": 0,
-            }
-            with open(state_file, 'w') as f:
-                json.dump(state, f, indent=2)
+        if state.get("running"):
             console.print(
-                "  [green]✓[/green]  WebUI reiniciado en http://localhost:4000\n"
-                "  [dim]Abre http://localhost:4000 en tu navegador[/dim]"
+                f"  [yellow]⚠[/yellow]  WebUI ya activo en http://{_host}:{_port}\n"
+                "  [dim]Usa /webserver restart para reiniciarlo[/dim]"
             )
+            return
+
+        console.print(f"  [dim]Iniciando WebUI daemon en {_host}:{_port}...[/dim]")
+
+        _save_webui_config(True)   # persistir en oocode.json
+
+        # Lanzar el servidor como proceso INDEPENDIENTE (daemon) que persiste
+        # tras cerrar el TUI. start_new_session=True lo separa del proceso padre.
+        import subprocess as _subprocess
+        _server_mod = str(Path(__file__).parent.parent / "webui" / "server.py")
+        _proc = _subprocess.Popen(
+            [_sys.executable, _server_mod, _host, str(_port), str(_log_path)],
+            stdout=_subprocess.DEVNULL,
+            stderr=_subprocess.DEVNULL,
+            stdin=_subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+        # Esperar brevemente a que el servidor escriba su estado
+        import time as _time
+        for _ in range(20):
+            _time.sleep(0.15)
+            if _state_file.exists():
+                break
+
+        console.print(
+            f"  [green]✓[/green]  WebUI iniciado en http://{_host}:{_port}\n"
+            f"  [dim]PID: [cyan]{_proc.pid}[/cyan] | "
+            f"Log → [cyan]{_log_path}[/cyan] | Abre en tu navegador[/dim]\n"
+            f"  [dim]El servidor persiste tras cerrar el TUI. "
+            f"Para parar: [cyan]/webserver stop[/cyan] o "
+            f"[cyan]oocode --webserver stop[/cyan][/dim]"
+        )
+
+    elif args == "stop":
+        if state.get("running"):
+            _pid = state.get("pid")
+            if _pid:
+                try:
+                    os.kill(_pid, 0)   # comprobar si el proceso existe
+                    os.kill(_pid, 15)  # SIGTERM
+                    console.print(f"  [green]✓[/green]  WebUI detenido (PID {_pid} → SIGTERM)\n")
+                except ProcessLookupError:
+                    console.print("  [yellow]⚠[/yellow]  El proceso ya no existía\n")
+                except PermissionError:
+                    console.print(f"  [yellow]⚠[/yellow]  Sin permiso para señalizar PID {_pid}\n")
+            _state_file.unlink(missing_ok=True)
+            _save_webui_config(False)
         else:
-            console.print("  [yellow]⚠[/yellow]  WebUI no activo para reiniciar\n")
+            _state_file.unlink(missing_ok=True)
+            console.print("  [yellow]⚠[/yellow]  WebUI no estaba activo\n")
+
+    elif args == "restart":
+        if _state_file.exists():
+            _state_file.unlink(missing_ok=True)
+        console.print("  [dim]Reiniciando WebUI...[/dim]")
+        _cmd_webserver("start", config, agent_loop)
+
+    else:
+        console.print(
+            f"  [yellow]⚠[/yellow]  Subcomando desconocido: '{args}'\n"
+            "  [dim]Uso: /webserver [start|stop|restart|status][/dim]"
+        )
 
 
 def _cmd_keybindings(args: str, agent_loop) -> None:
@@ -4077,7 +5258,7 @@ def _cmd_steer(args: str, agent_loop) -> None:
     ctx.add("user", f"[STEER] Actualiza tu tarea: {instruction}")
 
     # Actualizar el label del separador para reflejar la tarea activa
-    agent_loop._sep_label = instruction[:40] + ("…" if len(instruction) > 40 else "")
+    agent_loop._sep_label = instruction
 
     console.print(
         f"  [green]✓[/green]  Steer inyectado al agente principal:\n"
@@ -4091,34 +5272,76 @@ def _cmd_steer(args: str, agent_loop) -> None:
 # ── MCP ───────────────────────────────────────────────────────────────────────
 
 def _cmd_mcp(args: str, agent_loop) -> None:
-    """Muestra estado del pool MCP."""
+    """Gestión del pool MCP: estado, catálogo, instalación y configuración."""
     parts = args.strip().split(maxsplit=1)
     sub   = parts[0].lower() if parts else ""
+    rest  = parts[1].strip() if len(parts) > 1 else ""
 
     pool = getattr(agent_loop, "_mcp_pool", None)
-    if pool is None:
-        console.print("  [dim]Sin servidores MCP configurados.[/dim]  "
-                      "[dim](mcp.servers en oocode.json)[/dim]")
+
+    # ── /mcp catalog [query] ──────────────────────────────────────────────────
+    if sub == "catalog":
+        _cmd_mcp_catalog(rest)
         return
 
-    if sub == "reload" and parts[1:]:
-        name = parts[1].strip()
-        client = pool.get_client(name)
+    # ── /mcp check <id> ───────────────────────────────────────────────────────
+    if sub == "check":
+        _cmd_mcp_check(rest)
+        return
+
+    # ── /mcp install <id> [extra args...] ────────────────────────────────────
+    if sub == "install":
+        _cmd_mcp_install(rest, agent_loop, pool)
+        return
+
+    # ── /mcp add <name> <cmd...> ─────────────────────────────────────────────
+    if sub == "add":
+        _cmd_mcp_add(rest, agent_loop, pool)
+        return
+
+    # ── /mcp remove <name> ────────────────────────────────────────────────────
+    if sub == "remove":
+        _cmd_mcp_remove(rest, pool)
+        return
+
+    # ── /mcp enable/disable <name> ────────────────────────────────────────────
+    if sub in ("enable", "disable"):
+        _cmd_mcp_toggle(rest, sub == "enable", pool)
+        return
+
+    # ── /mcp reload <name> ────────────────────────────────────────────────────
+    if sub == "reload" and rest:
+        if pool is None:
+            console.print("  [dim]Sin pool MCP activo.[/dim]")
+            return
+        client = pool.get_client(rest)
         if client is None:
-            console.print(f"  [red]✗[/red]  Servidor MCP '{name}' no encontrado.")
+            console.print(f"  [red]✗[/red]  Servidor MCP '{rest}' no encontrado.")
             return
         n = client.reload_tools()
-        console.print(f"  [green]✓[/green]  {name}: {n} tools recargadas.")
+        console.print(f"  [green]✓[/green]  {rest}: {n} tools recargadas.")
         return
 
-    if sub == "restart" and parts[1:]:
-        name = parts[1].strip()
-        client = pool.restart_server(name)
+    # ── /mcp restart <name> ───────────────────────────────────────────────────
+    if sub == "restart" and rest:
+        if pool is None:
+            console.print("  [dim]Sin pool MCP activo.[/dim]")
+            return
+        client = pool.restart_server(rest)
         if client and client.is_alive:
-            console.print(f"  [green]✓[/green]  Servidor MCP '{name}' reiniciado "
+            console.print(f"  [green]✓[/green]  Servidor MCP '{rest}' reiniciado "
                           f"({len(client.tools)} tools).")
         else:
-            console.print(f"  [red]✗[/red]  No se pudo reiniciar '{name}'.")
+            console.print(f"  [red]✗[/red]  No se pudo reiniciar '{rest}'.")
+        return
+
+    # ── /mcp → estado general ─────────────────────────────────────────────────
+    if pool is None:
+        console.print(
+            "  [dim]Sin servidores MCP activos.[/dim]  "
+            "[dim cyan]/mcp catalog[/dim cyan] para ver servidores disponibles  ·  "
+            "[dim cyan]/mcp install <id>[/dim cyan] para añadir uno"
+        )
         return
 
     console.print()
@@ -4144,8 +5367,190 @@ def _cmd_mcp(args: str, agent_loop) -> None:
     console.print(t)
     console.print(
         f"\n  {pool.client_count} servidor(es) · {pool.tool_count} tools  ·  "
-        "[dim]/mcp reload <nombre>  ·  /mcp restart <nombre>[/dim]\n"
+        "[dim]/mcp catalog · /mcp install <id> · /mcp reload/restart <nombre>[/dim]\n"
     )
+
+
+def _cmd_mcp_catalog(query: str) -> None:
+    """Muestra el catálogo de servidores MCP disponibles."""
+    from agent.mcp_manager import search_catalog, check_server_prerequisites
+    servers = search_catalog(query)
+    if not servers:
+        console.print(f"  [dim]No hay resultados para '{query}'.[/dim]")
+        return
+    title = f"Catálogo MCP{' — ' + query if query else ''}"
+    t = Table(title=title, box=box.SIMPLE, header_style="bold cyan")
+    t.add_column("ID",          style="cyan",   width=14)
+    t.add_column("Runtime",     style="yellow", width=8)
+    t.add_column("Descripción", max_width=50)
+    t.add_column("OK",          width=4)
+    for srv in servers:
+        missing = check_server_prerequisites(srv)
+        ok = "[green]✓[/green]" if not missing else f"[red]✗ {', '.join(missing)}[/red]"
+        t.add_row(srv.get("id", ""), srv.get("runtime", ""), srv.get("description", ""), ok)
+    console.print()
+    console.print(t)
+    console.print(
+        "  [dim]/mcp install <id> [args...]  ·  /mcp check <id>  para detalles[/dim]\n"
+    )
+
+
+def _cmd_mcp_check(id_or_name: str) -> None:
+    """Muestra detalles y prerequisitos de un servidor del catálogo."""
+    from agent.mcp_manager import find_in_catalog, check_server_prerequisites
+    if not id_or_name:
+        console.print("  [dim]Uso: /mcp check <id>  (ver /mcp catalog para IDs)[/dim]")
+        return
+    srv = find_in_catalog(id_or_name)
+    if srv is None:
+        console.print(f"  [red]✗[/red]  '{id_or_name}' no encontrado en el catálogo.  "
+                      "[dim]/mcp catalog para listar[/dim]")
+        return
+    console.print()
+    console.print(f"  [bold cyan]{srv.get('name', '')}[/bold cyan]  "
+                  f"[dim]({srv.get('id', '')})[/dim]")
+    console.print(f"  {srv.get('description', '')}")
+    console.print(f"  [dim]Runtime:[/dim]  {srv.get('runtime', '')}")
+    console.print(f"  [dim]Cmd base:[/dim] {' '.join(srv.get('cmd', []))}")
+    if srv.get("example_args"):
+        console.print(f"  [dim]Ejemplo:[/dim]  "
+                      f"{' '.join(srv.get('cmd', []))} {' '.join(srv.get('example_args', []))}")
+    if srv.get("install_hint"):
+        console.print(f"  [dim]Instalar:[/dim] {srv['install_hint']}")
+    if srv.get("note"):
+        console.print(f"  [dim]Nota:[/dim]     {srv['note']}")
+    missing = check_server_prerequisites(srv)
+    if missing:
+        console.print(f"  [red]✗ Prerequisito no encontrado:[/red] {', '.join(missing)}")
+        console.print(f"  [dim]Instala con:[/dim] {srv.get('install_hint', 'ver documentación')}")
+    else:
+        console.print("  [green]✓[/green]  Prerequisitos OK")
+    console.print()
+
+
+def _cmd_mcp_install(rest: str, agent_loop, pool) -> None:
+    """Añade un servidor del catálogo a oocode.json y lo arranca (hot-add)."""
+    from agent.mcp_manager import (
+        find_in_catalog, build_entry_from_catalog,
+        add_server, check_server_prerequisites, hot_add_to_pool,
+    )
+    if not rest:
+        console.print("  [dim]Uso: /mcp install <id> [args adicionales...][/dim]")
+        console.print("  [dim]     /mcp catalog para ver IDs disponibles[/dim]")
+        return
+
+    tokens    = rest.split()
+    id_or_name = tokens[0]
+    extra_args = tokens[1:]
+
+    srv = find_in_catalog(id_or_name)
+    if srv is None:
+        console.print(f"  [red]✗[/red]  '{id_or_name}' no encontrado en el catálogo.  "
+                      "[dim]/mcp catalog para listar[/dim]")
+        return
+
+    # Verificar prerequisitos
+    missing = check_server_prerequisites(srv)
+    if missing:
+        console.print(
+            f"  [yellow]⚠[/yellow]  Prerequisito no encontrado: [bold]{', '.join(missing)}[/bold]"
+        )
+        if srv.get("install_hint"):
+            console.print(f"  Instalar con: [cyan]{srv['install_hint']}[/cyan]")
+        console.print("  [dim]Configura igualmente (arranque fallará si el runtime no está disponible)[/dim]")
+
+    entry = build_entry_from_catalog(srv, extra_args)
+    add_server(entry)
+    console.print(
+        f"  [green]✓[/green]  Servidor [cyan]{entry['name']}[/cyan] añadido a oocode.json"
+    )
+    console.print(f"  [dim]Cmd:[/dim] {' '.join(entry['cmd'])}")
+
+    # Hot-add: arrancar en el pool activo sin reiniciar OOCode
+    if pool is not None:
+        registry = getattr(agent_loop, "registry", None)
+        if registry is not None:
+            console.print(f"  Arrancando [cyan]{entry['name']}[/cyan]…", end=" ")
+            ok, msg = hot_add_to_pool(entry, pool, registry)
+            if ok:
+                console.print(f"[green]✓[/green]  {msg}")
+            else:
+                console.print(f"[red]✗[/red]  {msg}")
+        else:
+            console.print("  [dim]Reinicia OOCode para activar el servidor.[/dim]")
+    else:
+        console.print("  [dim]Reinicia OOCode para activar el servidor.[/dim]")
+
+
+def _cmd_mcp_add(rest: str, agent_loop, pool) -> None:
+    """Añade un servidor MCP personalizado (nombre + cmd libre)."""
+    from agent.mcp_manager import add_server, hot_add_to_pool
+    tokens = rest.split()
+    if len(tokens) < 2:
+        console.print("  [dim]Uso: /mcp add <nombre> <cmd> [args...][/dim]")
+        console.print("  [dim]Ejemplo: /mcp add mi-fs npx -y @modelcontextprotocol/server-filesystem /home/user[/dim]")
+        return
+
+    name = tokens[0]
+    cmd  = tokens[1:]
+    entry = {"name": name, "cmd": cmd, "enabled": True}
+    add_server(entry)
+    console.print(
+        f"  [green]✓[/green]  Servidor [cyan]{name}[/cyan] añadido a oocode.json"
+    )
+    console.print(f"  [dim]Cmd:[/dim] {' '.join(cmd)}")
+
+    if pool is not None:
+        registry = getattr(agent_loop, "registry", None)
+        if registry is not None:
+            console.print(f"  Arrancando [cyan]{name}[/cyan]…", end=" ")
+            ok, msg = hot_add_to_pool(entry, pool, registry)
+            if ok:
+                console.print(f"[green]✓[/green]  {msg}")
+            else:
+                console.print(f"[red]✗[/red]  {msg}")
+        else:
+            console.print("  [dim]Reinicia OOCode para activar el servidor.[/dim]")
+    else:
+        console.print("  [dim]Reinicia OOCode para activar el servidor.[/dim]")
+
+
+def _cmd_mcp_remove(name: str, pool) -> None:
+    """Elimina un servidor de oocode.json y lo para si está activo."""
+    from agent.mcp_manager import remove_server
+    if not name:
+        console.print("  [dim]Uso: /mcp remove <nombre>[/dim]")
+        return
+    removed = remove_server(name)
+    if removed:
+        console.print(f"  [green]✓[/green]  Servidor [cyan]{name}[/cyan] eliminado de oocode.json.")
+        if pool is not None:
+            client = pool.get_client(name)
+            if client:
+                try:
+                    client.stop()
+                except Exception:
+                    pass
+                console.print(f"  [dim]Servidor parado.[/dim]")
+        console.print("  [dim]Reinicia OOCode para aplicar cambios.[/dim]")
+    else:
+        console.print(f"  [red]✗[/red]  Servidor '{name}' no encontrado en oocode.json.")
+
+
+def _cmd_mcp_toggle(name: str, enable: bool, pool) -> None:
+    """Activa o desactiva un servidor en oocode.json."""
+    from agent.mcp_manager import set_server_enabled
+    if not name:
+        action = "enable" if enable else "disable"
+        console.print(f"  [dim]Uso: /mcp {action} <nombre>[/dim]")
+        return
+    found = set_server_enabled(name, enable)
+    if found:
+        state = "[green]activado[/green]" if enable else "[dim]desactivado[/dim]"
+        console.print(f"  [green]✓[/green]  Servidor [cyan]{name}[/cyan] {state} en oocode.json.")
+        console.print("  [dim]Reinicia OOCode para aplicar.[/dim]")
+    else:
+        console.print(f"  [red]✗[/red]  Servidor '{name}' no encontrado en oocode.json.")
 
 
 # ── RAG ───────────────────────────────────────────────────────────────────────
@@ -4173,6 +5578,11 @@ def _cmd_rag(args: str, agent_loop, config) -> None:
                         similarity_threshold=config.rag_similarity_threshold,
                         max_snippet_chars=config.rag_max_snippet_chars,
                         index_interval=config.rag_index_interval,
+                        max_file_chars=config.rag_max_file_chars,
+                        chunk_chars=config.rag_chunk_chars,
+                        chunk_overlap=config.rag_chunk_overlap,
+                        max_files=config.rag_max_files,
+                        min_slot_chars=config.rag_min_slot_chars,
                     )
                     agent_loop._workspace_rag = rag
                     rag.ensure_indexed()
@@ -4201,6 +5611,7 @@ def _cmd_rag(args: str, agent_loop, config) -> None:
             return
         import threading as _threading
         import time as _time
+        _RAG_REINDEX_POLL = 0.4   # segundos entre comprobaciones de progreso de re-indexación
         console.print("  [dim]Re-indexando workspace…[/dim]")
         _t = _threading.Thread(target=rag._do_index, args=(False,), daemon=True,
                                name="oocode-rag-reindex")
@@ -4212,7 +5623,7 @@ def _cmd_rag(args: str, agent_loop, config) -> None:
                 _last_files = _files
                 if _files > 0:
                     console.print(f"  [dim]  … {_files} ficheros procesados[/dim]")
-            _time.sleep(0.4)
+            _time.sleep(_RAG_REINDEX_POLL)
         console.print(
             f"  [green]✓[/green]  Re-indexación completa: "
             f"[cyan]{rag.index_size}[/cyan] fragmentos  ·  "
@@ -4324,13 +5735,13 @@ def _cmd_snapshots(args: str, agent_loop) -> None:
             console.print(f"  contexto: {ctx.get('messages', 0)} msgs  "
                           f"~{ctx.get('tokens_estimate', 0)} tok")
             if ctx.get("summary"):
-                console.print(f"\n  [dim]Resumen:[/dim]\n  {ctx['summary'][:400]}")
+                console.print(f"\n  [dim]Resumen:[/dim]\n  {ctx['summary']}")
             last = data.get("last_messages", [])
             if last:
                 console.print(f"\n  [dim]Últimos {len(last)} mensajes:[/dim]")
                 for m in last:
                     role = m.get("role", "?")
-                    content = m.get("content", "")[:120].replace("\n", " ")
+                    content = m.get("content", "")
                     console.print(f"  [{role}] {content}")
             console.print()
         except Exception as exc:
@@ -4438,3 +5849,154 @@ def _cmd_lint(args: str, config) -> None:
         console.print(out or "  [green]✓[/green]  Sin diagnósticos.")
     else:
         console.print(_lint_project(str(p)))
+
+
+def run_webserver_standalone(cmd: str, config) -> bool:
+    """Controla el WebUI daemon desde CLI (oocode --webserver start|stop|status|restart).
+
+    Devuelve True si la operación tuvo éxito, False si hubo error.
+    """
+    import sys as _sys
+    import os as _os
+    import subprocess as _subprocess
+    import time as _time
+    from pathlib import Path as _P
+
+    _state_file = _P.home() / ".oocode" / "webui_state.json"
+    _host       = getattr(config, "webui_host", "0.0.0.0")
+    _port       = int(getattr(config, "webui_port", 4000))
+    _log_file   = getattr(config, "webui_log_file", "")
+    _log_path   = (
+        _P(_log_file).expanduser()
+        if _log_file
+        else _P.home() / ".oocode" / "logs" / "webserver.log"
+    )
+
+    def _load_state() -> dict:
+        if _state_file.exists():
+            try:
+                return json.loads(_state_file.read_text())
+            except Exception:
+                pass
+        return {}
+
+    def _save_config(enabled: bool) -> None:
+        _cfg = _P.home() / ".oocode" / "oocode.json"
+        try:
+            _d = json.loads(_cfg.read_text()) if _cfg.exists() else {}
+            _d.setdefault("webui", {})["enabled"] = enabled
+            _cfg.write_text(json.dumps(_d, indent=2, ensure_ascii=False))
+        except Exception:
+            pass
+
+    def _do_stop(state: dict) -> bool:
+        _pid = state.get("pid")
+        if _pid:
+            try:
+                _os.kill(_pid, 0)
+                _os.kill(_pid, 15)  # SIGTERM
+                console.print(f"  [green]✓[/green]  WebUI daemon detenido (PID {_pid})\n")
+            except ProcessLookupError:
+                console.print("  [yellow]⚠[/yellow]  El proceso ya no existía\n")
+            except PermissionError:
+                console.print(f"  [yellow]⚠[/yellow]  Sin permiso para señalizar PID {_pid}\n")
+                return False
+        _state_file.unlink(missing_ok=True)
+        _save_config(False)
+        return True
+
+    def _do_start() -> bool:
+        try:
+            import flask  # noqa: F401
+        except ImportError:
+            console.print(
+                "  [red]✗[/red]  Flask no instalado.\n"
+                "  [dim]Instala con: pip install flask[/dim]"
+            )
+            return False
+        _save_config(True)
+        _server_mod = str(_P(__file__).parent.parent / "webui" / "server.py")
+        _proc = _subprocess.Popen(
+            [_sys.executable, _server_mod, _host, str(_port), str(_log_path)],
+            stdout=_subprocess.DEVNULL,
+            stderr=_subprocess.DEVNULL,
+            stdin=_subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        for _ in range(30):
+            _time.sleep(0.2)
+            if _state_file.exists():
+                break
+        state = _load_state()
+        if state.get("running"):
+            console.print(
+                f"  [green]✓[/green]  WebUI daemon iniciado en http://{_host}:{_port}\n"
+                f"  [dim]PID: [cyan]{state.get('pid', _proc.pid)}[/cyan] | "
+                f"Log → [cyan]{_log_path}[/cyan][/dim]\n"
+                f"  [dim]Para parar: [cyan]oocode --webserver stop[/cyan][/dim]"
+            )
+            return True
+        console.print(
+            f"  [yellow]⚠[/yellow]  El servidor tardó en arrancar. "
+            f"Revisa el log: [cyan]{_log_path}[/cyan]\n"
+        )
+        return False
+
+    state = _load_state()
+
+    if cmd == "status":
+        if state.get("running"):
+            _pid = state.get("pid")
+            _alive = False
+            if _pid:
+                try:
+                    _os.kill(_pid, 0)
+                    _alive = True
+                except Exception:
+                    pass
+            _elapsed = int(_time.time() - state.get("started_ts", _time.time()))
+            _status_icon = "[green]✓[/green]" if _alive else "[yellow]⚠[/yellow] (proceso ya no existe)"
+            console.print(
+                f"  {_status_icon}  WebUI en http://{state.get('host', _host)}:{state.get('port', _port)}\n"
+                f"  [dim]PID: [cyan]{_pid}[/cyan] | Uptime: [cyan]{_elapsed}s[/cyan] | "
+                f"Log: [cyan]{state.get('log', _log_path)}[/cyan][/dim]"
+            )
+        else:
+            console.print(
+                f"  [yellow]●[/yellow]  WebUI no activo (config: {_host}:{_port})\n"
+                f"  [dim]Arranca con: [cyan]oocode --webserver start[/cyan][/dim]"
+            )
+        return True
+
+    elif cmd == "start":
+        if state.get("running"):
+            _pid = state.get("pid")
+            try:
+                if _pid:
+                    _os.kill(_pid, 0)
+                console.print(
+                    f"  [yellow]⚠[/yellow]  WebUI ya activo en http://{_host}:{_port} (PID {_pid})\n"
+                    "  [dim]Usa [cyan]oocode --webserver restart[/cyan] para reiniciarlo[/dim]"
+                )
+                return True
+            except (ProcessLookupError, TypeError):
+                _state_file.unlink(missing_ok=True)
+        console.print(f"  [dim]Iniciando WebUI daemon en {_host}:{_port}...[/dim]")
+        return _do_start()
+
+    elif cmd == "stop":
+        if state.get("running"):
+            return _do_stop(state)
+        _state_file.unlink(missing_ok=True)
+        console.print("  [yellow]⚠[/yellow]  WebUI no estaba activo\n")
+        return True
+
+    elif cmd == "restart":
+        _WEBUI_RESTART_GRACE = 0.5   # segundos de gracia entre stop y start del daemon WebUI
+        console.print(f"  [dim]Reiniciando WebUI en {_host}:{_port}...[/dim]")
+        if state.get("running"):
+            _do_stop(state)
+            _time.sleep(_WEBUI_RESTART_GRACE)
+        return _do_start()
+
+    return True

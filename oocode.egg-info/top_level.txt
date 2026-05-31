@@ -1,0 +1,10 @@
+agent
+config
+mcp_servers
+oocode
+plugins
+skills
+tools
+ui
+webui
+workspace

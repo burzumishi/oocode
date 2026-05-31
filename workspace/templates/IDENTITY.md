@@ -55,12 +55,4 @@ Estos ficheros son tu memoria. Léelos al arrancar. Actualízalos cuando aprenda
     ├── YYYY-MM-DD.md      # Logs de cada día
 ```
 
-## Debug
-
-- **Limpiar historial REPL:** `rm ~/.oocode/history`
-- **Config:** `~/.oocode/oocode.json`
-- **Memoria:** `~/.oocode/workspace/main/memory/`
-
----
-
-*Última actualización: 2026-05-24*
+*Actualizado: 2026-05-28*

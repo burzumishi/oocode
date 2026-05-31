@@ -336,4 +336,4 @@ class TestVerifyAfterEditRegistration:
 
     def test_total_builtins_now_15(self):
         from tools.hooks import _BUILTINS
-        assert len(_BUILTINS) == 19  # 14 anteriores + interface_change_detector
+        assert len(_BUILTINS) == 22  # 19 anteriores + dead_code_detection + deadlock_detection + performance_profiling

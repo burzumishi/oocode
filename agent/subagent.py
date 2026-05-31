@@ -29,9 +29,12 @@ class ActiveSubAgent:
     result:      Optional[str] = None
     error:       Optional[str] = None
     finished_at: Optional[float] = None   # timestamp de finalización
-    steer_count: int   = 0               # instrucciones steer enviadas
+    steer_count:  int   = 0               # instrucciones steer enviadas
     priority:     int   = 0               # prioridad de la tarea (mayor = más urgente)
     queue_time:   float = 0.0            # tiempo en cola (para background agents)
+    n_tool_uses:  int   = 0               # tool calls ejecutados por el subagente
+    n_tokens_out: int   = 0               # tokens de output generados (acumulado)
+    ctx_pct:      int   = 0               # % de contexto usado (actualizado por el subagente)
 
     def elapsed(self) -> float:
         if self.finished_at is not None:
@@ -51,6 +54,26 @@ class ActiveSubAgent:
 # Registro global de subagentes activos (accedido desde commands.py)
 _registry: dict[str, "ActiveSubAgent"] = {}
 _registry_lock = threading.Lock()
+
+# Contador round-robin para distribución de hosts Ollama entre subagentes
+_host_rr_lock:    threading.Lock = threading.Lock()
+_host_rr_counter: int            = 0
+
+
+def _pick_subagent_host(config) -> str:
+    """Selecciona el host Ollama para un subagente según la política de routing.
+
+    round-robin: distribuye entre todos los hosts disponibles (principal + extras).
+    primary-only: siempre usa el host principal (comportamiento clásico).
+    """
+    global _host_rr_counter
+    all_hosts = config.all_ollama_hosts
+    if len(all_hosts) <= 1 or config.ollama_subagent_routing == "primary-only":
+        return config.ollama_host
+    with _host_rr_lock:
+        idx = _host_rr_counter % len(all_hosts)
+        _host_rr_counter += 1
+    return all_hosts[idx]
 
 # Cola de subagentes con gestión de prioridades
 _subagent_queue: list[tuple[float, int, "ActiveSubAgent"]] = []  # (timestamp, priority, sub)
@@ -82,51 +105,36 @@ def _dequeue() -> Optional["ActiveSubAgent"]:
 
 
 def _queue_worker_fn() -> None:
-    """Worker global que procesa la cola de subagentes."""
-    global _queue_worker
-    _queue_worker = threading.current_thread()
-    
-    while not _queue_shutdown.is_set():
-        sub = _dequeue()
-        if sub is None:
-            # Esperar un breve periodo antes de revisar la cola
-            time.sleep(0.01)
-            continue
-        
-        # Iniciar worker para este subagente
-        def _process_sub(sub: ActiveSubAgent) -> None:
-            try:
-                sub.result = self.run(
-                    sub.agent_id, sub.task, silent=True,
-                    kill_event=sub.kill_event, steer_queue=sub.steer_queue,
-                    priority=sub.priority,
-                )
-                if sub.status == "running":
-                    sub.status = "done"
-            except Exception as exc:
-                sub.error = str(exc)
-                sub.status = "error"
-            finally:
-                sub.finished_at = time.time()
-                _deregister(sub.run_id)
-        
-        t = threading.Thread(
-            target=_process_sub, daemon=True,
-            name=f"oocode-sub-{sub.run_id[:6]}",
-        )
-        sub.thread = t
-        t.start()
+    """Placeholder — la cola se mantiene por compatibilidad pero los subagentes
+    se ejecutan directamente en spawn_background con su propio thread."""
+    pass
+
+
+def _register(sub: "ActiveSubAgent") -> None:
+    """Registra un subagente en el registro global."""
+    with _registry_lock:
+        _registry[sub.run_id] = sub
 
 
 def _start_queue_worker() -> None:
-    """Inicia el worker global de la cola."""
-    global _queue_worker
-    if _queue_worker is None or not _queue_worker.is_alive():
-        _queue_worker = threading.Thread(target=_queue_worker_fn, daemon=True)
-        _queue_worker.start()
+    """No-op — subagentes se lanzan directamente con spawn_background."""
+    pass
 
 
-_RECENT_TTL = 1800   # segundos que permanecen los subagentes finalizados (30 min)
+def _get_recent_ttl() -> int:
+    """Lee recentTtl desde oocode.json o devuelve el default (1800 s)."""
+    try:
+        from pathlib import Path as _P
+        import json as _j
+        _f = _P.home() / ".oocode" / "oocode.json"
+        if _f.exists():
+            return int(_j.loads(_f.read_text()).get("subagents", {}).get("recentTtl", 1800))
+    except Exception:
+        pass
+    return 1800
+
+
+_RECENT_TTL = _get_recent_ttl()
 
 
 def _deregister(run_id: str) -> None:
@@ -202,7 +210,8 @@ class SubAgentRunner:
         self._parent_plugins = parent_plugins   # PluginManager del padre
         self._parent_skills  = parent_skills    # SkillManager del padre
         self._parent_client  = parent_client    # ollama.Client del padre (evita reload)
-        self._parent_rt      = None             # RuntimeSettings del padre (se inyecta en oocode.py)
+        self._parent_rt         = None   # RuntimeSettings del padre (se inyecta en oocode.py)
+        self._parent_webui_queue = None  # queue del padre en modo WebUI (se inyecta en sessions.py)
 
     # ── Herramientas bloqueadas en modo explore ───────────────────────────────
 
@@ -265,7 +274,8 @@ RESTRICCIONES ABSOLUTAS:
     def run(self, agent_id: str, task: str, silent: bool = False,
             kill_event: Optional[threading.Event] = None,
             steer_queue: Optional[queue.SimpleQueue] = None,
-            explore_mode: bool = False, priority: int = 0) -> str:
+            explore_mode: bool = False, priority: int = 0,
+            sub_ref: Optional["ActiveSubAgent"] = None) -> str:
         """Ejecuta un subagente y devuelve su resultado.
 
         El subagente escribe su output directamente al console del padre
@@ -281,10 +291,14 @@ RESTRICCIONES ABSOLUTAS:
 
         sub_config = OOConfig.load(agent_id=agent_id)
 
-        # Forzar mismo modelo e host que el padre (restricción VRAM)
-        sub_config.model                = self.config.model
-        sub_config.ollama_host          = self.config.ollama_host
-        sub_config.embed_model          = self.config.embed_model
+        # Modelo: mismo que el padre (restricción VRAM compartida)
+        # Host: round-robin entre hosts disponibles para paralelismo real
+        sub_config.model                    = self.config.model
+        sub_config.ollama_host              = _pick_subagent_host(self.config)
+        sub_config.ollama_extra_hosts       = self.config.ollama_extra_hosts
+        sub_config.ollama_embed_host        = self.config.ollama_embed_host
+        sub_config.ollama_subagent_routing  = self.config.ollama_subagent_routing
+        sub_config.embed_model              = self.config.embed_model
         # Heredar configs per-modelo para que el subagente use el mismo contextWindow
         sub_config.model_configs        = self.config.model_configs
         sub_config.model_system_overhead = self.config.model_system_overhead
@@ -356,9 +370,13 @@ RESTRICCIONES ABSOLUTAS:
         embed = self._shared_embed
         if embed is None:
             embed = EmbeddingClient(
-                host=sub_config.ollama_host,
+                host=sub_config.effective_embed_host,
                 model=sub_config.embed_model,
                 max_input_chars=sub_config.embed_max_input_chars,
+                disk_cache_enabled=sub_config.embed_disk_cache_enabled,
+                disk_cache_dir=sub_config.embed_disk_cache_dir,
+                disk_cache_max=sub_config.embed_disk_cache_max,
+                ram_cache_max=sub_config.embed_ram_cache_max,
             )
 
         from config import MEMORY_DIR
@@ -402,9 +420,15 @@ RESTRICCIONES ABSOLUTAS:
             ollama_client=self._parent_client,  # reutiliza cliente del padre
         )
 
-        # Inyectar steer_queue y kill_event para control externo
-        loop._steer_queue = steer_queue
-        loop._ext_kill    = kill_event
+        # Inyectar steer_queue, kill_event y referencia al registro de stats
+        loop._steer_queue   = steer_queue
+        loop._ext_kill      = kill_event
+        loop._sub_stats_ref = sub_ref   # ActiveSubAgent | None — para actualizar stats
+
+        # Propagar cola WebUI del padre: los eventos del subagente fluyen al SSE del browser
+        if self._parent_webui_queue is not None:
+            loop._webui_queue = self._parent_webui_queue
+            loop._status_cb   = lambda _: None   # sin TUI status bar
 
         # Propagar modo elevated del padre al subagente
         if self._parent_rt is not None:
@@ -530,20 +554,18 @@ RESTRICCIONES ABSOLUTAS:
             thread      = None,  # type: ignore[arg-type]
             kill_event  = kill_ev,
             steer_queue = steer_q,
-            priority     = priority,  # prioridad configurada
+            priority     = priority,
             queue_time   = 0.0,
         )
-        
-        # Añadir a la cola con gestión de prioridades
-        _enqueue(sub)
-        
+        _register(sub)
+
         # Iniciar worker en thread
         def _worker():
             try:
                 sub.result = self.run(
                     agent_id, task, silent=True,
                     kill_event=kill_ev, steer_queue=steer_q,
-                    priority=priority,
+                    priority=priority, sub_ref=sub,
                 )
                 if sub.status == "running":   # no machacar "killed"
                     sub.status = "done"
@@ -608,13 +630,30 @@ RESTRICCIONES ABSOLUTAS:
         ids_str    = ", ".join(f'"{i}"' for i in agent_ids)
         model_name = self.config.model or "modelo actual"
 
+        def _fmt_sub_elapsed(secs: float) -> str:
+            if secs < 60:
+                return f"{secs:.0f}s"
+            m, s = divmod(int(secs), 60)
+            return f"{m}m {s:02d}s"
+
         def spawn_subagent(agent_id: str, task: str) -> str:
             if agent_id not in agent_ids:
                 return f"Error: agente '{agent_id}' no existe. Disponibles: {ids_str}"
             sub = self.spawn_background(agent_id, task, priority=0)
             sub.thread.join()
             if sub.error:
+                elapsed_str = _fmt_sub_elapsed(sub.elapsed())
+                console.print(f"  [dim red]⎿  Error ({elapsed_str}): {sub.error[:120]}[/dim red]")
                 return f"Error en subagente: {sub.error}"
+            # Imprimir footer con estadísticas
+            elapsed_str = _fmt_sub_elapsed(sub.elapsed())
+            n_tools     = sub.n_tool_uses
+            n_tok       = sub.n_tokens_out
+            tok_str     = (f" · {n_tok // 1000:.1f}k tokens" if n_tok >= 1000
+                           else (f" · {n_tok} tokens" if n_tok > 0 else ""))
+            tools_str   = f"{n_tools} tool use{'s' if n_tools != 1 else ''}" if n_tools > 0 else ""
+            stats_inner = "  ·  ".join(filter(None, [tools_str, tok_str.lstrip(" · "), elapsed_str]))
+            console.print(f"  [dim]⎿  Done ({stats_inner}) (ctrl+o to expand)[/dim]")
             return sub.result or ""
 
         schema = {
@@ -624,7 +663,9 @@ RESTRICCIONES ABSOLUTAS:
                 f"El subagente usa el mismo modelo ({model_name}) y servidor Ollama. "
                 f"Su output es visible en tiempo real en la conversación (prefijo │). "
                 f"Agentes disponibles: {ids_str}. "
-                "Útil para delegar tareas en workspaces independientes."
+                "Útil para delegar tareas en workspaces independientes. "
+                "IMPORTANTE: si hay un plan activo, llama task_done() justo después "
+                "para marcar la tarea del plan como completada."
             ),
             "parameters": {
                 "type": "object",
@@ -652,7 +693,7 @@ RESTRICCIONES ABSOLUTAS:
 
         def explore(task: str) -> str:
             """Lanza un subagente read-only de exploración."""
-            console.print(f"  [bold cyan]🔍 Explorando:[/bold cyan] [dim]{task[:120]}[/dim]")
+            console.print(f"  [bold cyan]🔍 Explorando:[/bold cyan] [dim]{task}[/dim]")
 
             run_id  = uuid.uuid4().hex
             kill_ev = threading.Event()
@@ -722,3 +763,6 @@ RESTRICCIONES ABSOLUTAS:
             },
         }
         return "explore", explore, schema
+
+# Exportar funciones para tests
+__all__ = ["SubAgentRunner", "ActiveSubAgent", "_enqueue", "_dequeue", "_register", "_deregister", "_subagent_queue"]

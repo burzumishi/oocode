@@ -8,7 +8,7 @@ from pathlib import Path
 from rich.prompt import IntPrompt
 import ollama
 
-from config import OOConfig, CONFIG_DIR, MEMORY_DIR
+from config import OOConfig, CONFIG_DIR, MEMORY_DIR, VERSION
 from agent.branches import BranchManager
 from agent.embeddings import EmbeddingClient
 import agent.logger as log
@@ -59,9 +59,6 @@ def select_model_interactive(config: OOConfig) -> None:
     except Exception as e:
         console.print(f"  [red]Error conectando con Ollama:[/red] {e}")
         sys.exit(1)
-    #finally:
-    #    return True
-    #    client.close()
 
 
 def _sync_plugins() -> None:
@@ -99,6 +96,33 @@ def _sync_skills() -> None:
         if not dst.exists():
             import shutil
             shutil.copy2(src, dst)
+
+
+def _ensure_all_workspaces(config) -> None:
+    """Inicializa silenciosamente el workspace de cada agente definido en oocode.json.
+
+    El agente activo se salta — su workspace lo gestiona el bloque principal con output.
+    Para el resto: si el directorio no existe o no tiene IDENTITY.md, copiar plantillas.
+    """
+    current_ws = str(Path(config.workspace).expanduser().resolve())
+    for agent in config.agents:
+        ws_path = agent.workspace
+        if not ws_path:
+            continue
+        ws_abs = str(Path(ws_path).expanduser().resolve())
+        if ws_abs == current_ws:
+            continue  # El agente activo se gestiona aparte con console output
+        ws = WorkspaceManager(
+            ws_path,
+            agent_name=agent.name,
+            agent_emoji=agent.emoji,
+            ollama_host=config.ollama_host,
+            permissions=config.permissions,
+            max_memory_lines=config.ws_max_memory_lines,
+            max_daily_chars=config.ws_max_daily_chars,
+        )
+        if not ws.exists():
+            ws.init()
 
 
 def build_registry(workdir: str, config=None) -> ToolRegistry:
@@ -514,20 +538,38 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Ejemplos:\n"
-            "  oocode                          Agente 'main' desde ~/.oocode/oocode.json\n"
-            "  oocode --agent coding           Agente 'coding' con su propio workspace\n"
-            "  oocode --model qwen3.5:9b       Sobreescribe el modelo para esta sesión\n"
-            "  oocode /home/user/mi-proyecto   Workspace apuntando a un proyecto\n"
+            "  oocode --version                     Muestra la versión y sale\n"
+            "  oocode                               Agente 'main' desde ~/.oocode/oocode.json\n"
+            "  oocode --agent coding                Agente 'coding' con su propio workspace\n"
+            "  oocode --model qwen3.5:9b            Sobreescribe el modelo para esta sesión\n"
+            "  oocode --doctor                      Verifica dependencias y configuración\n"
+            "  oocode --webserver start             Arranca el WebUI daemon (independiente del TUI)\n"
+            "  oocode --webserver stop              Para el WebUI daemon\n"
+            "  oocode --webserver status            Estado del WebUI daemon\n"
+            "  oocode --recover-last-session        Recupera la última sesión con mensajes\n"
+            "  oocode --recover-session abc123      Recupera la sesión con ese ID o prefijo\n"
+            "  oocode /home/user/mi-proyecto        Workspace apuntando a un proyecto\n"
         ),
     )
+    parser.add_argument("--version", "-V", action="version",
+                        version=f"OOCode {VERSION}")
     parser.add_argument("--agent", "-a", metavar="ID",
                         help="ID del agente (definido en ~/.oocode/oocode.json)")
     parser.add_argument("--model", "-m", metavar="MODELO",
                         help="Modelo Ollama (sobreescribe el del agente para esta sesión)")
     parser.add_argument("--host", metavar="URL",
-                        help="URL del servidor Ollama (ej: http://192.168.1.33:11434)")
+                        help="URL del servidor Ollama (ej: http://192.168.1.100:11434)")
     parser.add_argument("--workspace", "-w", metavar="RUTA",
                         help="Workspace del agente (sobreescribe el de oocode.json)")
+    parser.add_argument("--doctor", action="store_true",
+                        help="Verifica dependencias, conectividad y configuración, luego sale")
+    parser.add_argument("--webserver", choices=["start", "stop", "restart", "status"],
+                        metavar="CMD",
+                        help="Controla el WebUI daemon: start|stop|restart|status")
+    parser.add_argument("--recover-last-session", action="store_true",
+                        help="Recupera la última sesión con mensajes al arrancar")
+    parser.add_argument("--recover-session", metavar="ID",
+                        help="Recupera la sesión con el ID (o prefijo) indicado al arrancar")
     parser.add_argument("dir", nargs="?",
                         help="Directorio de trabajo del proyecto (donde buscar OOCODE.md)")
     args = parser.parse_args()
@@ -543,6 +585,32 @@ def main() -> None:
     if args.workspace:
         config.workspace = str(Path(args.workspace).expanduser().resolve())
 
+    # Inicializar workspaces de todos los agentes definidos en oocode.json si no existen
+    _ensure_all_workspaces(config)
+
+    # Inicializar sistema de logs (antes de cualquier diagnóstico o subcomando)
+    log.init(
+        enabled=config.log_enabled,
+        log_file=config.log_file,
+        level=config.log_level,
+        max_size_mb=config.log_max_size,
+        max_files=config.log_max_files,
+    )
+
+    # --doctor: diagnóstico standalone antes de entrar al REPL
+    if args.doctor:
+        if args.dir:
+            os.chdir(str(Path(args.dir).expanduser().resolve()))
+        config.project_dir = str(Path.cwd().resolve())
+        from ui.commands import run_doctor_standalone
+        ok = run_doctor_standalone(config)
+        sys.exit(0 if ok else 1)
+
+    # --webserver: controla el WebUI daemon sin entrar al REPL
+    if args.webserver:
+        from ui.commands import run_webserver_standalone
+        sys.exit(0 if run_webserver_standalone(args.webserver, config) else 1)
+
     # Directorio de proyecto: separado del workspace de identidad (~/.oocode/workspace/main/)
     # args.dir indica el proyecto donde buscar OOCODE.md y ejecutar bash — no el workspace.
     if args.dir:
@@ -556,14 +624,6 @@ def main() -> None:
             config.model_configs[config.model]["timeoutSeconds"] = config.fallback_timeout
             config.save()
 
-    # Inicializar sistema de logs
-    log.init(
-        enabled=config.log_enabled,
-        log_file=config.log_file,
-        level=config.log_level,
-        max_size_mb=config.log_max_size,
-        max_files=config.log_max_files,
-    )
     log.info("session_start", agent=config.agent_id, model=config.model or "")
 
     # Runtime se crea aquí para que el banner use el color guardado
@@ -618,9 +678,13 @@ def main() -> None:
 
     permissions = PermissionManager(config.permissions)
     embed_client = EmbeddingClient(
-        host=config.ollama_host,
+        host=config.effective_embed_host,
         model=config.embed_model,
         max_input_chars=config.embed_max_input_chars,
+        disk_cache_enabled=config.embed_disk_cache_enabled,
+        disk_cache_dir=config.embed_disk_cache_dir,
+        disk_cache_max=config.embed_disk_cache_max,
+        ram_cache_max=config.embed_ram_cache_max,
     )
     # Directorio de memoria por agente: evita mezcla de memorias entre agentes
     agent_memory_dir = MEMORY_DIR / config.agent_id
@@ -659,6 +723,11 @@ def main() -> None:
                 similarity_threshold=config.rag_similarity_threshold,
                 max_snippet_chars=config.rag_max_snippet_chars,
                 index_interval=config.rag_index_interval,
+                max_file_chars=config.rag_max_file_chars,
+                chunk_chars=config.rag_chunk_chars,
+                chunk_overlap=config.rag_chunk_overlap,
+                max_files=config.rag_max_files,
+                min_slot_chars=config.rag_min_slot_chars,
             )
             log.info("workspace_rag_init", workspace=config.workspace,
                      index_size=_workspace_rag.index_size)
@@ -708,6 +777,23 @@ def main() -> None:
             "required": ["name", "content"],
         },
     })
+
+    # ── Resolver sesión a recuperar (--recover-last-session / --recover-session) ──
+    from agent.session import find_last_session_with_messages, find_session_by_prefix
+    _recover_id: str | None = None
+    if getattr(args, "recover_session", None):
+        _recover_id = find_session_by_prefix(config.agent_id, args.recover_session)
+        if _recover_id is None:
+            console.print(
+                f"  [yellow]⚠[/yellow]  Sesión no encontrada: [cyan]{args.recover_session}[/cyan]\n"
+                "  [dim]Usa /sessions para listar las sesiones disponibles[/dim]\n"
+            )
+    elif getattr(args, "recover_last_session", False):
+        _recover_id = find_last_session_with_messages(config.agent_id)
+        if _recover_id is None:
+            console.print(
+                "  [yellow]⚠[/yellow]  No hay sesiones anteriores con mensajes para recuperar\n"
+            )
 
     # Sesión
     session = SessionManager(config.agent_id)
@@ -810,12 +896,19 @@ def main() -> None:
             console.print(f"  [yellow]⚠[/yellow]  Plugin error: {err}")
 
     # Inyectar plugins, skills y cliente Ollama en el subagent_runner.
-    # Compartir el cliente evita que Ollama descargue/recargue el modelo entre
-    # llamadas del agente principal y sus subagentes.
+    # En modo primary-only o sin hosts extra: compartir cliente para evitar
+    # que Ollama descargue/recargue el modelo entre llamadas.
+    # En modo round-robin con hosts extra: NO compartir cliente — cada subagente
+    # crea el suyo propio conectado al host asignado por _pick_subagent_host(),
+    # lo que permite distribuir la carga entre varias GPUs realmente.
     subagent_runner._parent_plugins = agent.plugins
     subagent_runner._parent_skills  = agent.skills
-    subagent_runner._parent_client  = agent.client
     subagent_runner._parent_rt      = agent.rt
+    _has_extra_hosts = len(config.all_ollama_hosts) > 1
+    _is_primary_only = config.ollama_subagent_routing == "primary-only"
+    if not _has_extra_hosts or _is_primary_only:
+        subagent_runner._parent_client = agent.client  # compartir: mismo host
+    # else: _parent_client queda None → cada subagente crea ollama.Client(sub_config.ollama_host)
 
     # Hooks built-in: registrar según config.hooks_builtins
     if config.hooks_enabled and config.hooks_builtins:
@@ -927,7 +1020,35 @@ def main() -> None:
     # La toolbar lee agent._lsp_mod._pool para obtener el pool actual.
     agent._lsp_mod = agent.plugins._loaded.get("lsp")
 
+    # ── Recuperar sesión anterior si se pidió ──────────────────────────────────
+    if _recover_id:
+        _n = agent.restore_session(_recover_id)
+        if _n > 0:
+            # Buscar timestamp de la sesión para mostrarlo
+            _idx_file = (
+                Path.home() / ".oocode" / "sessions" / config.agent_id / "sessions.json"
+            )
+            _ts_str = ""
+            try:
+                import json as _j
+                _idx = _j.loads(_idx_file.read_text())
+                _entry = _idx.get(_recover_id, {})
+                _ts_str = _entry.get("started_at", "")[:19].replace("T", " ")
+            except Exception:
+                pass
+            console.print(
+                f"  [green]✓[/green]  Sesión recuperada: [cyan]{_recover_id[:8]}…[/cyan]"
+                + (f"  [dim]{_ts_str}[/dim]" if _ts_str else "")
+                + f"  [dim]{_n} mensajes restaurados[/dim]\n"
+            )
+        else:
+            console.print(
+                f"  [yellow]⚠[/yellow]  Sesión [cyan]{_recover_id[:8]}[/cyan] no tiene mensajes recuperables\n"
+            )
+
     run_repl(agent, config)
+
+    agent.close()
 
     if _mcp_pool is not None:
         _mcp_pool.stop_all()

@@ -11,7 +11,6 @@ from agent.workspace_rag import (
     _chunk_code_intelligently,
     _enrich_metadata,
     _fallback_index_chunk,
-    chunk_with_metadata,
     WorkspaceRAG,
 )
 

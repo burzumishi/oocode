@@ -21,7 +21,7 @@ class TestDefaultConfig(unittest.TestCase):
         required = {
             "ollama", "agents", "permissions", "context", "embeddings",
             "tools", "workspace", "logging", "appearance", "plugins",
-            "pluginOptions", "skills", "modelOptions", "models", "fallback",
+            "pluginOptions", "skills", "models", "fallback",
             "mcp", "hooks", "snapshots", "rag", "vision", "chatlog",
         }
         missing = required - set(self._dc().keys())
@@ -62,7 +62,8 @@ class TestDefaultConfig(unittest.TestCase):
         builtins = self._dc()["hooks"]["builtins"]
         expected = {"diff_after_write", "ctags_after_write", "lint_after_write",
                     "quick_syntax_after_write", "verify_after_edit",
-                    "test_suite_delta", "config_syntax_after_write"}
+                    "test_suite_delta", "config_syntax_after_write",
+                    "deadlock_detection", "dead_code_detection", "performance_profiling"}
         self.assertEqual(set(builtins), expected)
 
     def test_permissions_are_valid_values(self):
@@ -403,6 +404,186 @@ class TestModelInputTypes(unittest.TestCase):
         cfg = OOConfig()
         cfg.model = None
         self.assertEqual(cfg.active_model_input_types, ["text"])
+
+
+class TestMultiHostOllama(unittest.TestCase):
+    """Tests para soporte multi-servidor Ollama."""
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _load_from(self, custom: dict):
+        import copy
+        import config as _cfg_mod
+        from config import DEFAULT_CONFIG, OOConfig
+        merged = copy.deepcopy(DEFAULT_CONFIG)
+        for section, vals in custom.items():
+            if isinstance(vals, dict) and isinstance(merged.get(section), dict):
+                merged[section].update(vals)
+            else:
+                merged[section] = vals
+        import tempfile
+        tmp = Path(tempfile.mktemp(suffix=".json"))
+        tmp.write_text(json.dumps(merged, ensure_ascii=False))
+        try:
+            orig = _cfg_mod.CONFIG_FILE
+            _cfg_mod.CONFIG_FILE = tmp
+            cfg = OOConfig.load()
+        finally:
+            _cfg_mod.CONFIG_FILE = orig
+            tmp.unlink(missing_ok=True)
+        return cfg
+
+    # ── DEFAULT_CONFIG ────────────────────────────────────────────────────────
+
+    def test_default_config_ollama_extra_hosts(self):
+        from config import DEFAULT_CONFIG
+        self.assertIn("extraHosts", DEFAULT_CONFIG["ollama"])
+        self.assertEqual(DEFAULT_CONFIG["ollama"]["extraHosts"], [])
+
+    def test_default_config_ollama_embed_host(self):
+        from config import DEFAULT_CONFIG
+        self.assertIn("embedHost", DEFAULT_CONFIG["ollama"])
+        self.assertEqual(DEFAULT_CONFIG["ollama"]["embedHost"], "")
+
+    def test_default_config_ollama_subagent_routing(self):
+        from config import DEFAULT_CONFIG
+        self.assertIn("subagentRouting", DEFAULT_CONFIG["ollama"])
+        self.assertEqual(DEFAULT_CONFIG["ollama"]["subagentRouting"], "round-robin")
+
+    # ── OOConfig defaults ─────────────────────────────────────────────────────
+
+    def test_ooconfig_default_extra_hosts_empty(self):
+        from config import OOConfig
+        self.assertEqual(OOConfig().ollama_extra_hosts, [])
+
+    def test_ooconfig_default_embed_host_empty(self):
+        from config import OOConfig
+        self.assertEqual(OOConfig().ollama_embed_host, "")
+
+    def test_ooconfig_default_routing_round_robin(self):
+        from config import OOConfig
+        self.assertEqual(OOConfig().ollama_subagent_routing, "round-robin")
+
+    # ── effective_embed_host ──────────────────────────────────────────────────
+
+    def test_effective_embed_host_fallback_to_primary(self):
+        from config import OOConfig
+        cfg = OOConfig(ollama_host="http://primary:11434", ollama_embed_host="")
+        self.assertEqual(cfg.effective_embed_host, "http://primary:11434")
+
+    def test_effective_embed_host_dedicated(self):
+        from config import OOConfig
+        cfg = OOConfig(ollama_host="http://primary:11434",
+                       ollama_embed_host="http://embed:11434")
+        self.assertEqual(cfg.effective_embed_host, "http://embed:11434")
+
+    def test_effective_embed_host_primary_only_ignores_embed_host(self):
+        """primary-only debe centralizar TODO el tráfico en el host principal, incluyendo embeddings."""
+        from config import OOConfig
+        cfg = OOConfig(ollama_host="http://primary:11434",
+                       ollama_embed_host="http://secondary:11434",
+                       ollama_subagent_routing="primary-only")
+        self.assertEqual(cfg.effective_embed_host, "http://primary:11434")
+
+    def test_effective_embed_host_round_robin_uses_embed_host(self):
+        """Con round-robin, embedHost dedicado se respeta."""
+        from config import OOConfig
+        cfg = OOConfig(ollama_host="http://primary:11434",
+                       ollama_embed_host="http://secondary:11434",
+                       ollama_subagent_routing="round-robin")
+        self.assertEqual(cfg.effective_embed_host, "http://secondary:11434")
+
+    # ── all_ollama_hosts ──────────────────────────────────────────────────────
+
+    def test_all_ollama_hosts_single(self):
+        from config import OOConfig
+        cfg = OOConfig(ollama_host="http://primary:11434")
+        self.assertEqual(cfg.all_ollama_hosts, ["http://primary:11434"])
+
+    def test_all_ollama_hosts_multiple(self):
+        from config import OOConfig
+        cfg = OOConfig(ollama_host="http://h1:11434",
+                       ollama_extra_hosts=["http://h2:11434", "http://h3:11434"])
+        self.assertEqual(cfg.all_ollama_hosts,
+                         ["http://h1:11434", "http://h2:11434", "http://h3:11434"])
+
+    def test_all_ollama_hosts_filters_empty_strings(self):
+        from config import OOConfig
+        cfg = OOConfig(ollama_host="http://h1:11434",
+                       ollama_extra_hosts=["http://h2:11434", "", "http://h3:11434"])
+        self.assertEqual(cfg.all_ollama_hosts,
+                         ["http://h1:11434", "http://h2:11434", "http://h3:11434"])
+
+    # ── load() ────────────────────────────────────────────────────────────────
+
+    def test_load_extra_hosts(self):
+        cfg = self._load_from({"ollama": {"extraHosts": ["http://gpu2:11434"]}})
+        self.assertEqual(cfg.ollama_extra_hosts, ["http://gpu2:11434"])
+
+    def test_load_embed_host(self):
+        cfg = self._load_from({"ollama": {"embedHost": "http://cpu:11434"}})
+        self.assertEqual(cfg.ollama_embed_host, "http://cpu:11434")
+
+    def test_load_subagent_routing_primary_only(self):
+        cfg = self._load_from({"ollama": {"subagentRouting": "primary-only"}})
+        self.assertEqual(cfg.ollama_subagent_routing, "primary-only")
+
+    def test_load_backward_compat_no_extra_keys(self):
+        """JSON sin extraHosts/embedHost carga con los defaults sin error."""
+        cfg = self._load_from({})
+        self.assertEqual(cfg.ollama_extra_hosts, [])
+        self.assertEqual(cfg.ollama_embed_host, "")
+        self.assertEqual(cfg.ollama_subagent_routing, "round-robin")
+
+    # ── _pick_subagent_host ───────────────────────────────────────────────────
+
+    def test_pick_subagent_host_single_host(self):
+        import agent.subagent as sub_mod
+        from config import OOConfig
+        cfg = OOConfig(ollama_host="http://primary:11434")
+        self.assertEqual(sub_mod._pick_subagent_host(cfg), "http://primary:11434")
+
+    def test_pick_subagent_host_round_robin(self):
+        import agent.subagent as sub_mod
+        from config import OOConfig
+        cfg = OOConfig(ollama_host="http://h1:11434",
+                       ollama_extra_hosts=["http://h2:11434"],
+                       ollama_subagent_routing="round-robin")
+        sub_mod._host_rr_counter = 0
+        hosts = [sub_mod._pick_subagent_host(cfg) for _ in range(4)]
+        self.assertEqual(hosts, ["http://h1:11434", "http://h2:11434",
+                                  "http://h1:11434", "http://h2:11434"])
+
+    def test_pick_subagent_host_primary_only_ignores_extras(self):
+        import agent.subagent as sub_mod
+        from config import OOConfig
+        cfg = OOConfig(ollama_host="http://h1:11434",
+                       ollama_extra_hosts=["http://h2:11434", "http://h3:11434"],
+                       ollama_subagent_routing="primary-only")
+        sub_mod._host_rr_counter = 0
+        hosts = [sub_mod._pick_subagent_host(cfg) for _ in range(6)]
+        self.assertTrue(all(h == "http://h1:11434" for h in hosts))
+
+    def test_pick_subagent_host_three_hosts_round_robin(self):
+        import agent.subagent as sub_mod
+        from config import OOConfig
+        cfg = OOConfig(ollama_host="http://h1:11434",
+                       ollama_extra_hosts=["http://h2:11434", "http://h3:11434"],
+                       ollama_subagent_routing="round-robin")
+        sub_mod._host_rr_counter = 0
+        hosts = [sub_mod._pick_subagent_host(cfg) for _ in range(6)]
+        self.assertEqual(hosts, ["http://h1:11434", "http://h2:11434", "http://h3:11434",
+                                  "http://h1:11434", "http://h2:11434", "http://h3:11434"])
+
+    def test_pick_subagent_host_empty_extra_hosts(self):
+        import agent.subagent as sub_mod
+        from config import OOConfig
+        cfg = OOConfig(ollama_host="http://primary:11434",
+                       ollama_extra_hosts=[],
+                       ollama_subagent_routing="round-robin")
+        sub_mod._host_rr_counter = 0
+        for _ in range(5):
+            self.assertEqual(sub_mod._pick_subagent_host(cfg), "http://primary:11434")
 
 
 if __name__ == "__main__":

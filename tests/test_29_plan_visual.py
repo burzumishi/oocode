@@ -5,11 +5,11 @@ Basado en prueba real de consola 2026-05-20. Cubre:
 Panel visual (capture_output=False):
 - _print se llama exactamente cuando capture_output=False
 - _print NO se llama cuando capture_output=True
-- Panel contiene ◈, "Plan de ejecución", ◼/◻, ↻
+- Panel contiene ◈, "Plan de ejecución", progreso [1/N], contadores
 - Summary se muestra si se pasa; no aparece si no se pasa
-- Singular "1 tarea" vs plural "N tareas"
 - Tareas >12: panel muestra "+ N más"
 - Tareas largas (>80 chars): truncadas en panel con "…"
+- Sin iconos ◼/◻ en líneas de tarea; sin línea ↻ "Ejecutando tarea"
 
 Formato exacto de retorno:
 - plan_create: "Plan creado: N tareas. Activa ahora [1/N]: 'texto'. Usa task_done()..."
@@ -22,7 +22,7 @@ Casos límite:
 - active_idx=-1 pero hay pending: task_done lo recupera correctamente
 - Non-string items en tasks: coercionados a str()
 - Tarea >80 chars: guardada completa en _plan_tasks pero truncada en retorno
-- plan_create con 1 sola tarea: funciona (singular en panel)
+- plan_create con 1 sola tarea: funciona
 - _all_plan_tasks_done() integración con plan_create/task_done
 """
 import sys
@@ -63,6 +63,7 @@ def _make_loop(capture_output: bool = True):
     loop._kill_requested = False
     loop._pending_tasks = []
     loop._last_tool_calls = []
+    loop._flush_live_block_cb = None
     return loop
 
 
@@ -101,30 +102,31 @@ class TestPlanCreateVisualPanel:
         all_text = "\n".join(printed)
         assert "Plan de ejecución" in all_text
 
-    def test_panel_task1_has_active_icon(self):
-        """Primera tarea usa ◼ (activa)."""
+    def test_panel_task1_shows_as_dash(self):
+        """Primera tarea aparece con guión sin iconos ◼/◻."""
         loop, printed = _make_visual_loop()
         loop._execute_plan_create(["Paso 1", "Paso 2", "Paso 3"])
-        task_lines = [m for m in printed if "◼" in m or "◻" in m]
-        # La primera debe tener ◼
-        first_task_line = next((m for m in task_lines if "1." in m), "")
-        assert "◼" in first_task_line
+        task1_line = next((m for m in printed if "Paso 1" in m), "")
+        assert "- " in task1_line
+        assert "◼" not in task1_line
+        assert "◻" not in task1_line
 
-    def test_panel_other_tasks_have_pending_icon(self):
-        """Tareas 2+ usan ◻ (pendientes)."""
+    def test_panel_other_tasks_show_as_dash(self):
+        """Tareas 2+ aparecen con guión sin iconos."""
         loop, printed = _make_visual_loop()
         loop._execute_plan_create(["T1", "T2", "T3"])
-        task_lines = [m for m in printed if "◼" in m or "◻" in m]
-        second_task_line = next((m for m in task_lines if "2." in m), "")
-        assert "◻" in second_task_line
+        task2_line = next((m for m in printed if "T2" in m), "")
+        assert "- " in task2_line
+        assert "◼" not in task2_line
+        assert "◻" not in task2_line
 
-    def test_panel_contains_execute_line(self):
-        """Línea ↻ 'Ejecutando tarea 1/N' al final del panel."""
+    def test_panel_has_no_execute_line(self):
+        """No hay línea ↻ 'Ejecutando tarea' tras el plan."""
         loop, printed = _make_visual_loop()
         loop._execute_plan_create(["T1", "T2"])
         all_text = "\n".join(printed)
-        assert "↻" in all_text
-        assert "Ejecutando tarea 1/2" in all_text
+        assert "↻" not in all_text
+        assert "Ejecutando tarea" not in all_text
 
     def test_panel_shows_summary_when_provided(self):
         loop, printed = _make_visual_loop()
@@ -140,18 +142,17 @@ class TestPlanCreateVisualPanel:
         non_task_lines = [m for m in printed if "dim italic" in m]
         assert non_task_lines == []
 
-    def test_panel_singular_tarea_for_one_task(self):
+    def test_panel_single_task_shows_header(self):
         loop, printed = _make_visual_loop()
         loop._execute_plan_create(["Una única tarea"])
         header_line = next((m for m in printed if "Plan de ejecución" in m), "")
-        assert "(1 tarea)" in header_line
-        assert "tareas" not in header_line
+        assert "◈" in header_line
 
-    def test_panel_plural_tareas_for_multiple(self):
+    def test_panel_multiple_tasks_shows_header(self):
         loop, printed = _make_visual_loop()
         loop._execute_plan_create(["T1", "T2", "T3"])
         header_line = next((m for m in printed if "Plan de ejecución" in m), "")
-        assert "(3 tareas)" in header_line
+        assert "◈" in header_line
 
     def test_panel_shows_more_line_for_over_12_tasks(self):
         loop, printed = _make_visual_loop()
@@ -164,7 +165,7 @@ class TestPlanCreateVisualPanel:
         loop, printed = _make_visual_loop()
         tasks = [f"Tarea {i}" for i in range(1, 16)]
         loop._execute_plan_create(tasks)
-        task_lines = [m for m in printed if ("◼" in m or "◻" in m) and "más" not in m]
+        task_lines = [m for m in printed if "- " in m and "más" not in m]
         assert len(task_lines) == 12
 
     def test_panel_truncates_long_task_name_with_ellipsis(self):
@@ -172,21 +173,21 @@ class TestPlanCreateVisualPanel:
         loop, printed = _make_visual_loop()
         long_task = "Esta tarea tiene una descripción extremadamente larga que supera los ochenta caracteres"
         loop._execute_plan_create([long_task, "T2"])
-        task1_line = next((m for m in printed if "1." in m), "")
+        task1_line = next((m for m in printed if "Esta tarea" in m), "")
         assert "…" in task1_line
 
     def test_panel_line_count_with_summary(self):
-        """Con summary: header + summary + N tareas + ↻ = N + 3 líneas."""
+        """Con summary: header + summary + N tareas = N + 2 líneas."""
         loop, printed = _make_visual_loop()
         loop._execute_plan_create(["T1", "T2", "T3"], summary="Mi plan")
-        # 1 header + 1 summary + 3 tasks + 1 execute = 6
-        assert len(printed) == 6
+        # 1 header + 1 summary + 3 tasks = 5
+        assert len(printed) == 5
 
     def test_panel_line_count_without_summary(self):
-        """Sin summary: header + N tareas + ↻ = N + 2 líneas."""
+        """Sin summary: header + N tareas + línea vacía = N + 2 líneas."""
         loop, printed = _make_visual_loop()
         loop._execute_plan_create(["T1", "T2", "T3"])
-        # 1 header + 3 tasks + 1 execute = 5
+        # 1 header + 3 tasks + 1 línea vacía = 5
         assert len(printed) == 5
 
 
@@ -436,3 +437,46 @@ class TestPlanCreateAllTasksDoneIntegration:
         loop._execute_task_done()
         assert all(t["status"] == "done" for t in loop._plan_tasks)
         assert loop._all_plan_tasks_done()
+
+
+# ── Plan siempre inmediato — sin deferral ────────────────────────────────────
+
+class TestPlanCreateDeferred:
+    def test_always_prints_immediately_even_with_tools(self):
+        """El plan se imprime siempre de inmediato, independientemente del turn_block."""
+        loop, printed = _make_visual_loop()
+        loop._turn_block = [("read_file", {}, "ok", False)]
+        loop._execute_plan_create(["T1", "T2"])
+        assert any("Plan de ejecución" in m for m in printed)
+
+    def test_always_prints_with_summary(self):
+        """El plan se imprime siempre de inmediato, con o sin summary."""
+        loop, printed = _make_visual_loop()
+        loop._turn_block = [("read_file", {}, "ok", False)]
+        loop._execute_plan_create(["T1", "T2"], summary="Mi resumen")
+        all_text = "\n".join(printed)
+        assert "◈" in all_text
+        assert "Plan de ejecución" in all_text
+
+    def test_immediate_when_no_accumulated_tools(self):
+        """Sin tools acumuladas, el panel se imprime de inmediato."""
+        loop, printed = _make_visual_loop()
+        loop._turn_block = []
+        loop._execute_plan_create(["T1", "T2"])
+        assert any("Plan de ejecución" in m for m in printed)
+
+    def test_uses_dash_format(self):
+        """El panel usa guiones para las tareas."""
+        loop, printed = _make_visual_loop()
+        loop._execute_plan_create(["Tarea A", "Tarea B"])
+        task_lines = [m for m in printed if "Tarea A" in m or "Tarea B" in m]
+        assert len(task_lines) == 2
+        for ln in task_lines:
+            assert "- " in ln
+
+    def test_capture_output_clears_turn_block(self):
+        """En modo capture_output, _flush_turn_block limpia el buffer sin imprimir."""
+        loop = _make_loop(capture_output=True)
+        loop._turn_block = [("read_file", {}, "ok", False)]
+        loop._flush_turn_block()
+        assert loop._turn_block == []

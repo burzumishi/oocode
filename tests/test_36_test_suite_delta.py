@@ -90,7 +90,7 @@ class TestTestSuiteDeltaRegistration:
 
     def test_total_builtins_count(self):
         from tools.hooks import _BUILTINS
-        assert len(_BUILTINS) == 19
+        assert len(_BUILTINS) == 22  # 19 anteriores + dead_code_detection + deadlock_detection + performance_profiling
 
     def test_double_register_is_idempotent(self):
         from tools.hooks import HookManager

@@ -9,7 +9,7 @@ MEMORY_DIR       = CONFIG_DIR / "memory"
 HISTORY_FILE     = CONFIG_DIR / "history"
 KEYBINDINGS_FILE = CONFIG_DIR / "keybindings.json"
 
-VERSION     = "0.1.0"
+VERSION     = "0.3.6"
 APP_NAME    = "OOCode"
 APP_SUBTITLE = "Ollama Open Code"
 
@@ -17,7 +17,12 @@ DEFAULT_AGENT_ID = "main"
 
 DEFAULT_CONFIG: dict = {
     "ollama": {
-        "host": "http://localhost:11434"
+        "host":             "http://localhost:11434",
+        "extraHosts":       [],           # hosts adicionales para subagentes (round-robin)
+        "embedHost":        "",           # host dedicado para embeddings (vacío = usar host principal)
+        "subagentRouting":  "round-robin", # "round-robin" | "primary-only"
+        "ollamaRetryCount": 2,            # reintentos automáticos en timeout de Ollama (0 = sin retry)
+        "ollamaRetryDelay": 3.0           # segundos de espera base entre reintentos (se duplica con backoff)
     },
     "agents": {
         "defaults": {
@@ -345,21 +350,13 @@ DEFAULT_CONFIG: dict = {
         "file_integrity_check": "auto",
     },
     "context": {
-        "minKeep":            6,      # mensajes mínimos a conservar tras compactar
-        "compactThreshold":   0.85,   # fracción del límite que dispara auto-compactación
-        "maxSummaryChars":    2100,   # chars máximos del resumen acumulado (~600 tok)
-        "maxToolResultTokens": 800,   # tokens máximos de un resultado de tool en contexto
-        "autoContinueMax":    8       # auto-continuaciones máx. por turno (0 = desactivado)
-    },
-    "context_cache": {
-        "chars_per_token":    3.0,    # chars por token (por defecto ~3)
-        "cache_dir":          "~/.oocode/cache",
-        "cache_ttl":          300,    # segundos de caché (5 min por defecto)
-        "prompt_cache_enabled": True,  # activar/desactivar caché de prompts
-        "context_window_configurable": True,  # permitir configurar context window
-        "context_window_default": 262144,  # context window por defecto
-        "context_window_min": 8192,  # mínimo context window
-        "context_window_max": 262144  # máximo context window
+        "minKeep":              6,      # mensajes mínimos a conservar tras compactar
+        "compactThreshold":     0.85,   # fracción del límite que dispara auto-compactación
+        "maxSummaryChars":      2100,   # chars máximos del resumen acumulado (~600 tok)
+        "maxToolResultTokens":  800,    # tokens máximos de un resultado de tool en contexto
+        "autoContinueMax":      8,      # auto-continuaciones máx. por turno (0 = desactivado)
+        "highWater":            0.70,   # fracción para truncar tool results en 2ª pasada
+        "toolMaxChars":         3000    # chars máximos por tool result tras 2ª pasada de compactación
     },
     "embeddings": {
         "model":               "nomic-embed-text-v2-moe:latest",
@@ -367,7 +364,11 @@ DEFAULT_CONFIG: dict = {
         "similarityThreshold": 0.30,  # score mínimo para devolver un resultado
         "snippetChars":        400,   # chars del snippet por resultado
         "topK":                3,     # resultados máximos por búsqueda
-        "memoryEmbedEnabled":  True   # usar embeddings para búsqueda semántica en memorias
+        "memoryEmbedEnabled":  True,  # usar embeddings para búsqueda semántica en memorias
+        "diskCacheEnabled":    True,  # persistir caché de embeddings a disco
+        "diskCacheDir":        "~/.oocode/cache",  # directorio de caché en disco
+        "diskCacheMaxEntries": 2000,  # máx. entradas en caché de disco
+        "ramCacheMax":         256,   # vectores máximos en caché LRU en RAM
     },
     "tools": {
         "readFileLinesDefault":  150,   # líneas por defecto en read_file
@@ -421,18 +422,11 @@ DEFAULT_CONFIG: dict = {
     "skills": {
         "enabled": []             # lista de skills activos (sincronizado con /skills enable)
     },
-    "modelOptions": {
-        "temperature":   None,   # 0.0–2.0  (None = usar default del modelo)
-        "topP":          None,   # 0.0–1.0
-        "topK":          None,   # entero ≥1
-        "numCtx":        None,   # tokens de contexto del modelo (override global)
-        "numPredict":    None,   # tokens máximos a generar (-1 = ilimitado)
-        "repeatPenalty": None,   # 1.0 = sin penalización
-        "seed":          None    # -1 = aleatorio
-    },
     "models": {
         "systemOverhead": 2000,  # tokens reservados para system prompt + tool schemas
-        "configs": {}            # {model_id: {contextWindow, maxTokens, params}}
+        "repeatPenalty":  None,  # default global de repeat_penalty (None = sin override)
+        "seed":           None,  # default global de seed (-1=aleatorio, None = sin override)
+        "configs": {}            # {model_id: {contextWindow, maxTokens, params, thinking}}
     },
     "fallback": {
         "enabled":        False,  # activar agente de fallback
@@ -464,6 +458,7 @@ DEFAULT_CONFIG: dict = {
             "diff_after_write", "ctags_after_write", "lint_after_write",
             "quick_syntax_after_write", "verify_after_edit", "test_suite_delta",
             "config_syntax_after_write",
+            "deadlock_detection", "dead_code_detection", "performance_profiling",
         ]
     },
     "snapshots": {
@@ -479,7 +474,12 @@ DEFAULT_CONFIG: dict = {
         "indexInterval":       300,    # segundos entre re-indexaciones en background
         "topKComplex":         10,     # top_k para queries largas/autoedición (>complexMinChars)
         "thresholdComplex":    0.35,   # threshold más permisivo para queries complejas
-        "complexMinChars":     150     # longitud mínima del mensaje para activar boost
+        "complexMinChars":     150,    # longitud mínima del mensaje para activar boost
+        "maxFileChars":        6000,   # chars por fichero antes de chunking
+        "chunkChars":          512,    # chars por chunk de indexación
+        "chunkOverlap":        64,     # solapamiento entre chunks consecutivos
+        "maxFiles":            2000,   # ficheros máximos a indexar en el workspace
+        "minSlotChars":        200     # mínimo de chars por fragmento en la respuesta RAG
     },
     "vision": {
         "enabled":       True,   # activar detección de imágenes en el input
@@ -489,6 +489,31 @@ DEFAULT_CONFIG: dict = {
         "enabled":    False,               # activar/desactivar registro de conversaciones
         "path":       "",                  # ruta del fichero (vacío = ~/.oocode/logs/chat.log)
         "maxSizeMb":  10                   # tamaño máximo antes de rotar
+    },
+    "webui": {
+        "enabled":   False,                # True = WebUI activo al arrancar
+        "host":      "0.0.0.0",           # IP de escucha (0.0.0.0 = todas las interfaces)
+        "port":      4000,                 # puerto HTTP del WebUI
+        "logFile":   "",                   # ruta del log (vacío = ~/.oocode/logs/webserver.log)
+        "logMaxSizeMb": 5                  # tamaño máximo del log antes de rotar
+    },
+    "subagents": {
+        "maxConcurrent":   4,              # subagentes simultáneos máximos
+        "maxTeams":        3,              # equipos de agentes simultáneos máximos
+        "maxTeamSize":     5,              # agentes máximos por equipo
+        "recentTtl":       1800,           # segundos que permanecen los subagentes finalizados
+        "defaultPriority": 0              # prioridad por defecto de los subagentes
+    },
+    "backup": {
+        "enabled":   True,                 # activar backups automáticos antes de escribir
+        "dir":       "",                   # directorio de backups (vacío = ~/.oocode/backup/)
+        "maxFiles":  50,                   # máximo de ficheros .bak a conservar
+        "extensions": [                    # extensiones que se respaldan
+            ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".c", ".cpp",
+            ".h", ".hpp", ".java", ".rb", ".php", ".cs", ".sh", ".bash",
+            ".pl", ".pm", ".sql", ".md", ".txt", ".json", ".yaml", ".yml",
+            ".toml", ".html", ".css"
+        ]
     }
 }
 
@@ -504,7 +529,10 @@ class AgentDef(BaseModel):
 
 class OOConfig(BaseModel):
     # ── Ollama ────────────────────────────────────────────────────────────────
-    ollama_host: str = "http://localhost:11434"
+    ollama_host:             str       = "http://localhost:11434"
+    ollama_extra_hosts:      list[str] = []
+    ollama_embed_host:       str       = ""
+    ollama_subagent_routing: str       = "round-robin"
 
     # ── Agente activo ─────────────────────────────────────────────────────────
     model:       Optional[str] = None
@@ -526,6 +554,8 @@ class OOConfig(BaseModel):
     max_summary_chars:       int   = 2100
     max_tool_result_tokens:  int   = 800
     auto_continue_max:       int   = 8   # auto-continuaciones máx. por turno (0=desactivado)
+    context_high_water:      float = 0.70  # fracción de max_tokens para truncado 2ª pasada
+    context_tool_max_chars:  int   = 3000  # chars máx. por tool result en 2ª pasada
 
     # ── Embeddings ────────────────────────────────────────────────────────────
     embed_model:                str   = "nomic-embed-text-v2-moe:latest"
@@ -534,6 +564,10 @@ class OOConfig(BaseModel):
     embed_snippet_chars:        int   = 400
     embed_top_k:                int   = 3
     memory_embed_enabled:       bool  = True   # usar embeddings vectoriales en memorias persistentes
+    embed_disk_cache_enabled:   bool  = True   # persistir caché de embeddings a disco
+    embed_disk_cache_dir:       str   = "~/.oocode/cache"
+    embed_disk_cache_max:       int   = 2000   # máx. entradas en caché de disco
+    embed_ram_cache_max:        int   = 256    # vectores máximos en caché LRU en RAM
 
     # ── Herramientas ──────────────────────────────────────────────────────────
     read_file_lines_default:   int = 150
@@ -576,14 +610,11 @@ class OOConfig(BaseModel):
     skills_enabled:  list[str] = []
     plugin_options:  dict      = {}
 
-    # ── Opciones del modelo (None = usar default del modelo) ──────────────────
-    model_temperature:    Optional[float] = None
-    model_top_p:          Optional[float] = None
-    model_top_k:          Optional[int]   = None
-    model_num_ctx:        Optional[int]   = None   # override global de num_ctx
-    model_num_predict:    Optional[int]   = None
-    model_repeat_penalty: Optional[float] = None
-    model_seed:           Optional[int]   = None
+    # ── Defaults globales de modelos (models.repeatPenalty / seed) ──────────────
+    model_repeat_penalty: Optional[float] = None   # default global para repeat_penalty
+    model_seed:           Optional[int]   = None   # default global para seed (-1=aleatorio)
+    ollama_retry_count:   int             = 2      # reintentos en timeout (ollama.ollamaRetryCount)
+    ollama_retry_delay:   float           = 3.0    # delay base entre reintentos en s (ollama.ollamaRetryDelay)
 
     # ── Configuración por modelo ───────────────────────────────────────────────
     # {model_id: {"contextWindow": int, "maxTokens": int, "params": dict}}
@@ -609,6 +640,7 @@ class OOConfig(BaseModel):
         "diff_after_write", "ctags_after_write", "lint_after_write",
         "quick_syntax_after_write", "verify_after_edit", "test_suite_delta",
         "config_syntax_after_write",
+        "deadlock_detection", "dead_code_detection", "performance_profiling",
     ]
 
     # ── Snapshots ─────────────────────────────────────────────────────────────
@@ -622,6 +654,11 @@ class OOConfig(BaseModel):
     rag_similarity_threshold: float = 0.40
     rag_max_snippet_chars:    int   = 4000
     rag_index_interval:       float = 300.0
+    rag_max_file_chars:       int   = 6000   # chars por fichero antes de chunking
+    rag_chunk_chars:          int   = 512    # chars por chunk de indexación
+    rag_chunk_overlap:        int   = 64     # solapamiento entre chunks
+    rag_max_files:            int   = 2000   # ficheros máximos a indexar
+    rag_min_slot_chars:       int   = 200    # mínimo de chars por fragmento en respuesta RAG
     # Boost para queries complejas (mensaje largo o multi-fichero)
     rag_top_k_complex:            int   = 10
     rag_threshold_complex:        float = 0.35
@@ -636,10 +673,47 @@ class OOConfig(BaseModel):
     chatlog_path:         str  = ""
     chatlog_max_size_mb:  int  = 10
 
+    # ── WebUI ─────────────────────────────────────────────────────────────────
+    webui_enabled:        bool = False
+    webui_host:           str  = "0.0.0.0"
+    webui_port:           int  = 4000
+    webui_log_file:       str  = ""   # vacío = ~/.oocode/logs/webserver.log
+    webui_log_max_size:   int  = 5
+
+    # ── Subagentes ────────────────────────────────────────────────────────────
+    subagents_max_concurrent:   int = 4
+    subagents_max_teams:        int = 3
+    subagents_max_team_size:    int = 5
+    subagents_recent_ttl:       int = 1800
+    subagents_default_priority: int = 0
+
+    # ── Backups ───────────────────────────────────────────────────────────────
+    backup_enabled:     bool      = True
+    backup_dir:         str       = ""   # vacío = ~/.oocode/backup/
+    backup_max_files:   int       = 50
+    backup_extensions:  list[str] = []   # vacío usa los defaults de DEFAULT_CONFIG
+
     # ── Fallback ──────────────────────────────────────────────────────────────
     fallback_enabled: bool = False
     fallback_model:   str  = ""
     fallback_timeout: int  = 120   # segundos
+
+    @property
+    def effective_embed_host(self) -> str:
+        """Host para embeddings.
+
+        En modo primary-only: siempre el host principal, ignorando embedHost.
+        Esto garantiza que configurar primary-only realmente centraliza todo
+        el tráfico Ollama en el host principal, incluyendo embeddings y memoria.
+        """
+        if self.ollama_subagent_routing == "primary-only":
+            return self.ollama_host
+        return self.ollama_embed_host or self.ollama_host
+
+    @property
+    def all_ollama_hosts(self) -> list[str]:
+        """Todos los hosts disponibles: principal + extras (filtra vacíos)."""
+        return [self.ollama_host] + [h for h in self.ollama_extra_hosts if h]
 
     @property
     def fallback_active_config(self) -> bool:
@@ -690,23 +764,26 @@ class OOConfig(BaseModel):
             return max(computed, 2000)
         return self.max_context_tokens
 
-    def effective_model_params(self) -> dict:
-        """Parámetros para Ollama: per-modelo + overrides globales (modelOptions).
+    @property
+    def max_thinking_tokens(self) -> int:
+        """Tokens de thinking máximos para el modelo activo (0 = sin límite).
 
-        Los overrides globales (modelOptions) tienen prioridad sobre los per-modelo.
+        Lee de models.configs[model].thinking.maxThinkingTokens; default 6000.
+        """
+        return self.active_model_config.get("thinking", {}).get("maxThinkingTokens", 6000)
+
+    def effective_model_params(self) -> dict:
+        """Parámetros para Ollama: per-modelo con defaults globales de models.repeatPenalty/seed.
+
+        Los defaults globales sólo se aplican si el modelo no define ya el parámetro.
         """
         params: dict = dict(self.active_model_config.get("params", {}))
         for ollama_key, attr in [
-            ("temperature",    "model_temperature"),
-            ("top_p",          "model_top_p"),
-            ("top_k",          "model_top_k"),
-            ("num_ctx",        "model_num_ctx"),
-            ("num_predict",    "model_num_predict"),
             ("repeat_penalty", "model_repeat_penalty"),
             ("seed",           "model_seed"),
         ]:
             val = getattr(self, attr)
-            if val is not None:
+            if val is not None and ollama_key not in params:
                 params[ollama_key] = val
         return params
 
@@ -750,9 +827,11 @@ class OOConfig(BaseModel):
             return
         if model_name not in self.model_configs:
             self.model_configs[model_name] = {}
+        existing_t = self.model_configs[model_name].get("thinking", {})
         self.model_configs[model_name]["thinking"] = {
-            "think_level": think_level,
-            "reasoning":   reasoning,
+            "think_level":       think_level,
+            "reasoning":         reasoning,
+            "maxThinkingTokens": existing_t.get("maxThinkingTokens", 6000),
         }
         self.save()
 
@@ -772,7 +851,22 @@ class OOConfig(BaseModel):
         def _get(section: str, key: str):
             return raw.get(section, {}).get(key, DEFAULT_CONFIG[section][key])
 
-        ollama_host  = raw.get("ollama", {}).get("host", DEFAULT_CONFIG["ollama"]["host"])
+        _ollama_raw          = raw.get("ollama", {})
+        _mo_raw              = raw.get("modelOptions", {})   # solo para migración desde versión anterior
+        ollama_host          = _ollama_raw.get("host",            DEFAULT_CONFIG["ollama"]["host"])
+        ollama_extra_hosts   = _ollama_raw.get("extraHosts",      DEFAULT_CONFIG["ollama"]["extraHosts"])
+        ollama_embed_host    = _ollama_raw.get("embedHost",       DEFAULT_CONFIG["ollama"]["embedHost"])
+        ollama_subagent_routing = _ollama_raw.get("subagentRouting",
+                                                   DEFAULT_CONFIG["ollama"]["subagentRouting"])
+        ollama_retry_count   = int(_ollama_raw.get("ollamaRetryCount",
+                                   _mo_raw.get("ollamaRetryCount",
+                                               DEFAULT_CONFIG["ollama"]["ollamaRetryCount"])))
+        ollama_retry_delay   = float(_ollama_raw.get("ollamaRetryDelay",
+                                     _mo_raw.get("ollamaRetryDelay",
+                                                 DEFAULT_CONFIG["ollama"]["ollamaRetryDelay"])))
+        _models_raw          = raw.get("models", {})
+        model_repeat_penalty = _models_raw.get("repeatPenalty", _mo_raw.get("repeatPenalty"))
+        model_seed           = _models_raw.get("seed", _mo_raw.get("seed"))
         # Merge de permisos: mantiene los del usuario y añade los nuevos del DEFAULT
         _default_perms = DEFAULT_CONFIG["permissions"].copy()
         _user_perms    = raw.get("permissions", {})
@@ -822,7 +916,10 @@ class OOConfig(BaseModel):
             a_instructions = ""
 
         _cfg = cls(
-            ollama_host         = ollama_host,
+            ollama_host             = ollama_host,
+            ollama_extra_hosts      = ollama_extra_hosts,
+            ollama_embed_host       = ollama_embed_host,
+            ollama_subagent_routing = ollama_subagent_routing,
             model               = model,
             workspace           = workspace,
             agent_id            = a_id,
@@ -837,6 +934,8 @@ class OOConfig(BaseModel):
             max_summary_chars       = _get("context", "maxSummaryChars"),
             max_tool_result_tokens  = _get("context", "maxToolResultTokens"),
             auto_continue_max       = _get("context", "autoContinueMax"),
+            context_high_water      = _get("context", "highWater"),
+            context_tool_max_chars  = _get("context", "toolMaxChars"),
 
             embed_model                 = _get("embeddings", "model"),
             embed_max_input_chars       = _get("embeddings", "maxInputChars"),
@@ -844,6 +943,10 @@ class OOConfig(BaseModel):
             embed_snippet_chars         = _get("embeddings", "snippetChars"),
             embed_top_k                 = _get("embeddings", "topK"),
             memory_embed_enabled        = _get("embeddings", "memoryEmbedEnabled"),
+            embed_disk_cache_enabled    = _get("embeddings", "diskCacheEnabled"),
+            embed_disk_cache_dir        = _get("embeddings", "diskCacheDir"),
+            embed_disk_cache_max        = _get("embeddings", "diskCacheMaxEntries"),
+            embed_ram_cache_max         = _get("embeddings", "ramCacheMax"),
 
             read_file_lines_default    = _get("tools", "readFileLinesDefault"),
             read_file_lines_warn_large = _get("tools", "readFileLinesWarnLarge"),
@@ -880,13 +983,10 @@ class OOConfig(BaseModel):
             skills_enabled  = raw.get("skills",  {}).get("enabled", []),
             plugin_options  = plugin_options,
 
-            model_temperature    = raw.get("modelOptions", {}).get("temperature"),
-            model_top_p          = raw.get("modelOptions", {}).get("topP"),
-            model_top_k          = raw.get("modelOptions", {}).get("topK"),
-            model_num_ctx        = raw.get("modelOptions", {}).get("numCtx"),
-            model_num_predict    = raw.get("modelOptions", {}).get("numPredict"),
-            model_repeat_penalty = raw.get("modelOptions", {}).get("repeatPenalty"),
-            model_seed           = raw.get("modelOptions", {}).get("seed"),
+            model_repeat_penalty = model_repeat_penalty,
+            model_seed           = model_seed,
+            ollama_retry_count   = ollama_retry_count,
+            ollama_retry_delay   = ollama_retry_delay,
 
             model_configs         = raw.get("models", {}).get("configs", {}),
             model_system_overhead = raw.get("models", {}).get("systemOverhead", 2000),
@@ -934,6 +1034,11 @@ class OOConfig(BaseModel):
             rag_top_k_complex        = _get("rag", "topKComplex"),
             rag_threshold_complex    = _get("rag", "thresholdComplex"),
             rag_complex_min_chars    = _get("rag", "complexMinChars"),
+            rag_max_file_chars       = _get("rag", "maxFileChars"),
+            rag_chunk_chars          = _get("rag", "chunkChars"),
+            rag_chunk_overlap        = _get("rag", "chunkOverlap"),
+            rag_max_files            = _get("rag", "maxFiles"),
+            rag_min_slot_chars       = _get("rag", "minSlotChars"),
 
             vision_enabled        = raw.get("vision", {}).get("enabled",
                                             DEFAULT_CONFIG["vision"]["enabled"]),
@@ -946,17 +1051,48 @@ class OOConfig(BaseModel):
                                           DEFAULT_CONFIG["chatlog"]["path"]),
             chatlog_max_size_mb = raw.get("chatlog", {}).get("maxSizeMb",
                                           DEFAULT_CONFIG["chatlog"]["maxSizeMb"]),
+
+            webui_enabled      = raw.get("webui", {}).get("enabled",
+                                         DEFAULT_CONFIG["webui"]["enabled"]),
+            webui_host         = raw.get("webui", {}).get("host",
+                                         DEFAULT_CONFIG["webui"]["host"]),
+            webui_port         = int(raw.get("webui", {}).get("port",
+                                         DEFAULT_CONFIG["webui"]["port"])),
+            webui_log_file     = raw.get("webui", {}).get("logFile",
+                                         DEFAULT_CONFIG["webui"]["logFile"]),
+            webui_log_max_size = raw.get("webui", {}).get("logMaxSizeMb",
+                                         DEFAULT_CONFIG["webui"]["logMaxSizeMb"]),
+
+            subagents_max_concurrent   = raw.get("subagents", {}).get("maxConcurrent",
+                                              DEFAULT_CONFIG["subagents"]["maxConcurrent"]),
+            subagents_max_teams        = raw.get("subagents", {}).get("maxTeams",
+                                              DEFAULT_CONFIG["subagents"]["maxTeams"]),
+            subagents_max_team_size    = raw.get("subagents", {}).get("maxTeamSize",
+                                              DEFAULT_CONFIG["subagents"]["maxTeamSize"]),
+            subagents_recent_ttl       = raw.get("subagents", {}).get("recentTtl",
+                                              DEFAULT_CONFIG["subagents"]["recentTtl"]),
+            subagents_default_priority = raw.get("subagents", {}).get("defaultPriority",
+                                              DEFAULT_CONFIG["subagents"]["defaultPriority"]),
+
+            backup_enabled    = raw.get("backup", {}).get("enabled",
+                                        DEFAULT_CONFIG["backup"]["enabled"]),
+            backup_dir        = raw.get("backup", {}).get("dir",
+                                        DEFAULT_CONFIG["backup"]["dir"]),
+            backup_max_files  = raw.get("backup", {}).get("maxFiles",
+                                        DEFAULT_CONFIG["backup"]["maxFiles"]),
+            backup_extensions = raw.get("backup", {}).get("extensions",
+                                        list(DEFAULT_CONFIG["backup"]["extensions"])),
         )
 
         # ── Migración automática: añadir secciones nuevas y eliminar campos deprecated ──
-        # "modelOptions" se excluye porque save() la omite cuando todos sus valores son None.
-        _OPTIONAL_SECTIONS = {"modelOptions"}
         _missing_sections  = [
             k for k in DEFAULT_CONFIG
-            if k not in raw and k not in _OPTIONAL_SECTIONS
+            if k not in raw
         ]
         # Campos deprecated eliminados de la spec pero que pueden seguir en el JSON
         _has_deprecated = "maxTokens" in raw.get("context", {})
+        # modelOptions legacy: si existe en el JSON, save() lo eliminará y relocaliza los valores
+        _has_model_opts_legacy = "modelOptions" in raw
         # Claves nuevas dentro de secciones existentes
         _has_mcp_gaps = (
             "systemAssistant" not in raw.get("mcp", {}) or
@@ -968,7 +1104,14 @@ class OOConfig(BaseModel):
         _embed_old = raw.get("embeddings", {}).get("maxInputChars", 0)
         if isinstance(_embed_old, int) and _embed_old <= 3000:
             _cfg.embed_max_input_chars = 8000
-        if _missing_sections or _has_deprecated or _has_mcp_gaps:
+        # Migración: añadir maxThinkingTokens a modelos con thinking block que no lo tengan
+        _old_max_think = _mo_raw.get("maxThinkingTokens", 6000)
+        _has_thinking_gap = False
+        for _mid, _mcfg in _cfg.model_configs.items():
+            if "thinking" in _mcfg and "maxThinkingTokens" not in _mcfg["thinking"]:
+                _mcfg["thinking"]["maxThinkingTokens"] = _old_max_think
+                _has_thinking_gap = True
+        if _missing_sections or _has_deprecated or _has_mcp_gaps or _has_model_opts_legacy or _has_thinking_gap:
             _cfg.save()
 
         return _cfg
@@ -990,7 +1133,13 @@ class OOConfig(BaseModel):
         if CONFIG_FILE.exists():
             raw = json.loads(CONFIG_FILE.read_text())
 
-        raw.setdefault("ollama", {})["host"] = self.ollama_host
+        _ol = raw.setdefault("ollama", {})
+        _ol["host"]             = self.ollama_host
+        _ol["extraHosts"]       = self.ollama_extra_hosts
+        _ol["embedHost"]        = self.ollama_embed_host
+        _ol["subagentRouting"]  = self.ollama_subagent_routing
+        _ol["ollamaRetryCount"] = self.ollama_retry_count
+        _ol["ollamaRetryDelay"] = self.ollama_retry_delay
         raw["permissions"] = self.permissions
 
         # Contexto (maxTokens eliminado: se calcula desde models.configs)
@@ -1001,6 +1150,8 @@ class OOConfig(BaseModel):
         ctx["maxSummaryChars"]     = self.max_summary_chars
         ctx["maxToolResultTokens"] = self.max_tool_result_tokens
         ctx["autoContinueMax"]     = self.auto_continue_max
+        ctx["highWater"]           = self.context_high_water
+        ctx["toolMaxChars"]        = self.context_tool_max_chars
 
         # Embeddings
         emb = raw.setdefault("embeddings", {})
@@ -1010,6 +1161,10 @@ class OOConfig(BaseModel):
         emb["snippetChars"]        = self.embed_snippet_chars
         emb["topK"]                = self.embed_top_k
         emb["memoryEmbedEnabled"]  = self.memory_embed_enabled
+        emb["diskCacheEnabled"]    = self.embed_disk_cache_enabled
+        emb["diskCacheDir"]        = self.embed_disk_cache_dir
+        emb["diskCacheMaxEntries"] = self.embed_disk_cache_max
+        emb["ramCacheMax"]         = self.embed_ram_cache_max
 
         # Herramientas
         tools = raw.setdefault("tools", {})
@@ -1059,28 +1214,20 @@ class OOConfig(BaseModel):
         if self.plugin_options:
             raw["pluginOptions"] = self.plugin_options
 
-        # Model options — omitir claves con valor None para no saturar el JSON
-        mo = raw.setdefault("modelOptions", {})
-        for json_key, attr in [
-            ("temperature",   "model_temperature"),
-            ("topP",          "model_top_p"),
-            ("topK",          "model_top_k"),
-            ("numCtx",        "model_num_ctx"),
-            ("numPredict",    "model_num_predict"),
-            ("repeatPenalty", "model_repeat_penalty"),
-            ("seed",          "model_seed"),
-        ]:
-            val = getattr(self, attr)
-            if val is None:
-                mo.pop(json_key, None)
-            else:
-                mo[json_key] = val
-        if not mo:
-            raw.pop("modelOptions", None)
+        # Eliminar bloque legacy modelOptions si quedó del formato anterior
+        raw.pop("modelOptions", None)
 
-        # Per-model context configs
+        # Per-model context configs + defaults globales
         models_sec = raw.setdefault("models", {})
         models_sec["systemOverhead"] = self.model_system_overhead
+        if self.model_repeat_penalty is not None:
+            models_sec["repeatPenalty"] = self.model_repeat_penalty
+        else:
+            models_sec.pop("repeatPenalty", None)
+        if self.model_seed is not None:
+            models_sec["seed"] = self.model_seed
+        else:
+            models_sec.pop("seed", None)
         models_sec["configs"] = self.model_configs
 
         # Fallback
@@ -1120,6 +1267,11 @@ class OOConfig(BaseModel):
         rag["topKComplex"]         = self.rag_top_k_complex
         rag["thresholdComplex"]    = self.rag_threshold_complex
         rag["complexMinChars"]     = self.rag_complex_min_chars
+        rag["maxFileChars"]        = self.rag_max_file_chars
+        rag["chunkChars"]          = self.rag_chunk_chars
+        rag["chunkOverlap"]        = self.rag_chunk_overlap
+        rag["maxFiles"]            = self.rag_max_files
+        rag["minSlotChars"]        = self.rag_min_slot_chars
 
         # Visión
         vis = raw.setdefault("vision", {})
@@ -1131,6 +1283,29 @@ class OOConfig(BaseModel):
         cl["enabled"]   = self.chatlog_enabled
         cl["path"]      = self.chatlog_path
         cl["maxSizeMb"] = self.chatlog_max_size_mb
+
+        # WebUI
+        wu = raw.setdefault("webui", {})
+        wu["enabled"]      = self.webui_enabled
+        wu["host"]         = self.webui_host
+        wu["port"]         = self.webui_port
+        wu["logFile"]      = self.webui_log_file
+        wu["logMaxSizeMb"] = self.webui_log_max_size
+
+        # Subagentes
+        sa = raw.setdefault("subagents", {})
+        sa["maxConcurrent"]   = self.subagents_max_concurrent
+        sa["maxTeams"]        = self.subagents_max_teams
+        sa["maxTeamSize"]     = self.subagents_max_team_size
+        sa["recentTtl"]       = self.subagents_recent_ttl
+        sa["defaultPriority"] = self.subagents_default_priority
+
+        # Backups
+        bk = raw.setdefault("backup", {})
+        bk["enabled"]    = self.backup_enabled
+        bk["dir"]        = self.backup_dir
+        bk["maxFiles"]   = self.backup_max_files
+        bk["extensions"] = self.backup_extensions or list(DEFAULT_CONFIG["backup"]["extensions"])
 
         # Modelo del agente activo
         agents_raw = raw.setdefault("agents", {})
@@ -1148,7 +1323,7 @@ class OOConfig(BaseModel):
         seen: set[str] = set()
         candidates: list[Path] = []
         for base in [
-            Path(self.workspace),
+            Path(self.workspace).expanduser(),
             Path(self.project_dir) if self.project_dir else None,
             Path.cwd(),
         ]:

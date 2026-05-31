@@ -30,10 +30,11 @@ _IGNORE_FILES = {
     "*.lock", "package-lock.json", "yarn.lock", "Pipfile.lock", "poetry.lock",
     "*.min.js", "*.min.css", "*.map", "*.egg-info",
 }
-_MAX_FILE_CHARS = 6000   # chars por fichero antes de chunking
-_CHUNK_CHARS    = 512    # chars por chunk (≤512 tokens en casi cualquier modelo)
-_CHUNK_OVERLAP  = 64     # solapamiento entre chunks
-_MAX_FILES      = 2000
+_MAX_FILE_CHARS    = 6000   # fallback si se crea WorkspaceRAG sin config
+_CHUNK_CHARS       = 512
+_CHUNK_OVERLAP     = 64
+_MAX_FILES         = 2000
+_MIN_RAG_SLOT_CHARS = 200
 
 # Map file extensions to markdown fence language names
 _EXT_TO_LANG = {
@@ -81,18 +82,28 @@ class WorkspaceRAG:
         workspace: str,
         embed_client,                        # agent.embeddings.EmbeddingClient
         index_dir: Path,
-        top_k: int            = 3,
-        similarity_threshold: float = 0.42,
-        max_snippet_chars: int = 1400,
-        index_interval: float  = 300,        # segundos entre re-indexaciones
+        top_k: int            = 5,
+        similarity_threshold: float = 0.40,
+        max_snippet_chars: int = 4000,
+        index_interval: float  = 300,
+        max_file_chars: int    = _MAX_FILE_CHARS,
+        chunk_chars: int       = _CHUNK_CHARS,
+        chunk_overlap: int     = _CHUNK_OVERLAP,
+        max_files: int         = _MAX_FILES,
+        min_slot_chars: int    = _MIN_RAG_SLOT_CHARS,
     ):
-        self._workspace  = Path(workspace).expanduser().resolve()
-        self._ec         = embed_client
-        self._index_dir  = index_dir / self._workspace.name
-        self._top_k      = top_k
-        self._threshold  = similarity_threshold
-        self._max_chars  = max_snippet_chars
-        self._interval   = index_interval
+        self._workspace     = Path(workspace).expanduser().resolve()
+        self._ec            = embed_client
+        self._index_dir     = index_dir / self._workspace.name
+        self._top_k         = top_k
+        self._threshold     = similarity_threshold
+        self._max_chars     = max_snippet_chars
+        self._interval      = index_interval
+        self._max_file_chars  = max_file_chars
+        self._chunk_chars     = chunk_chars
+        self._chunk_overlap   = chunk_overlap
+        self._max_files       = max_files
+        self._min_slot_chars  = min_slot_chars
         self._last_index    = 0.0
         self._indexing      = False
         self._files_indexed = 0
@@ -152,11 +163,11 @@ class WorkspaceRAG:
                     break
                 dirnames[:] = [d for d in dirnames if d not in _IGNORE_DIRS]
                 for fn in filenames:
-                    if files_seen >= _MAX_FILES:
+                    if files_seen >= self._max_files:
                         log.debug(
                             "workspace_rag_limit_reached",
                             workspace=self._workspace.name,
-                            limit=_MAX_FILES,
+                            limit=self._max_files,
                         )
                         limit_reached = True
                         break
@@ -171,11 +182,11 @@ class WorkspaceRAG:
                     if incremental and base["mtime"].get(rel) == mtime:
                         continue
                     try:
-                        text = fp.read_text(errors="replace")[:_MAX_FILE_CHARS]
+                        text = fp.read_text(errors="replace")[:self._max_file_chars]
                     except Exception:
                         continue
                     base["chunks"] = [c for c in base["chunks"] if c["path"] != rel]
-                    for chunk in _chunk_text(text, rel):
+                    for chunk in _chunk_text(text, rel, self._chunk_chars, self._chunk_overlap):
                         vec = self._ec.embed(chunk["text"])
                         if vec:
                             chunk["vec"] = vec
@@ -268,7 +279,7 @@ class WorkspaceRAG:
         self._last_hits = len(results)
         if not results:
             return ""
-        slot = max(200, self._max_chars // max(len(results), 1))
+        slot = max(self._min_slot_chars, self._max_chars // max(len(results), 1))
         parts = []
         for sim, chunk in results:
             full_path = chunk["path"]
@@ -338,8 +349,8 @@ class WorkspaceRAG:
         if use_intelligent:
             chunks = _chunk_code_intelligently(text, path)
         else:
-            chunks = _chunk_text(text, path)
-        
+            chunks = _chunk_text(text, path, self._chunk_chars, self._chunk_overlap)
+
         # Enriquecer metadata de todos los chunks
         for chunk in chunks:
             chunk = _enrich_metadata(chunk, path)
@@ -348,19 +359,21 @@ class WorkspaceRAG:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _chunk_text(text: str, path: str) -> list[dict]:
+def _chunk_text(text: str, path: str,
+                chunk_chars: int = _CHUNK_CHARS,
+                chunk_overlap: int = _CHUNK_OVERLAP) -> list[dict]:
     lines  = text.splitlines(keepends=True)
     chunks = []
     buf    = ""
     start  = 0
     for i, line in enumerate(lines):
         buf += line
-        if len(buf) >= _CHUNK_CHARS:
+        if len(buf) >= chunk_chars:
             chunks.append({"path": path, "line": start + 1, "text": buf.strip()})
             overlap = ""
             for j in range(i, max(-1, i - 5), -1):
                 overlap = lines[j] + overlap
-                if len(overlap) >= _CHUNK_OVERLAP:
+                if len(overlap) >= chunk_overlap:
                     break
             buf   = overlap
             start = i + 1 - overlap.count("\n")
@@ -453,18 +466,4 @@ def _fallback_index_chunk(chunk: dict) -> dict:
     return chunk
 
 
-def chunk_with_metadata(self, text: str, path: str, 
-                       use_intelligent: bool = True) -> list[dict]:
-    """Chunking con metadata enriquecida."""
-    chunks = []
-    
-    if use_intelligent:
-        chunks = _chunk_code_intelligently(text, path)
-    else:
-        chunks = _chunk_text(text, path)
-    
-    for chunk in chunks:
-        chunk = _enrich_metadata(chunk, path)
-    
-    return chunks
 

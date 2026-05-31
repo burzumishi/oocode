@@ -257,7 +257,7 @@ class WorkspaceManager:
         max_memory_lines: int = 12,
         max_daily_chars: int = 400,
     ):
-        self.path = Path(workspace_path)
+        self.path = Path(workspace_path).expanduser()
         self._max_memory_lines = max_memory_lines
         self._max_daily_chars  = max_daily_chars
         self._cfg = {
@@ -268,26 +268,65 @@ class WorkspaceManager:
             "permissions": permissions or {},
         }
 
-    def init(self, overwrite: bool = False) -> list[str]:
-        """Crea el workspace y genera los ficheros de identidad. Devuelve lista de ficheros creados."""
+    def init(self, overwrite: bool = False, use_examples: bool = True) -> list[str]:  # noqa: ARG002
+        """Crea el workspace y genera los ficheros de identidad. Devuelve lista de ficheros creados.
+
+        Los ficheros se leen desde workspace/templates/ (empaquetados con el código).
+        MEMORY.md se genera dinámicamente (contiene fecha de hoy).
+        Fallback a generadores dinámicos si falta algún fichero en templates/.
+        """
         self.path.mkdir(parents=True, exist_ok=True)
         (self.path / "memory").mkdir(exist_ok=True)
-        generators = {
-            "IDENTITY.md": lambda c: _identity(c["name"], c["emoji"]),
-            "SOUL.md":     lambda c: _soul(c["name"]),
-            "USER.md":     lambda c: _user(),
-            "AGENTS.md":   lambda c: _agents(c["name"], c["workspace"]),
-            "HEARTBEAT.md": lambda c: _heartbeat(),
-            "TOOLS.md":    lambda c: _tools(c["name"], c["ollama_host"], c["permissions"]),
-            "MEMORY.md":   lambda c: _memory(),
-        }
+
+        templates_dir = Path(__file__).parent / "templates"
         created = []
-        for filename, generator in generators.items():
+
+        for filename in WORKSPACE_FILES:
             fpath = self.path / filename
+            tpl = templates_dir / filename
+
+            if filename == "MEMORY.md":
+                content = _memory()
+            elif tpl.exists():
+                content = tpl.read_text()
+            else:
+                # Fallback a generadores dinámicos
+                if filename == "AGENTS.md":
+                    content = _agents(self._cfg.get("name", "OOCode"), self._cfg.get("workspace", str(self.path.parent)))
+                elif filename == "HEARTBEAT.md":
+                    content = _heartbeat()
+                elif filename == "TOOLS.md":
+                    content = _tools(
+                        self._cfg.get("name", "OOCode"),
+                        self._cfg.get("ollama_host", "http://localhost:11434"),
+                        self._cfg.get("permissions", {})
+                    )
+                elif filename == "IDENTITY.md":
+                    content = _identity(self._cfg.get("name", "OOCode"), self._cfg.get("emoji", "🤖"))
+                elif filename == "SOUL.md":
+                    content = _soul(self._cfg.get("name", "OOCode"))
+                elif filename == "USER.md":
+                    content = _user()
+                else:
+                    content = ""
+
             if not fpath.exists() or overwrite:
-                fpath.write_text(generator(self._cfg))
+                fpath.write_text(content)
                 created.append(filename)
         return created
+
+    @property
+    def user_name(self) -> str:
+        """Alias/nombre del usuario desde USER.md ('Llamado'), o '' si no está configurado."""
+        user_md = self.path / "USER.md"
+        if not user_md.exists():
+            return ""
+        for line in user_md.read_text().splitlines():
+            if "**Llamado:**" in line:
+                val = line.split("**Llamado:**")[-1].strip()
+                if val and "(sin configurar)" not in val and "__" not in val:
+                    return val
+        return ""
 
     def load_context(self) -> str:
         """Delega al mini-context compacto (usado en system prompt)."""

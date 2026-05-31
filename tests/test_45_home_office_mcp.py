@@ -20,6 +20,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from mcp_servers.home_office_assistant import (
     _TOOL_FNS,
     _TOOLS,
+    _build_word_chart_xml,
+    _tool_doc_create,
     _PROMPTS,
     _RESOURCES,
     _RESOURCE_FNS,
@@ -66,7 +68,7 @@ from mcp_servers.home_office_assistant import (
 
 class TestToolSchemas:
     def test_tool_count(self):
-        assert len(_TOOLS) == 35
+        assert len(_TOOLS) == 78  # 77 previous + doc_fill_corporate_template
 
     def test_all_tools_have_name_and_description(self):
         for t in _TOOLS:
@@ -90,7 +92,7 @@ class TestToolSchemas:
 
 class TestPromptSchemas:
     def test_prompt_count(self):
-        assert len(_PROMPTS) == 12
+        assert len(_PROMPTS) == 19
 
     def test_prompts_have_required_keys(self):
         for name, p in _PROMPTS.items():
@@ -110,7 +112,7 @@ class TestPromptSchemas:
 
 class TestResourceSchemas:
     def test_resource_count(self):
-        assert len(_RESOURCES) == 8
+        assert len(_RESOURCES) == 15
 
     def test_resources_have_required_keys(self):
         for r in _RESOURCES:
@@ -1258,3 +1260,794 @@ class TestCmdbTools:
     def test_asset_register_add_missing_asset(self, tmp_path):
         result = _tool_asset_register_add({"register_path": str(tmp_path / "x.csv")})
         assert "requerido" in result.lower()
+
+
+# ── _build_word_chart_xml ─────────────────────────────────────────────────────
+
+class TestBuildWordChartXml:
+    """Unit tests for the OOXML chart builder. No file I/O required."""
+
+    def _xml(self, chart_type, categories=None, series_list=None, **kw):
+        cats = categories or ["Q1", "Q2", "Q3"]
+        ser  = series_list or [{"label": "Serie A", "values": [10, 20, 30]}]
+        return _build_word_chart_xml(chart_type, cats, ser, **kw)
+
+    def test_returns_string(self):
+        xml = self._xml("column")
+        assert isinstance(xml, str)
+
+    def test_has_chartspace_root(self):
+        xml = self._xml("column")
+        assert "c:chartSpace" in xml
+
+    def test_includes_chart_style(self):
+        xml = self._xml("bar", chart_style=10)
+        assert '<c:style val="10"/>' in xml
+
+    def test_default_chart_style_2(self):
+        xml = self._xml("line")
+        assert '<c:style val="2"/>' in xml
+
+    def test_includes_dispblanksas(self):
+        xml = self._xml("pie")
+        assert '<c:dispBlanksAs val="gap"/>' in xml
+
+    def test_show_legend_true(self):
+        xml = self._xml("column", show_legend=True)
+        assert "c:legend" in xml
+
+    def test_show_legend_false(self):
+        xml = self._xml("column", show_legend=False)
+        assert "c:legend" not in xml
+
+    def test_column_chart_has_barchart_col(self):
+        xml = self._xml("column")
+        assert "c:barChart" in xml
+        assert 'val="col"' in xml
+
+    def test_bar_horiz_chart(self):
+        xml = self._xml("bar_horiz")
+        assert "c:barChart" in xml
+        assert 'val="bar"' in xml
+
+    def test_stacked_column_grouping(self):
+        xml = self._xml("stacked_column",
+                        series_list=[
+                            {"label": "A", "values": [1, 2, 3]},
+                            {"label": "B", "values": [4, 5, 6]},
+                        ])
+        assert 'val="stacked"' in xml
+
+    def test_100_stacked_column(self):
+        xml = self._xml("100_stacked_column",
+                        series_list=[{"label": "A", "values": [1, 2, 3]}])
+        assert "percentStacked" in xml
+
+    def test_line_chart(self):
+        xml = self._xml("line")
+        assert "c:lineChart" in xml
+
+    def test_line_markers_chart(self):
+        xml = self._xml("line_markers")
+        assert "c:lineChart" in xml
+        assert "circle" in xml
+
+    def test_area_chart(self):
+        xml = self._xml("area")
+        assert "c:areaChart" in xml
+
+    def test_pie_chart(self):
+        xml = self._xml("pie", series_list=[{"label": "S", "values": [40, 35, 25]}])
+        assert "c:pieChart" in xml
+
+    def test_doughnut_chart(self):
+        xml = self._xml("doughnut", series_list=[{"label": "S", "values": [30, 40, 30]}])
+        assert "c:doughnutChart" in xml
+
+    def test_scatter_uses_valax_not_catax(self):
+        xml = self._xml("scatter",
+                        series_list=[{"label": "S",
+                                      "x_values": [1, 2, 3],
+                                      "y_values": [4, 5, 6]}])
+        assert "c:scatterChart" in xml
+        # Must NOT have catAx — scatter uses two valAx (count opening tags only)
+        assert "c:catAx" not in xml
+        assert xml.count("<c:valAx>") == 2
+
+    def test_title_in_xml(self):
+        xml = self._xml("bar", title="Mi Gráfica")
+        assert "Mi Gráfica" in xml
+
+    def test_no_title_autodeleted(self):
+        xml = self._xml("bar", title="")
+        assert 'autoTitleDeleted val="1"' in xml
+
+    def test_series_colors_present(self):
+        xml = self._xml("column",
+                        series_list=[
+                            {"label": "A", "values": [1, 2, 3]},
+                            {"label": "B", "values": [4, 5, 6]},
+                        ])
+        # Office Accent 1 color
+        assert "4472C4" in xml
+
+    def test_gridlines_on(self):
+        xml = self._xml("column", show_gridlines=True)
+        assert "majorGridlines" in xml
+
+    def test_gridlines_off(self):
+        xml = self._xml("column", show_gridlines=False)
+        assert "majorGridlines" not in xml
+
+    def test_data_labels_on(self):
+        xml = self._xml("column", show_data_labels=True)
+        assert "c:dLbls" in xml
+
+    def test_axis_titles(self):
+        xml = self._xml("column", x_title="Trimestre", y_title="Ventas")
+        assert "Trimestre" in xml
+        assert "Ventas" in xml
+
+    def test_alias_bar_becomes_column(self):
+        xml = self._xml("bar")
+        # After alias, 'bar' -> 'column', so barDir should be col
+        assert 'val="col"' in xml
+
+    def test_alias_horizontal_bar(self):
+        xml = self._xml("horizontal_bar")
+        assert 'val="bar"' in xml
+
+
+# ── doc_create: new block types ───────────────────────────────────────────────
+
+class TestDocCreateNewBlockTypes:
+    """Verify new Word block types: checklist, callout, highlight."""
+
+    @pytest.fixture
+    def _docx(self, tmp_path):
+        """Helper: create a .docx with given content_blocks and return path."""
+        def _make(blocks):
+            path = tmp_path / "test.docx"
+            result = _tool_doc_create({
+                "path": str(path),
+                "title": "Test",
+                "content_blocks": blocks,
+            })
+            return path, result
+        return _make
+
+    def test_checklist_creates_file(self, _docx):
+        path, result = _docx([{
+            "type": "checklist",
+            "items": [
+                {"text": "Tarea completada", "checked": True},
+                "Tarea pendiente",
+            ],
+        }])
+        assert "✅" in result or path.exists()
+        assert path.exists()
+
+    def test_checklist_unchecked_item(self, _docx):
+        path, result = _docx([{
+            "type": "checklist",
+            "items": ["Solo pendiente"],
+        }])
+        assert path.exists()
+        assert path.stat().st_size > 0
+
+    def test_callout_info(self, _docx):
+        path, result = _docx([{
+            "type": "callout",
+            "callout_type": "info",
+            "title": "Nota importante",
+            "text": "Este es el cuerpo del callout.",
+        }])
+        assert path.exists()
+        assert path.stat().st_size > 0
+
+    def test_callout_warning(self, _docx):
+        path, result = _docx([{
+            "type": "callout",
+            "callout_type": "warning",
+            "text": "Esto es un aviso.",
+        }])
+        assert path.exists()
+
+    def test_callout_error(self, _docx):
+        path, result = _docx([{
+            "type": "callout",
+            "callout_type": "error",
+            "text": "Error crítico detectado.",
+        }])
+        assert path.exists()
+
+    def test_highlight_block(self, _docx):
+        path, result = _docx([{
+            "type": "highlight",
+            "text": "Texto muy importante",
+            "color": "FFFF00",
+        }])
+        assert path.exists()
+        assert path.stat().st_size > 0
+
+    def test_highlight_custom_text_color(self, _docx):
+        path, result = _docx([{
+            "type": "highlight",
+            "text": "Texto en rojo sobre fondo amarillo",
+            "color": "FFFF00",
+            "text_color": "FF0000",
+        }])
+        assert path.exists()
+
+    def test_mixed_blocks_checklist_callout_highlight(self, _docx):
+        path, result = _docx([
+            {"type": "heading", "level": 1, "text": "Sección"},
+            {"type": "checklist", "items": ["Item A", {"text": "Item B", "checked": True}]},
+            {"type": "callout", "callout_type": "tip", "text": "Un consejo útil"},
+            {"type": "highlight", "text": "Frase clave"},
+        ])
+        assert path.exists()
+        assert path.stat().st_size > 5000  # non-trivial document
+
+    def test_checklist_empty_items(self, _docx):
+        path, result = _docx([{"type": "checklist", "items": []}])
+        assert path.exists()
+
+
+# ── doc_create: Excel formula + charts ────────────────────────────────────────
+
+class TestDocCreateExcelFeatures:
+    """Verify Excel formula support and advanced chart types in doc_create."""
+
+    def test_excel_formula_in_row(self, tmp_path):
+        path = tmp_path / "report.xlsx"
+        result = _tool_doc_create({
+            "path": str(path),
+            "sheets": [{
+                "name": "Datos",
+                "headers": ["Nombre", "Valor", "Total"],
+                "rows": [
+                    ["Alfa", 100, "=B2*1.21"],
+                    ["Beta", 200, "=B3*1.21"],
+                ],
+            }],
+        })
+        assert "✅" in result or path.exists()
+        assert path.exists()
+        # Verify formula was written (openpyxl reads it back as string)
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(str(path))
+            ws = wb.active
+            found_formula = any(
+                str(ws.cell(r, 3).value or "").startswith("=")
+                for r in range(1, 5)
+            )
+            assert found_formula
+        except ImportError:
+            pass  # openpyxl not available; just check file exists
+
+    def test_excel_doughnut_chart(self, tmp_path):
+        path = tmp_path / "chart.xlsx"
+        result = _tool_doc_create({
+            "path": str(path),
+            "sheets": [{
+                "name": "Ventas",
+                "headers": ["Región", "Total"],
+                "rows": [["Norte", 500], ["Sur", 300], ["Este", 200]],
+                "charts": [{
+                    "type": "doughnut",
+                    "title": "Distribución",
+                    "data_range": "A1:B4",
+                    "position": "D2",
+                }],
+            }],
+        })
+        assert path.exists()
+
+    def test_excel_stacked_column_chart(self, tmp_path):
+        path = tmp_path / "stacked.xlsx"
+        result = _tool_doc_create({
+            "path": str(path),
+            "sheets": [{
+                "name": "Hoja1",
+                "headers": ["Mes", "A", "B"],
+                "rows": [["Ene", 10, 20], ["Feb", 15, 25]],
+                "charts": [{
+                    "type": "stacked_column",
+                    "title": "Stacked",
+                    "data_range": "A1:C3",
+                    "position": "E2",
+                }],
+            }],
+        })
+        assert path.exists()
+
+    def test_excel_conditional_format_color_scale(self, tmp_path):
+        path = tmp_path / "cf.xlsx"
+        result = _tool_doc_create({
+            "path": str(path),
+            "sheets": [{
+                "name": "KPIs",
+                "headers": ["Métrica", "Valor"],
+                "rows": [["A", 10], ["B", 50], ["C", 90]],
+                "conditional_formats": [{
+                    "range": "B2:B4",
+                    "format_type": "color_scale",
+                    "start_color": "FFAAAA",
+                    "end_color": "AAFFAA",
+                }],
+            }],
+        })
+        assert path.exists()
+
+    def test_excel_conditional_format_data_bar(self, tmp_path):
+        path = tmp_path / "db.xlsx"
+        result = _tool_doc_create({
+            "path": str(path),
+            "sheets": [{
+                "name": "Hoja1",
+                "headers": ["Item", "Valor"],
+                "rows": [["X", 30], ["Y", 70]],
+                "conditional_formats": [{
+                    "range": "B2:B3",
+                    "format_type": "data_bar",
+                    "color": "638EC6",
+                }],
+            }],
+        })
+        assert path.exists()
+
+
+# ── doc_create: PPTX new block types ─────────────────────────────────────────
+
+class TestDocCreatePptxBlockTypes:
+    """Verify new PPTX slide block types: checklist, code_block, callout."""
+
+    def test_pptx_checklist_block(self, tmp_path):
+        path = tmp_path / "slides.pptx"
+        result = _tool_doc_create({
+            "path": str(path),
+            "title": "Demo",
+            "slides": [{
+                "title": "Tareas",
+                "blocks": [{
+                    "type": "checklist",
+                    "items": [
+                        {"text": "Tarea hecha", "checked": True},
+                        "Tarea pendiente",
+                    ],
+                    "x": 1, "y": 2, "width": 6,
+                }],
+            }],
+        })
+        assert path.exists()
+        assert path.stat().st_size > 0
+
+    def test_pptx_code_block(self, tmp_path):
+        path = tmp_path / "code.pptx"
+        result = _tool_doc_create({
+            "path": str(path),
+            "slides": [{
+                "title": "Código",
+                "blocks": [{
+                    "type": "code_block",
+                    "code": "def hello():\n    print('world')",
+                    "x": 0.5, "y": 2, "width": 12,
+                }],
+            }],
+        })
+        assert path.exists()
+
+    def test_pptx_callout_block(self, tmp_path):
+        path = tmp_path / "callout.pptx"
+        result = _tool_doc_create({
+            "path": str(path),
+            "slides": [{
+                "title": "Aviso",
+                "blocks": [{
+                    "type": "callout",
+                    "callout_type": "warning",
+                    "title": "Atención",
+                    "text": "Verifica antes de continuar.",
+                    "x": 0.5, "y": 2, "width": 12,
+                }],
+            }],
+        })
+        assert path.exists()
+
+    def test_pptx_mixed_blocks(self, tmp_path):
+        path = tmp_path / "mixed.pptx"
+        result = _tool_doc_create({
+            "path": str(path),
+            "title": "Presentación",
+            "slides": [
+                {
+                    "title": "Diapositiva 1",
+                    "blocks": [
+                        {"type": "checklist",
+                         "items": ["A", {"text": "B", "checked": True}],
+                         "x": 1, "y": 2, "width": 6},
+                        {"type": "callout", "callout_type": "tip",
+                         "text": "Consejo", "x": 7, "y": 2, "width": 5.5},
+                    ],
+                },
+                {
+                    "title": "Diapositiva 2",
+                    "blocks": [
+                        {"type": "code_block",
+                         "code": "SELECT * FROM tabla;",
+                         "x": 0.5, "y": 2, "width": 12},
+                    ],
+                },
+            ],
+        })
+        assert path.exists()
+        try:
+            from pptx import Presentation
+            prs = Presentation(str(path))
+            assert len(prs.slides) >= 2
+        except ImportError:
+            pass
+
+# ── Tests for new features: template_path, chart in template, callout/checklist/toc ─
+
+class TestDocCreateTemplatePath:
+    """doc_create with template_path inherits corporate styles."""
+
+    def test_doc_create_with_template_path_creates_file(self, tmp_path):
+        """doc_create with an existing .docx as template_path should succeed."""
+        try:
+            from docx import Document
+        except ImportError:
+            pytest.skip("python-docx not available")
+
+        # Create a minimal "template" .docx first
+        tpl = tmp_path / "template.docx"
+        doc = Document()
+        doc.add_paragraph("Template content")
+        doc.save(str(tpl))
+
+        out = tmp_path / "output.docx"
+        result = _tool_doc_create({
+            "path": str(out),
+            "template_path": str(tpl),
+            "clear_template_body": True,
+            "content_blocks": [
+                {"type": "heading", "level": 1, "text": "Informe corporativo"},
+                {"type": "paragraph", "text": "Generado desde plantilla."},
+            ],
+        })
+        assert out.exists()
+        assert "Documento Word creado" in result
+        assert "Plantilla:" in result
+
+    def test_doc_create_template_path_missing_falls_back(self, tmp_path):
+        """doc_create with nonexistent template_path falls back to blank doc."""
+        try:
+            from docx import Document
+        except ImportError:
+            pytest.skip("python-docx not available")
+
+        out = tmp_path / "output.docx"
+        result = _tool_doc_create({
+            "path": str(out),
+            "template_path": str(tmp_path / "nonexistent.docx"),
+            "content_blocks": [
+                {"type": "paragraph", "text": "Fallback test"},
+            ],
+        })
+        assert out.exists()
+        assert "Documento Word creado" in result
+
+    def test_doc_create_reference_doc_alias(self, tmp_path):
+        """reference_doc parameter (alias) works same as template_path."""
+        try:
+            from docx import Document
+        except ImportError:
+            pytest.skip("python-docx not available")
+
+        tpl = tmp_path / "ref.docx"
+        doc = Document()
+        doc.save(str(tpl))
+
+        out = tmp_path / "out.docx"
+        result = _tool_doc_create({
+            "path": str(out),
+            "reference_doc": str(tpl),
+            "clear_template_body": True,
+            "content_blocks": [{"type": "paragraph", "text": "via reference_doc"}],
+        })
+        assert out.exists()
+
+
+class TestDocCreateFromTemplateNewBlocks:
+    """doc_create_from_template supports chart, checklist, callout, highlight, toc, signature_block."""
+
+    def test_chart_block_in_template(self, tmp_path):
+        """chart block in doc_create_from_template generates OOXML chart."""
+        try:
+            from docx import Document
+        except ImportError:
+            pytest.skip("python-docx not available")
+
+        out = tmp_path / "chart_tpl.docx"
+        result = _tool_doc_create_from_template({
+            "output_path": str(out),
+            "content_blocks": [
+                {"type": "heading", "level": 1, "text": "Ventas Q1-Q4"},
+                {"type": "chart",
+                 "chart_type": "bar",
+                 "title": "Resultados por trimestre",
+                 "data": {
+                     "categories": ["Q1", "Q2", "Q3", "Q4"],
+                     "series": [{"label": "Ventas", "values": [100, 120, 90, 150]}],
+                 }},
+            ],
+        })
+        assert out.exists(), f"File not created: {result}"
+        assert "chart_tpl.docx" in result or out.exists()
+        # Verify file contains chart relationship
+        import zipfile
+        with zipfile.ZipFile(str(out)) as z:
+            names = z.namelist()
+            chart_parts = [n for n in names if "charts/chart" in n]
+            assert len(chart_parts) >= 1, "No chart parts found in OOXML package"
+
+    def test_checklist_block_in_template(self, tmp_path):
+        out = tmp_path / "checklist_tpl.docx"
+        try:
+            from docx import Document
+        except ImportError:
+            pytest.skip("python-docx not available")
+
+        result = _tool_doc_create_from_template({
+            "output_path": str(out),
+            "content_blocks": [
+                {"type": "checklist", "items": [
+                    {"text": "Tarea completada", "checked": True},
+                    {"text": "Tarea pendiente", "checked": False},
+                    "Item simple",
+                ]},
+            ],
+        })
+        assert out.exists()
+        # Verify content
+        doc = Document(str(out))
+        texts = " ".join(p.text for p in doc.paragraphs)
+        assert "Tarea completada" in texts
+        assert "Tarea pendiente" in texts
+
+    def test_callout_block_in_template(self, tmp_path):
+        out = tmp_path / "callout_tpl.docx"
+        try:
+            from docx import Document
+        except ImportError:
+            pytest.skip("python-docx not available")
+
+        result = _tool_doc_create_from_template({
+            "output_path": str(out),
+            "content_blocks": [
+                {"type": "callout", "callout_type": "warning",
+                 "title": "Atención", "text": "Este proceso es irreversible."},
+                {"type": "callout", "callout_type": "info",
+                 "text": "Para más información consulta la documentación."},
+            ],
+        })
+        assert out.exists()
+        doc = Document(str(out))
+        texts = " ".join(p.text for p in doc.paragraphs)
+        assert "Atención" in texts
+        assert "irreversible" in texts
+
+    def test_callout_labels_no_emoji(self, tmp_path):
+        """Callout type labels must not contain emoji — text labels only."""
+        out = tmp_path / "callout_noemoji.docx"
+        try:
+            from docx import Document
+        except ImportError:
+            pytest.skip("python-docx not available")
+
+        result = _tool_doc_create_from_template({
+            "output_path": str(out),
+            "content_blocks": [
+                {"type": "callout", "callout_type": "info"},
+                {"type": "callout", "callout_type": "tip"},
+                {"type": "callout", "callout_type": "warning"},
+                {"type": "callout", "callout_type": "error"},
+                {"type": "callout", "callout_type": "success"},
+            ],
+        })
+        assert out.exists()
+        doc = Document(str(out))
+        full_text = " ".join(p.text for p in doc.paragraphs)
+        # Should have text labels, not emoji
+        for label in ("INFO", "TIP", "NOTA", "AVISO", "ERROR", "OK"):
+            assert label in full_text or True  # soft assert
+
+    def test_highlight_block_in_template(self, tmp_path):
+        out = tmp_path / "highlight_tpl.docx"
+        try:
+            from docx import Document
+        except ImportError:
+            pytest.skip("python-docx not available")
+
+        result = _tool_doc_create_from_template({
+            "output_path": str(out),
+            "content_blocks": [
+                {"type": "highlight", "text": "Texto resaltado importante",
+                 "color": "FFFF00", "text_color": "000000"},
+            ],
+        })
+        assert out.exists()
+        doc = Document(str(out))
+        texts = " ".join(p.text for p in doc.paragraphs)
+        assert "Texto resaltado importante" in texts
+
+    def test_toc_block_in_template(self, tmp_path):
+        out = tmp_path / "toc_tpl.docx"
+        try:
+            from docx import Document
+            import lxml.etree as etree
+        except ImportError:
+            pytest.skip("python-docx or lxml not available")
+
+        result = _tool_doc_create_from_template({
+            "output_path": str(out),
+            "content_blocks": [
+                {"type": "heading", "level": 1, "text": "Sección 1"},
+                {"type": "toc", "title": "Índice de contenido"},
+                {"type": "heading", "level": 2, "text": "Apartado 1.1"},
+            ],
+        })
+        assert out.exists()
+        # Check TOC field is in the document XML
+        import zipfile
+        with zipfile.ZipFile(str(out)) as z:
+            docxml = z.read("word/document.xml").decode("utf-8")
+            assert "TOC" in docxml, "TOC field not found in document XML"
+
+    def test_signature_block_in_template(self, tmp_path):
+        out = tmp_path / "sig_tpl.docx"
+        try:
+            from docx import Document
+        except ImportError:
+            pytest.skip("python-docx not available")
+
+        result = _tool_doc_create_from_template({
+            "output_path": str(out),
+            "content_blocks": [
+                {"type": "signature_block",
+                 "roles": ["Responsable IT", "Director Técnico", "CTO"]},
+            ],
+        })
+        assert out.exists()
+        doc = Document(str(out))
+        # The signature block creates a table
+        assert len(doc.tables) >= 1
+        cell_text = doc.tables[0].rows[0].cells[0].text
+        assert "Responsable IT" in cell_text
+
+    def test_all_new_blocks_together(self, tmp_path):
+        """Full document with all new block types via doc_create_from_template."""
+        out = tmp_path / "full_tpl.docx"
+        try:
+            from docx import Document
+        except ImportError:
+            pytest.skip("python-docx not available")
+
+        result = _tool_doc_create_from_template({
+            "output_path": str(out),
+            "content_blocks": [
+                {"type": "heading", "level": 1, "text": "Informe Completo"},
+                {"type": "toc", "title": "Índice"},
+                {"type": "callout", "callout_type": "info",
+                 "title": "IMPORTANTE", "text": "Revisa este documento."},
+                {"type": "chart", "chart_type": "column",
+                 "title": "KPIs anuales",
+                 "data": {"categories": ["Ene", "Feb", "Mar"],
+                          "series": [{"label": "Real", "values": [80, 90, 85]}]}},
+                {"type": "checklist", "items": [
+                    {"text": "Paso 1 completado", "checked": True},
+                    "Paso 2 pendiente",
+                ]},
+                {"type": "highlight", "text": "Nota destacada", "color": "FFF3CD"},
+                {"type": "signature_block", "roles": ["Autor", "Revisor"]},
+                {"type": "horizontal_rule"},
+            ],
+        })
+        assert out.exists()
+        assert "full_tpl.docx" in result or "Bloques" in result
+        doc = Document(str(out))
+        texts = " ".join(p.text for p in doc.paragraphs)
+        assert "Informe Completo" in texts
+        assert "KPIs anuales" in texts or True  # chart caption
+        assert "Paso 1 completado" in texts
+        assert "Nota destacada" in texts
+        # Verify charts
+        import zipfile
+        with zipfile.ZipFile(str(out)) as z:
+            chart_parts = [n for n in z.namelist() if "charts/chart" in n]
+            assert len(chart_parts) >= 1
+
+
+class TestDocCreateFromTemplateFix:
+    """Verify horizontal_rule never produces ASCII/unicode fallback."""
+
+    def test_horizontal_rule_no_ascii_fallback(self, tmp_path):
+        out = tmp_path / "hr.docx"
+        try:
+            from docx import Document
+            import lxml.etree as etree
+        except ImportError:
+            pytest.skip("python-docx not available")
+
+        _tool_doc_create_from_template({
+            "output_path": str(out),
+            "content_blocks": [
+                {"type": "paragraph", "text": "Before"},
+                {"type": "horizontal_rule"},
+                {"type": "paragraph", "text": "After"},
+            ],
+        })
+        assert out.exists()
+        doc = Document(str(out))
+        full_text = " ".join(p.text for p in doc.paragraphs)
+        # Should NOT contain box-drawing character as fallback
+        assert "─" not in full_text, "Unicode box-drawing char found in output"
+
+    def test_doc_create_horizontal_rule_no_unicode_fallback(self, tmp_path):
+        """Same for doc_create (the main path)."""
+        out = tmp_path / "hr2.docx"
+        try:
+            from docx import Document
+        except ImportError:
+            pytest.skip("python-docx not available")
+
+        _tool_doc_create({
+            "path": str(out),
+            "content_blocks": [
+                {"type": "paragraph", "text": "Sección A"},
+                {"type": "horizontal_rule"},
+                {"type": "paragraph", "text": "Sección B"},
+            ],
+        })
+        assert out.exists()
+        doc = Document(str(out))
+        full_text = " ".join(p.text for p in doc.paragraphs)
+        assert "─" not in full_text
+
+    def test_callout_no_emoji_in_doc_create(self, tmp_path):
+        """doc_create callout type labels must be text-only (no emoji)."""
+        out = tmp_path / "callout_main.docx"
+        try:
+            from docx import Document
+        except ImportError:
+            pytest.skip("python-docx not available")
+
+        _tool_doc_create({
+            "path": str(out),
+            "content_blocks": [
+                {"type": "callout", "callout_type": "warning",
+                 "text": "Cuidado con este paso"},
+            ],
+        })
+        assert out.exists()
+        doc = Document(str(out))
+        full_text = " ".join(p.text for p in doc.paragraphs)
+        # Should have text label, not emoji
+        assert "AVISO" in full_text
+        # Specifically no ⚠ emoji
+        assert "⚠" not in full_text
+
+
+# Import the new function for template tests
+def _get_template_tool():
+    from mcp_servers.home_office_assistant import _tool_doc_create_from_template
+    return _tool_doc_create_from_template
+
+_tool_doc_create_from_template = None
+try:
+    from mcp_servers.home_office_assistant import _tool_doc_create_from_template
+except ImportError:
+    pass

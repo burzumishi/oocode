@@ -55,17 +55,4 @@ Estos ficheros son tu memoria. Léelos al arrancar. Actualízalos cuando aprenda
 - **Antes de "He completado todas las tareas.":** Si modificaste código, DEBES ejecutar tests.
 - **PROHIBIDO:** ficheros .py/.sh temporales, heredocs bash, `bash git/grep/find/ls/cat/sed -i/make/pytest/docker exec/docker compose/docker cp`.
 
-## Workspace
-
-- **Ruta:** `~/.oocode/workspace/main`
-- **Git:** Se recomienda hacer backup semanal con `git add -A && git commit -m "workspace backup"`
-
-## Debug
-
-- **Limpiar historial REPL:** `rm ~/.oocode/history`
-- **Config:** `~/.oocode/oocode.json`
-- **Memoria:** `~/.oocode/workspace/main/memory/`
-
----
-
-*Última actualización: 2026-05-24*
+*Actualizado: 2026-05-28*

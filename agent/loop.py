@@ -24,782 +24,32 @@ from agent.session import SessionManager
 from agent.runtime import RuntimeSettings, COLOR_PRESETS
 from tools.registry import ToolRegistry
 from tools.permissions import PermissionManager
+from tools.hooks import _is_write_tool, _is_modify_tool
 from workspace.manager import WorkspaceManager
 from config import DEFAULT_CONFIG as _DEFAULT_CONFIG
 
-_SPINNER_FRAMES    = ["○", "◌", "◎", "◉", "●", "◉", "◎", "◌"]
-_POLL_INTERVAL     = 0.2    # segundos entre ticks del spinner (5 fps)
 
-# Animación del header de tool en modo REPL: ciclo verde→amarillo (120 ms/frame)
-_HEADER_ANIM_CODES = ["\033[32m", "\033[92m", "\033[33m", "\033[93m"]
-_ANSI_BOLD  = "\033[1m"
-_ANSI_RESET = "\033[0m"
-_TIMEOUT_SENTINEL  = "__oocode_timeout__"  # señal de timeout de _stream_response
-_FALLBACK_MIN_CHARS = 50                   # chars mínimos para considerar respuesta iniciada
-
-_THINKING_WORDS = [
-    # Españolas reales
-    "Cavilando", "Cogitando", "Ruminando", "Elucubrando",
-    "Maquinando", "Ponderando", "Discurriendo", "Deliberando",
-    # Inventadas tech
-    "Neuroneando", "Sinaptizando", "Tokenizando", "Vectorizando",
-    "Inferenciando", "Transformeando", "Embedizando", "Prompteando",
-    "Tensorando", "Gradientando", "Sampliando", "Decodificando",
-    "Atteneando", "Softmaxeando", "Backproneando", "Halucineando",
-]
-
-# Palabras de "pensamiento" específicas para modo multi-tarea
-# Se usan cuando hay un plan activo y el agente está ejecutando tareas
-_MULTITASK_WORDS = [
-    "Planificando", "Organizando", "Orquestando", "Coordinando",
-    "Secuenciando", "Estructurando", "Implementando", "Ejecutando",
-]
-
-# Frases naturales para el indicador pre-vuelo de tareas múltiples
-# El placeholder {n} se reemplaza por el número de tareas detectadas.
-_TASK_PREFLIGHT_PHRASES = [
-    "Voy a analizar las {n} tareas y preparar un plan de acción",
-    "Detecté {n} tareas — organizando el plan antes de ejecutar",
-    "Perfecto, {n} tareas en cola — elaborando estrategia",
-    "Entendido: {n} objetivos — trazando el plan de ataque",
-    "{n} tareas identificadas — preparando hoja de ruta",
-    "Analizando las {n} tareas para estructurar el mejor plan",
-    "Recibidas {n} tareas — diseñando el plan de ejecución",
-    "Procesando {n} objetivos — organizando el trabajo",
-]
-
-# Colores para el ⊡ pulsante del indicador de tareas múltiples
-_TASK_ICON_COLORS = ["bold cyan", "bold magenta", "bold yellow", "bold blue", "bold green"]
-
-_DONE_WORDS = [
-    # Españolas reales
-    "Cavilado", "Razonado", "Procesado", "Completado",
-    # Inventadas tech
-    "Cogitado", "Inferido", "Generado", "Decodificado",
-    "Tokenizado", "Embedizado", "Neuroneado", "Transformado",
-    "Vectorizado", "Sinaptizado", "Gradientado", "Sampliado",
-    "Prompteado", "Atteneado", "Maquinado",
-]
-
-# Frases rotativas que aparecen en el spinner cuando el modelo lleva mucho tiempo
-_NEAR_FINISH_PHRASES = [
-    "casi sinaptizado…",
-    "estamos sinaptizando…",
-    "sinaptizando más…",
-    "casi terminado…",
-    "un momento más…",
-    "inferenciando a fondo…",
-    "tokenizando profundo…",
-    "embedizando más…",
-    "vectorizando…",
-    "neuroneando duro…",
-    "tokeninanzo más…",
-    "casi decodificado…",
-    "seguimos infiriendo…"
-]
-
-
-def _fmt_elapsed(secs: float) -> str:
-    """Formatea segundos como '28s' o '1m:32s'."""
-    if secs >= 60:
-        m = int(secs // 60)
-        s = int(secs % 60)
-        return f"{m}m:{s:02d}s"
-    return f"{int(secs)}s"
-
-
-def _fmt_tokens(n: int) -> str:
-    """Formatea un conteo de tokens con sufijo K/M para legibilidad."""
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.1f}M"
-    if n >= 10_000:
-        return f"{n // 1_000}K"
-    if n >= 1_000:
-        return f"{n / 1_000:.1f}K"
-    return str(n)
-
-
-def _rag_display(rag) -> str:
-    """Genera la parte RAG del spinner: 'N rag' o 'N/M rag' si topK cortó resultados."""
-    if rag is None:
-        return ""
-    hits      = getattr(rag, "last_hits", 0)
-    available = getattr(rag, "last_available", 0)
-    if hits <= 0:
-        return ""
-    if available > hits:
-        # topK cortó más candidatos — mostrar cuántos había disponibles
-        return f"  ·  ◈ {hits}/{available} rag"
-    return f"  ·  ◈ {hits} rag"
-
-
-def _is_complex_query(msg: str, min_chars: int) -> bool:
-    """True si el mensaje sugiere una query compleja que se beneficia de más RAG.
-
-    Criterios (OR):
-    - Mensaje suficientemente largo (multi-paso, multi-fichero).
-    - Menciona patrones de autoedición de OOCode (hooks, tools, loop, etc.).
-    """
-    if len(msg.strip()) >= min_chars:
-        return True
-    _OOCODE_KWS = (
-        "hook", "tool", "loop", "agent", "mcp", "plugin",
-        "registry", "config", "builtin", "oocode", "workspace_rag",
-        "context_snippet", "permission", "slash", "repl",
-    )
-    lower = msg.lower()
-    return sum(1 for kw in _OOCODE_KWS if kw in lower) >= 2
-
-
-# Alias de nombres de herramientas: algunos modelos (qwen, deepseek, llama…)
-# usan nombres distintos a los que registra OOCode, por sus datos de entrenamiento.
-# Se normalizan aquí para evitar "herramienta no encontrada".
-_TOOL_ALIASES: dict[str, str] = {
-    "execute_bash":    "bash",
-    "run_bash":        "bash",
-    "run_code":        "bash",
-    "execute_code":    "bash",
-    "shell":           "bash",
-    "terminal":        "bash",
-    "execute_command": "bash",
-    "read_file":       "read_file",   # igual, pero lo normalizamos por si acaso
-    "write_file":      "write_file",
-    "create_file":     "write_file",
-    "save_file":       "write_file",
-    "edit_file":       "edit_file",
-    "modify_file":     "edit_file",
-    "str_replace":     "edit_file",
-    "str_replace_editor": "edit_file",
-    "list_dir":        "list_dir",
-    "list_directory":  "list_dir",
-    "ls":              "list_dir",
-    "web_search":      "web_search",
-    "search_web":      "web_search",
-    "web_fetch":       "web_fetch",
-    "fetch_url":       "web_fetch",
-    "browse":          "web_fetch",
-    # Aliases para búsqueda de ficheros
-    "find":            "find_file",
-    "find_files":      "find_file",
-    "search_files":    "find_file",
-    "find_in_dir":     "find_file",
-    # Aliases para búsqueda de código
-    "grep":            "grep_code",
-    "search_code":     "grep_code",
-    "grep_search":     "grep_code",
-    "code_search":     "grep_code",
-    # Aliases para ejecución Python
-    "run_python":      "python_exec",
-    "execute_python":  "python_exec",
-    "python":          "python_exec",
-    # Aliases para wc/estadísticas
-    "wc":              "file_stat",
-    "stat":            "file_stat",
-}
-
-
-_IMG_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif"}
-
-
-def _load_images_b64(paths_or_b64: list[str]) -> list[str]:
-    """Convierte rutas de imagen o strings raw en base64 para Ollama."""
-    import base64
-    result = []
-    for item in paths_or_b64:
-        item = item.strip()
-        if not item:
-            continue
-        from pathlib import Path as _Path
-        p = _Path(item).expanduser()
-        if p.exists() and p.suffix.lower() in _IMG_EXTENSIONS:
-            try:
-                result.append(base64.b64encode(p.read_bytes()).decode())
-            except Exception:
-                pass
-        elif len(item) > 100:
-            # Asumir que ya es base64
-            result.append(item)
-    return result
-
-
-def _ctx_bar(used: int, total: int, width: int = 10, plain: bool = False) -> str:
-    """Barra de progreso del contexto con chars ▰▱ y color según nivel de llenado."""
-    if total <= 0:
-        return "─" * width
-    pct = min(used / total, 1.0)
-    filled = int(pct * width)
-    bar = '▰' * filled + '▱' * (width - filled)
-    if plain:
-        return bar
-    color = "green" if pct < 0.60 else "yellow" if pct < 0.85 else "bold red"
-    return f"[{color}]{bar}[/{color}]"
-
-
-def _compact_hint(cpct: int, thresh_pct: int) -> str:
-    if cpct >= thresh_pct:
-        return "  ↻ compactando"
-    if cpct >= thresh_pct - 10:
-        return "  ↻ cerca compactación"
-    return ""
-
-
-def _pbar_thin(done: int, total: int, w: int = 20) -> str:
-    """Barra de progreso fina con caracteres ▰▱ para compactación."""
-    filled = int(done / max(total, 1) * w)
-    return "▰" * filled + "▱" * (w - filled)
-
-
-def _pbar_thin_ratio(ratio: float, w: int = 20) -> str:
-    """Igual que _pbar_thin pero con ratio 0.0–1.0 para animación."""
-    filled = int(max(0.0, min(1.0, ratio)) * w)
-    return "▰" * filled + "▱" * (w - filled)
-
-
-def _sfmt(style: str, text: str) -> str:
-    """Embede un segmento con estilo para el status window de la TUI.
-
-    Usa marcadores de control \x01STYLE\x02TEXT\x03 que app.py:_parse_status_line()
-    convierte en tuplas (class:STYLE, TEXT) para prompt_toolkit.
-    Invisible en rutas no-TUI donde _status_cb es None.
-    """
-    return f"\x01{style}\x02{text}\x03"
-
-
-def _bar_style(cpct: int, thresh_pct: int) -> str:
-    """Devuelve el nombre de estilo para la barra de contexto según el porcentaje."""
-    if cpct >= thresh_pct:
-        return "status-bar-crit"
-    if cpct >= thresh_pct - 10:
-        return "status-bar-near"
-    if cpct >= 60:
-        return "status-bar-warn"
-    return "status-bar-ok"
-
-
-def _hint_styled(cpct: int, thresh_pct: int) -> str:
-    """Devuelve el hint de compactación envuelto en _sfmt con el estilo adecuado."""
-    if cpct >= thresh_pct:
-        return _sfmt("status-hint-crit", "  ↻ compactando")
-    if cpct >= thresh_pct - 10:
-        return _sfmt("status-hint-near", "  ↻ cerca compactación")
-    return ""
-
-
-# Header mínimo: solo lo que no está en el mini-context del workspace
-SYSTEM_HEADER = """\
-Eres {agent_name}, asistente de programación local con Ollama.
-Fecha: {today}
-Directorio del proyecto (CWD): {project_dir}
-IMPORTANTE: el código del proyecto está en el CWD. `~/.oocode/workspace/` contiene solo identidad/memoria del agente, NO código del proyecto.
-"""
-
-# ── Grupos de tools para filtrado de schemas ─────────────────────────────────
-# Reduce el overhead de tokens (~11K) enviando solo los schemas relevantes.
-# Estrategia conservadora: "core" + "lsp" + "memory" siempre presentes.
-# Si no se detecta ningún grupo específico → se envían todos (modo seguro).
-_TOOL_GROUPS: dict[str, frozenset] = {
-    "core": frozenset({
-        "read_file", "write_file", "edit_file", "edit_files",
-        "grep_code", "multi_grep", "find_files", "find_file", "find_dir",
-        "ls_dir", "ls_file", "code_outline", "read_sections", "code_search",
-        "code_compare", "diff_files", "web_search", "web_fetch", "bash",
-        "run_tests", "test_file", "mem_save", "workspace_remember",
-        "plan_create", "task_done", "python_exec", "spawn_subagent",
-        "analyze_codebase", "symbol_lookup", "affected_files",
-        "lint_file", "lint_project", "regex_replace", "bulk_replace",
-        "smart_replace", "patch_apply", "file_stat", "tree", "count_lines",
-        "context_before_edit", "pre_edit_check", "read_files", "grep_file",
-    }),
-    "git": frozenset({
-        "git_status", "git_diff", "git_log", "git_commit", "git_add",
-        "git_push", "git_pull", "git_branch", "git_stash", "git_blame",
-        "git_rebase", "git_tag", "git_cherry_pick", "git_worktree",
-        "git_patch", "git_clone",
-    }),
-    "docker": frozenset({
-        "docker_ps", "docker_logs", "docker_exec", "docker_inspect",
-        "docker_images", "docker_stop", "docker_rm", "docker_cp",
-        "compose_up", "compose_down", "compose_logs", "compose_exec",
-        "compose_status", "compose_services", "compose_restart",
-        "compose_build", "compose_config", "compose_run", "compose_version",
-        "compose_stop", "compose_images", "compose_top", "compose_pull",
-    }),
-    "debug": frozenset({
-        "strace_run", "gdb_run", "pdb_run", "valgrind_run",
-        "make_run", "run_script", "format_code", "mypy_check",
-    }),
-    "system": frozenset({
-        "systemctl_status", "systemctl_action", "journalctl",
-        "net_interfaces", "net_connections", "net_ping", "net_dns",
-        "disk_usage", "disk_inodes", "dir_size", "lsblk_info",
-        "user_list", "user_info", "group_list", "who_logged",
-        "ps_list", "top_snapshot", "kill_process",
-        "fw_status", "fw_rules", "fw_allow", "fw_deny",
-        "sys_info", "sys_updates", "sys_logs", "env_vars", "cron_list",
-        "process_list",
-    }),
-    "packages": frozenset({
-        "apt_update", "apt_upgrade", "apt_install", "apt_remove",
-        "apt_search", "apt_info", "apt_list_installed",
-        "dnf_update", "dnf_install", "dnf_remove", "dnf_search",
-        "dnf_info", "rpm_query", "pip_tool", "npm_tool",
-    }),
-    "lsp": frozenset({
-        "lsp_definition", "lsp_references", "lsp_hover", "lsp_symbols",
-        "lsp_diagnostics", "lsp_completion", "lsp_rename", "lsp_format",
-        "lsp_code_actions", "lsp_type_definition", "lsp_implementation",
-        "lsp_workspace_symbols", "lsp_call_hierarchy", "lsp_restart",
-    }),
-    "data": frozenset({
-        "json_format", "json_validate", "yaml_validate", "jq_query",
-        "encode_base64", "decode_base64", "url_encode", "url_decode",
-        "compute_hash", "to_base", "format_json", "escape_string",
-        "hex_encode", "hex_decode", "calculate", "template_fill",
-        "http_get", "port_check", "env_check", "hash_text", "get_datetime",
-        "system_info",
-    }),
-    "fs": frozenset({
-        "chmod_file", "chmod_dir", "chown_file", "chown_dir",
-        "mv_file", "cp_file", "rm_file", "rm_dir", "mkdir_dir",
-        "touch_file", "symlink_create", "readlink",
-        "archive_extract", "archive_create", "archive_list",
-    }),
-    "memory": frozenset({
-        "snippet_save", "snippet_get", "snippet_list", "snippet_delete",
-        "vault_list", "vault_get", "todo_list", "todo_add", "todo_done",
-        "todo_sync", "changelog_today", "changelog_session", "changelog_week",
-        "clipboard_copy", "clipboard_paste",
-        "index_workspace", "semantic_search",
-        "extract_functions", "extract_classes", "extract_imports", "ast_summary",
-        "build_symbol_index", "find_symbol", "list_symbols",
-        "search_todos", "run_quick_check", "list_recent_files", "read_project_file",
-    }),
-    "office": frozenset({
-        "email_list", "email_read", "email_send", "email_search",
-        "doc_convert", "pdf_extract_text", "doc_word_count",
-        "xlsx_read", "xlsx_write", "csv_analyze",
-        "cal_list", "cal_add", "cal_search",
-        "notes_list", "notes_search", "notes_save",
-        "image_to_text", "contact_search", "markdown_to_html",
-        "doc_read_template_fields", "doc_fill_template", "doc_list_templates",
-        "doc_create_rfc", "xlsx_fill_range", "xlsx_append_row", "xlsx_create_report",
-        "project_context_read", "project_init_office", "doc_project_save",
-        "doc_read", "doc_update_section", "doc_version_bump",
-        "cmdb_search", "cmdb_update", "asset_register_add",
-    }),
-    "security": frozenset({
-        "nmap_scan", "port_scan", "ssl_check", "whois_lookup", "dns_enum",
-        "http_headers", "nikto_scan", "gobuster_run", "curl_request",
-        "encode_decode", "hash_crack", "jwt_decode", "cert_inspect",
-        "log_analyze", "secret_scan", "cve_lookup",
-        "xor_decode", "steganography_check", "base_convert", "hex_dump",
-        "fw_audit", "ssh_key_audit", "sudoers_review", "file_integrity_check",
-    }),
-    "iot": frozenset({
-        "tapo_list", "tapo_status", "tapo_on_off", "tapo_set",
-        "blink_status", "blink_arm", "blink_snapshot", "blink_clips", "blink_verify",
-        "alexa_devices", "alexa_speak", "alexa_command", "alexa_volume",
-        "tuya_list", "tuya_status", "tuya_control",
-        "ha_entities", "ha_state", "ha_control", "ha_automation",
-        "mqtt_publish", "mqtt_subscribe",
-        "esphome_list", "esphome_control",
-        "iot_discover",
-    }),
-}
-
-_TASK_KEYWORDS: dict[str, frozenset] = {
-    "git": frozenset({
-        "git", "commit", "branch", "merge", "rebase", "push", "pull",
-        "stash", "blame", "tag", "cherry", "worktree", "repositorio", "repo",
-    }),
-    "docker": frozenset({
-        "docker", "container", "compose", "imagen", "image", "dockerfile",
-        "kubernetes", "k8s", "pod", "service", "volumen", "volume",
-    }),
-    "debug": frozenset({
-        "debug", "debuggear", "gdb", "valgrind", "strace", "pdb",
-        "breakpoint", "compilar", "compile", "build", "make", "cmake",
-        "makefile",
-    }),
-    "system": frozenset({
-        "systemctl", "service", "daemon", "proceso", "process", "red",
-        "network", "firewall", "disco", "disk", "usuario", "user",
-        "cpu", "cron", "journal", "syslog",
-    }),
-    "packages": frozenset({
-        "instalar", "install", "apt", "dnf", "pip", "npm", "paquete",
-        "package", "dependencia", "dependency", "upgrade", "actualizar",
-        "requirements.txt", "package.json",
-    }),
-    "data": frozenset({
-        "json", "yaml", "base64", "hash", "encode", "decode", "url",
-        "hex", "template", "calcular", "calculate", "http", "api",
-    }),
-    "office": frozenset({
-        "email", "correo", "mail", "imap", "smtp", "calendario",
-        "calendar", "evento", "event", "reunión", "meeting",
-        "documento", "document", "pdf", "excel", "xlsx", "csv",
-        "hoja", "spreadsheet", "nota", "note", "notas", "notes",
-        "contacto", "contact", "vcard", "vcf", "ocr", "pandoc",
-        "word", "docx", "libreoffice", "markdown", "informe", "report",
-        "rfc", "change request", "migración", "migration", "datacenter",
-        "plantilla", "template", "formulario", "form", "informe it",
-        "incidencia", "incident", "post-mortem", "rollback", "firewall",
-        "servidor", "server", "infraestructura", "infrastructure",
-        "cmdb", "inventario", "inventory", "activo", "asset",
-        "business case", "resumen ejecutivo", "executive summary",
-        "proyecto", "project", "version", "sección", "section",
-        "oocode.md", "naming", "client", "cliente",
-    }),
-    "iot": frozenset({
-        "tapo", "blink", "alexa", "echo", "tuya", "smart life", "smartlife",
-        "esphome", "esp8266", "esp32", "mqtt", "zigbee", "z-wave",
-        "luz", "light", "luces", "bombilla", "bulb", "enchufe", "plug",
-        "camara", "camera", "cámara", "timbre", "doorbell", "ring",
-        "casa inteligente", "smarthome", "home assistant", "homeassistant",
-        "iot", "sensor", "interruptor", "switch", "ventilador", "fan",
-        "termostato", "thermostat", "temperatura", "temperature",
-        "automatización", "automation", "escena", "scene", "rutina",
-    }),
-    "security": frozenset({
-        "pentest", "pentest", "hacking", "ctf", "seguridad", "security",
-        "vulnerabilidad", "vulnerability", "cve", "exploit", "nmap",
-        "nikto", "gobuster", "hashcat", "hash", "crack", "brute",
-        "ssl", "tls", "certificado", "certificate", "whois", "dns",
-        "puerto", "port", "scan", "escaneo", "firewall", "iptables",
-        "jwt", "token", "cifrado", "encrypt", "decrypt", "crypto",
-        "esteganografia", "steganography", "forense", "forensic",
-        "log", "audit", "auditoria", "secret", "leak", "creds",
-        "xor", "hex", "base64", "decode", "encode",
-        "ssh", "sudoers", "integridad", "integrity",
-    }),
-    "fs": frozenset({
-        "chmod", "chown", "mover", "move", "copiar", "copy", "eliminar",
-        "delete", "symlink", "archive", "zip", "tar", "comprimir",
-        "permisos", "permissions",
-    }),
-}
-
-SYSTEM_RULES = """\
-## HERRAMIENTAS — USA SIEMPRE LA COLUMNA ✅
-
-| Necesidad | ✅ USA | ❌ NO |
-|-----------|--------|-------|
-| Leer fichero | `read_file(path, offset=N, limit=M)` | `bash cat/head/tail/sed -n` |
-| Comparar ficheros | `diff_files(a, b)` | `bash diff` |
-| Tests | `run_tests(path)` | `bash pytest / npm test` |
-| Estructura fichero | `code_outline(path)` **— OBLIGATORIO antes de editar ficheros >1000 líneas** | `read_file` con múltiples offsets |
-| Leer secciones | `read_sections(path, ['Clase.metodo', 'funcion'])` **— OBLIGATORIO para ficheros >1000 líneas** | `read_file(offset=N)` × N |
-| Buscar en código | `grep_code` / `multi_grep(patterns=[…])` | `bash grep -rn` |
-| Buscar símbolo | `lsp_workspace_symbols(q, path)` o `symbol_lookup` | `bash grep -rn` |
-| Impacto de cambio | `affected_files(symbol, directory)` | `grep_code` + leer cada fichero |
-| Callers/callees | `lsp_call_hierarchy(path, line)` | `bash grep -rn función` |
-| Comparar código | `code_compare(a, b, symbol)` | grep+read×2 |
-| grep con filtros | `grep_code(exclude_pattern=, count_only=, files_with_matches=, files_without_matches=)` | `bash grep|grep -v` |
-| Buscar ficheros | `find_file` / `find_files` / `find_dir` | `bash find -name` |
-| Listar directorio | `ls_dir` | `bash ls -la` |
-| Info fichero | `file_stat` | `bash wc -l / stat` |
-| Editar fichero | `edit_file` / `regex_replace` / `smart_replace` | `bash sed -i` |
-| Editar múltiples | `bulk_replace` / `edit_files` | `bash sed -i` en bucle |
-| Crear fichero | `write_file` | `bash cat > f <<'EOF'` |
-| Python puntual | `python_exec(code=…, workdir=…)` | `bash python3 -c/<<'EOF'` |
-| Índice símbolos | `find_symbol` / `list_symbols` / `extract_functions` | `bash ctags` |
-| Git | `git_status/diff/add/commit/log/branch/stash` | `bash git …` |
-| Docker/compose | `docker_ps/logs/exec/inspect` / `compose_up/down/logs/exec/…` | `bash docker …` |
-| Copiar a container | `docker_cp(src=…, dst=…)` | `bash docker cp` |
-| Compilar | `make_run` | `bash make/gcc/cc` |
-| Linting | `lint_file` / `lint_project` | `bash ruff/mypy/…` |
-| Paquetes Python | `pip_tool(action='install', packages=[…])` | `bash pip install` |
-| Paquetes Node | `npm_tool(action='install', packages=[…])` | `bash npm install` |
-| Debug | `strace_run` / `gdb_run` / `pdb_run` / `valgrind_run` | `bash strace/gdb` |
-
-`bash` = ÚLTIMO RECURSO — solo si ninguna tool de la tabla lo cubre.
-
-## Planificación autónoma — OBLIGATORIA para tareas complejas
-
-**Para cualquier consulta que implique ≥3 pasos distintos** (exploración + implementación + verificación, o múltiples ficheros, o varias fases): ANTES de ejecutar NINGUNA herramienta, emite un plan detallado en texto para que el usuario pueda revisarlo.
-
-**Formato del plan detallado (≥3 pasos o replanificación):**
-```
-Plan:
-1. [Acción]: [qué harás exactamente] — ficheros: [rutas exactas] — tools: [tools que usarás]
-2. [Acción]: [cambios concretos] — ficheros: [rutas] — riesgo: [si puede romper algo]
-...
-```
-Si hay bloqueadores o decisiones no claras, añade al final:
-`⚠ REQUIERE REVISIÓN: [descripción — decisión de diseño, dependencia faltante, riesgo alto]`
-El sistema pausa y espera al usuario. Sin ese marcador, continúa automáticamente.
-El usuario puede intervenir en cualquier momento con `/steer` o `/subagents steer`.
-
-**Flujo de planificación con `plan_create`:**
-1. Emite el plan en texto (formato arriba) — SIN llamar tools aún.
-2. Llama `plan_create(tasks=["Tarea 1: …", "Tarea 2: …", ...], summary="Qué vas a hacer")` — activa el panel visual.
-3. Ejecuta cada tarea anunciando "Tarea N: descripción breve" al empezarla.
-4. Llama `task_done()` al completar cada tarea — avanza el marcador ✔/◼/◻.
-5. Al terminar TODAS, di "He completado todas las tareas." como primera frase.
-
-**Replanificación:** si durante la ejecución descubres que el plan original es incorrecto o incompleto:
-1. Anuncia `"Replanificación:"` seguido del nuevo plan antes de cambiar de estrategia.
-2. Llama `plan_create(tasks=[...])` para actualizar el panel visual con las nuevas tareas.
-3. Llama `workspace_remember(note="Aprendizaje: [descripción del problema] → [solución adoptada]")` para documentar el problema en OOCODE.md y evitar repetirlo en futuras sesiones.
-No cambies de estrategia silenciosamente.
-
-**Alternativa ligera (solo texto, sin panel):** si la tarea tiene exactamente 2 pasos o es puramente exploratoria, una frase de anuncio basta.
-
-**Cuándo usar subagente (`spawn_subagent`):**
-- Proyecto muy grande: exploración exhaustiva de codebase mientras el hilo principal prepara el plan.
-- Tareas completamente independientes que no comparten estado (ej. explorar fichero A y explorar fichero B simultáneamente).
-- Análisis read-only intensivo: `spawn_subagent(task="explorar…", explore=True)`.
-
-**Cuándo NO usar subagente:** edición de ficheros, tests, implementación — hazlo directamente con las tools.
-
-## Flujo de trabajo
-
-1. **Analiza y planifica** — si la tarea es compleja (≥3 pasos), crea un plan numerado primero.
-2. **Explora PRIMERO** — `read_file` + `grep_code` + `lsp_symbols` antes de editar.
-   - Localiza ficheros con `find_files(directory=CWD, name="*.ext")` o `ls_dir(CWD)`.
-   - NUNCA uses `edit_file` sin haber leído el fichero en este turno (el agente lo bloqueará).
-   - Ante errores HTTP/API/herramienta desconocida → `web_search` primero.
-3. **Implementa** — `edit_file` / `write_file` / `bulk_replace`. Anuncia qué fichero editas y por qué. Tras cada edición, describe en 1-2 frases qué cambió y qué efecto tiene.
-4. **Verifica** — `run_tests` / `lint_file` / `lsp_diagnostics` / `make_run`. Reporta el resultado: "N tests pasados, M fallidos" o lista de errores con `ruta:línea:mensaje`.
-5. **Finaliza y reporta** — informe estructurado: qué se hizo, ficheros cambiados (rutas exactas), resultado de tests/lint, advertencias, próximos pasos. Llama `mem_save` con hallazgos no obvios; `workspace_remember` para instrucciones persistentes.
-
-## Reglas generales
-- **Comunicación con el usuario (EL USUARIO NO VE LAS TOOLS NI SUS RESULTADOS, SOLO TU TEXTO):**
-  - **Antes de actuar:** anuncia brevemente qué vas a hacer (1 frase para simple, plan detallado para ≥3 pasos).
-  - **Tarea compleja (≥3 pasos) o replanificación:** emite un plan detallado en texto antes de la primera tool (ver "Planificación autónoma"). El sistema continúa automáticamente; el usuario puede redirigir con `/steer`.
-  - **Bloqueo no resoluble:** añade "⚠ REQUIERE REVISIÓN: [descripción]" al plan — el sistema pausa y espera al usuario antes de continuar.
-  - **Tras exploración:** describe qué encontraste — rutas de ficheros, funciones relevantes, causas identificadas, fragmentos de código con `ruta:línea`. No digas "encontré algo" sin mostrar el qué.
-  - **Tras implementación:** describe el cambio — qué función/clase se modificó, qué hacía antes y qué hace ahora. Un antes/después breve si no es obvio.
-  - **Al finalizar:** informe estructurado — qué se hizo, ficheros modificados (rutas exactas), resultado de tests (N pasados / M fallidos), advertencias activas, próximos pasos si procede.
-- **Ficheros >1000 líneas** (cualquier lenguaje o formato): SIEMPRE empieza con `code_outline(path)` para ver la estructura y `read_sections(path, ['NombreFuncion'])` para leer solo la sección relevante. NUNCA `read_file` sin offset en ficheros grandes. Antes de editar: `read_sections` → `grep_code` para verificar old_string → `edit_file`.
-- NUNCA inventes rutas, código ni resultados. NUNCA declares ✅ sin verificar con tools.
-- **Verbosidad adaptada al contexto** — sin relleno ("Entendido, voy a...", "Como puedes ver...") pero SÍ con contenido cuando el contexto lo exige:
-  - **Hallazgos y análisis:** detallado — fragmentos de código con `ruta:línea`, lista de ítems ordenada por severidad, causa raíz explicada. El usuario no ve los ficheros: necesita ver el contexto.
-  - **Después de implementar:** describe qué cambió (fichero + función + qué y por qué). Muestra un antes/después si el cambio no es obvio.
-  - **Informe de finalización:** resumen estructurado — qué se hizo, qué ficheros cambiaron (rutas exactas), resultado de tests (N pasados / M fallidos), advertencias, próximos pasos si procede.
-  - Código en bloques ```language. Errores y logs en ```text.
-- **El CWD es el directorio del proyecto.** Usa rutas absolutas al CWD para leer/editar código.
-  `~/.oocode/workspace/` = identidad del agente (NO código del proyecto). NO busques código ahí.
-- **`web_search` — escala antes de repetir estrategias que no funcionan:**
-  - Error HTTP/API/import desconocido → busca el error exacto + versión + plataforma ANTES de probar nada más.
-  - Símbolo, función o API no encontrada tras ≥3 búsquedas vacías en el proyecto → puede que el nombre sea externo o haya cambiado.
-  - ≥3 estrategias distintas fallidas con el mismo problema → busca antes de seguir adivinando.
-- **`compose_down -v` DESTRUYE VOLÚMENES (base de datos, datos persistentes)** — PROHIBIDO salvo que el usuario lo pida explícitamente. Usa `compose_stop` o `compose_restart` en su lugar.
-- **Escribir ficheros DENTRO de un contenedor Docker:** `write_file` en el host → `docker_cp(src='~/.oocode/tmp/file', dst='CONTAINER:/ruta/')`. Para contenido pequeño: `docker_exec(command='printf \\'texto\\' > /ruta/fichero')`.
-- **write_file Permission denied (Errno 13):** la ruta pertenece a un volumen Docker o directorio de sistema. Escribe en `~/.oocode/tmp/` y usa `docker_cp` para moverlo al contenedor.
-- Si bash devuelve error: diagnostica antes de reintentar (`ls_dir(path)`/`find_files(directory=path)`); no repitas el mismo comando.
-- **PROHIBIDO** (el agente bloqueará): ficheros .py/.sh temporales, heredocs bash, `bash git/grep/find/ls/cat/sed -i/make/pytest/docker exec/docker compose/docker cp`.
-- Anti-bucle: si una tool falla 2 veces con el mismo argumento, CAMBIA estrategia.
-- Antes de `regex_replace`: verifica con `grep_code` que el patrón existe exactamente.
-- Si `regex_replace` falla: usa `read_file` para ver el texto REAL → `edit_file` con literal exacto.
-- En planes multi-tarea: anuncia cada tarea con "Tarea N: descripción breve" al empezarla. Cuando hayas completado TODAS las tareas usando tools, tu primera frase debe ser "He completado todas las tareas." — el sistema lo detecta y detiene la ejecución.
-- **PROHIBIDO — nunca emitas "He completado todas las tareas." si**: (1) hay tareas ◻ pendientes en el panel, (2) en la misma respuesta mencionas "Próximo paso", "fase pendiente", `(PENDIENTE)`, "🔄 en curso" u otro trabajo futuro, (3) hay errores sin resolver marcados con `❌`, `REQUIERE CORRECCIÓN` o `(PENDIENTE)`, (4) la tarea activa requería editar/crear ficheros y NO llamaste `edit_file`/`write_file`/`bulk_replace`. El sistema detecta la contradicción y fuerza la continuación.
-- Cuando encuentres un error que no puedes resolver en este turno (indicado con `❌`, `REQUIERE CORRECCIÓN`, `(PENDIENTE)` u otro marcador similar): llama `workspace_remember(note="Aprendizaje: [descripción del problema encontrado] → [qué queda pendiente o cómo abordarlo]")` para documentarlo en OOCODE.md, luego explica al usuario qué falta — en lugar de declarar la tarea completada.
-- **ANTES de "He completado todas las tareas."** — si la tarea modificó código (`edit_file`/`write_file`/`bulk_replace`/`patch_apply`), DEBES llamar `run_tests` o `test_file` en este mismo turno. No puedes declarar completado sin haber ejecutado los tests. Excepción única: tareas puramente de lectura/análisis/documentación sin ningún cambio de código.
-- Nunca emitas una respuesta vacía. Tras recibir resultados de tools, continúa directamente con las siguientes tools o responde al usuario. Si ya has completado todo, di "He completado todas las tareas."
-
-## LSP — usar si hay servidor activo
-
-| Tarea | Tool |
-|-------|------|
-| Funciones/structs del fichero | `lsp_symbols(path)` |
-| Buscar símbolo en proyecto | `lsp_workspace_symbols(query, path)` |
-| Callers/callees | `lsp_call_hierarchy(path, line)` |
-| Tipo de variable | `lsp_hover(path, line, col)` |
-| Errores/warnings | `lsp_diagnostics(path)` |
-| Renombrar en todo el código | `lsp_rename(path, line, col, new_name, apply=true)` |
-
-**C/C++ (clangd):** `lsp_symbols` → `lsp_hover` → `lsp_call_hierarchy` → `edit_file` → `lsp_diagnostics` → `make_run`
-**Python:** `lsp_diagnostics` tras editar · `lsp_references` antes de renombrar
-**JS/TS/Shell/Perl/YAML:** `lsp_diagnostics` tras cada edición
-
-## Instrucciones y memoria
-- OOCODE.md + "## Instrucciones del proyecto" tienen máxima prioridad — SIEMPRE respetadas.
-- Instrucciones persistentes del usuario → `workspace_remember(note)`.
-- Hallazgos importantes (arquitectura, decisiones, bugs) → `mem_save(snake_case_name, content)`.
-"""
-
-_SUBAGENT_COLORS = ["cyan", "blue", "magenta", "green", "yellow", "bright_cyan"]
-
-
-def _make_compact_summary(blocks: list[tuple[str, dict, str, bool]]) -> str:
-    """Genera resumen compacto estilo Claude Code para un batch de tool calls TUI con metadata.
-
-    Ejemplo: "Searched 3 patterns, read 2 files, wrote 1 file  (ctrl+o to expand)"
-    Para ediciones únicas: "Updated agent/loop.py"  (nombre de fichero, no contador genérico)
-    Metadata: timestamp, tokens usados, estado LSP
-    """
-    import os
-    # Mapeo tool → (verbo, unidad_singular, unidad_plural)
-    _VERBS: dict[str, tuple[str, str, str]] = {
-        # búsqueda
-        "code_search":       ("Searched", "pattern", "patterns"),
-        "grep_code":         ("Searched", "pattern", "patterns"),
-        "grep_file":         ("Searched", "pattern", "patterns"),
-        "multi_grep":        ("Searched", "pattern", "patterns"),
-        "find_file":         ("Found", "file", "files"),
-        "find_files":        ("Found", "file", "files"),
-        "find_dir":          ("Found", "directory", "directories"),
-        "symbol_lookup":     ("Looked up", "symbol", "symbols"),
-        "code_compare":      ("Compared", "file", "files"),
-        # lectura
-        "read_file":         ("Read", "file", "files"),
-        "read_files":        ("Read", "file", "files"),
-        "ls_dir":            ("Listed", "directory", "directories"),
-        "file_stat":         ("Checked", "file", "files"),
-        # escritura
-        "write_file":        ("Wrote", "file", "files"),
-        "edit_file":         ("Updated", "file", "files"),
-        "edit_files":        ("Updated", "file", "files"),
-        "regex_replace":     ("Replaced", "pattern", "patterns"),
-        "bulk_replace":      ("Replaced", "pattern", "patterns"),
-        "patch_apply":       ("Applied", "patch", "patches"),
-        # bash / ejecución
-        "bash":              ("Ran", "command", "commands"),
-        "run_script":        ("Ran", "script", "scripts"),
-        "python_exec":       ("Executed", "script", "scripts"),
-        # LSP
-        "lsp_definition":    ("Resolved", "definition", "definitions"),
-        "lsp_references":    ("Found", "reference", "references"),
-        "lsp_hover":         ("Checked", "hover", "hovers"),
-        "lsp_symbols":       ("Listed", "symbol", "symbols"),
-        "lsp_diagnostics":   ("Checked", "diagnostic", "diagnostics"),
-        "lsp_completion":    ("Completed", "symbol", "symbols"),
-        "lsp_rename":        ("Renamed", "symbol", "symbols"),
-        "lsp_format":        ("Formatted", "file", "files"),
-        "lsp_workspace_symbols": ("Searched", "symbol", "symbols"),
-        "lsp_call_hierarchy":("Built", "call tree", "call trees"),
-        # memoria
-        "mem_save":          ("Saved", "memory", "memories"),
-        "mem_search":        ("Searched", "memory", "memories"),
-        "mem_list":          ("Listed", "memory", "memories"),
-        # MCP / misc
-        "spawn_subagent":    ("Spawned", "subagent", "subagents"),
-    }
-
-    # Herramientas que producen diff contable (+N -M líneas)
-    _EDIT_TOOLS = frozenset({"edit_file", "edit_files", "write_file"})
-    _REPLACE_TOOLS = frozenset({"regex_replace", "smart_replace", "bulk_replace", "patch_apply"})
-
-    from collections import Counter
-    import difflib
-
-    counts: Counter = Counter()
-    # Track ficheros editados para mostrar nombre cuando solo hay 1
-    edited_files: list[str] = []
-    total_added = total_removed = 0
-
-    for name, args, result, allowed in blocks:
-        if not allowed:
-            counts[("Denied", "call", "calls")] += 1
-            continue
-        # Nombre base para MCP tools (mcp_oocode_assistant_edit_file → edit_file)
-        base_name = name
-        for _write in ("_edit_file", "_edit_files", "_write_file",
-                       "_regex_replace", "_smart_replace", "_bulk_replace", "_patch_apply"):
-            if name.startswith("mcp_") and name.endswith(_write):
-                base_name = _write[1:]
-                break
-
-        verb_info = _VERBS.get(base_name, _VERBS.get(name, ("Used", "tool", "tools")))
-        counts[verb_info] += 1
-
-        # Para ediciones: intentar contar líneas y recoger nombre de fichero
-        if base_name in _EDIT_TOOLS and not str(result).startswith("Error"):
-            path = args.get("path") or args.get("file_path", "")
-            if path:
-                edited_files.append(os.path.basename(str(path)))
-            old_s = args.get("old_string", "")
-            new_s = args.get("new_string", "")
-            if old_s or new_s:
-                diff = list(difflib.unified_diff(
-                    old_s.splitlines(), new_s.splitlines(), n=0
-                ))
-                total_added   += sum(1 for l in diff if l.startswith("+") and not l.startswith("+++"))
-                total_removed += sum(1 for l in diff if l.startswith("-") and not l.startswith("---"))
-
-    parts: list[str] = []
-    # Construir partes del resumen
-    for (verb, sing, plur), n in counts.most_common():
-        # Para ediciones únicas: mostrar nombre del fichero si está disponible
-        if verb == "Updated" and n == 1 and len(edited_files) == 1:
-            entry = f"Updated {edited_files[0]}"
-            if total_added or total_removed:
-                entry += f" (+{total_added} -{total_removed})"
-            parts.append(entry)
-        elif verb == "Updated" and n > 1 and edited_files:
-            entry = f"Updated {n} files"
-            if total_added or total_removed:
-                entry += f" (+{total_added} -{total_removed})"
-            parts.append(entry)
-        else:
-            unit = sing if n == 1 else plur
-            parts.append(f"{verb} {n} {unit}")
-
-    if not parts:
-        return "(ctrl+o to expand)"
-    return ", ".join(parts) + "  (ctrl+o to expand)"
-
-
-
-
-def _record_tool_metrics(tool_name: str, duration: float, success: bool) -> None:
-    """Registra métricas de rendimiento de herramientas.
-    
-    Args:
-        tool_name: Nombre de la herramienta.
-        duration: Tiempo de ejecución en segundos.
-        success: Si la herramienta tuvo éxito.
-        cwd: Directorio de trabajo (opcional).
-    """
-    import time
-    from pathlib import Path
-    metrics_path = Path.home() / ".oocode" / "metrics" / "tool_timing.jsonl"
-    metrics_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    entry = {
-        "ts": time.time(),
-        "tool": tool_name,
-        "duration": duration,
-        "success": success,
-        "cwd": os.getcwd(),
-        "metrics": {
-            "p99": 0.0,
-            "p95": 0.0,
-            "p50": 0.0,
-            "min": duration,
-            "max": duration,
-            "count": 1,
-            "errors": 0,
-        },
-    }
-    
-    with metrics_path.open("a") as f:
-        f.write(json.dumps(entry) + "\n")
-
-    return None
-
-
-def _retry_with_backoff(func, *args, max_retries=3, base_delay=1.0) -> None:
-    """Ejecuta func con backoff exponencial."""
-    import time
-    import random
-    
-    for attempt in range(max_retries):
-        try:
-            return func(*args)
-        except Exception as e:
-            if attempt == max_retries - 1:
-                raise
-            # Backoff exponencial más consistente
-            delay = base_delay * (2 ** attempt) + random.uniform(0, 0.1)
-            print(f"⚠ Retry {attempt + 1}/{max_retries} en {delay:.1f}s...")
-            time.sleep(delay)
-    
-    return None
-
-class AgentLoop:
+# ── Helpers y constantes (re-exportadas para compatibilidad hacia atrás) ───────
+from agent.loop_helpers import (  # noqa: F401
+    _SPINNER_FRAMES, _POLL_INTERVAL, _HEADER_ANIM_CODES, _ANSI_BOLD, _ANSI_RESET,
+    _TIMEOUT_SENTINEL, _FALLBACK_MIN_CHARS, _THINKING_WORDS, _MULTITASK_WORDS,
+    _TASK_PREFLIGHT_PHRASES, _TASK_ICON_COLORS, _PREFLIGHT_USER_GREETINGS,
+    _SINGLE_PREFLIGHT_GENERIC, _PF_ACTIONS, _PF_DOMAINS, _PF_PHRASES,
+    _MULTI_ICON_STYLES, _COMPACT_LOCK, _DONE_WORDS, _NEAR_FINISH_PHRASES,
+    _TOOL_ALIASES, _IMG_EXTENSIONS,
+    _SUBAGENT_COLORS, _TOOL_LIVE_VERBS,
+    SYSTEM_HEADER, _TOOL_GROUPS, _TASK_KEYWORDS, SYSTEM_RULES,
+    _pick_preflight_phrase, _fmt_elapsed, _fmt_tokens, _rag_display,
+    _is_complex_query, _load_images_b64, _ctx_bar, _compact_hint,
+    _pbar_thin_ratio, _sfmt, _bar_style, _hint_styled,
+    _make_compact_summary,
+    _make_tool_preview, _pick_file_switch_phrase,
+    _SUBAGENT_SPINNER_POLL, _MAX_PLAN_TASKS, _BASH_OVERUSE_RATIO,
+)
+from webui.loop_webui import WebUIMixin
+from ui.loop_tui import TUIDisplayMixin
+
+class AgentLoop(TUIDisplayMixin, WebUIMixin):
     def __init__(
         self,
         config,
@@ -847,6 +97,8 @@ class AgentLoop:
             min_keep=config.compact_min_keep,
             compact_threshold=config.compact_threshold,
             max_summary_chars=config.max_summary_chars,
+            high_water=config.context_high_water,
+            tool_max_chars=config.context_tool_max_chars,
         )
         # Reutilizar cliente externo si se proporciona (subagentes comparten el del padre
         # para que Ollama no descargue/recargue el modelo entre llamadas).
@@ -865,6 +117,7 @@ class AgentLoop:
         self._turn_rag_snippet: Optional[str] = None
         self._pending_usage_line: str = ""
         self._kill_requested: bool = False
+        self._client_needs_rebuild: bool = False  # True después de kill: reconstruir httpx antes del próximo request
         # Callback de status (spinner) para el modo Application full-screen.
         # Si es None, se usa Live de Rich (modo REPL clásico).
         self._status_cb = None
@@ -875,6 +128,8 @@ class AgentLoop:
         self._auto_continue_count: int = 0
         # Etiqueta del separador superior: "" → muestra proyecto, "⚙ tool…" durante tool
         self._sep_label: str = ""
+        # WebUI SSE output queue — set by WebUI to capture loop output for browser streaming
+        self._webui_queue = None    # queue.SimpleQueue | None
         # Control externo de subagentes (inyectados por SubAgentRunner)
         self._steer_queue = None    # queue.SimpleQueue con nuevas instrucciones
         self._ext_kill    = None    # threading.Event: matar desde /subagents kill
@@ -937,26 +192,46 @@ class AgentLoop:
         self._turn_block: list[tuple[str, dict, str, bool]] = []
         self._turn_block_has_header: bool = False  # True si el batch ya mostró un ● header
         self._turn_expanded: bool = False
+        self._current_write_target: str = ""   # Último fichero editado/escrito (para auto-split)
         # Fichero actual procesado por tools de búsqueda (para mostrar en spinner)
         self._tool_current_file: str = ""
         # Live block callbacks (inyectados por OOCodeApp; None en modo REPL)
         self._start_live_block_cb: Optional[Callable] = None
         self._update_live_tools_cb: Optional[Callable] = None
+        self._update_live_current_tool_cb: Optional[Callable] = None  # muestra tool en ⎿ durante ejecución
+        self._update_live_preview_cb: Optional[Callable] = None       # líneas de preview (1-4) mientras corre
+        self._update_live_tool_start_cb: Optional[Callable] = None    # atómico: label + preview (sin double-flash)
         self._flush_live_block_cb: Optional[Callable] = None
+        self._set_plan_header_mode_cb: Optional[Callable] = None  # inyectado por OOCodeApp
         self._live_tool_count: int = 0   # tools completadas en el live block actual
         # True si el modelo emitió texto al usuario en el turno actual
         self._turn_text_emitted: bool = False
-        # Ficheros modificados en la tarea actual (se resetea en run())
-        self._task_modified_files: set = set()
+        # Buffer de salida para subagentes: max 12 líneas visibles por turno
+        self._sub_lines_shown: int = 0
+        _MAX_SUB_LINES_PER_TURN = 12
+        self._MAX_SUB_LINES = _MAX_SUB_LINES_PER_TURN
+        # Referencia al ActiveSubAgent para actualizar stats (None = no es subagente)
+        self._sub_stats_ref = None
         # Último resultado de tests de la tarea actual (se resetea en run())
         self._task_last_test: str = ""
 
+    def close(self) -> None:
+        """Libera recursos de forma determinista: cierra el httpx.Client de Ollama
+        si este AgentLoop es su propietario.  Llamar explícitamente antes de salir;
+        __del__ actúa solo como red de seguridad."""
+        if not getattr(self, "_owns_client", True):
+            return
+        client = getattr(self, "client", None)
+        if client is None:
+            return
+        try:
+            client.close()
+        except Exception as e:
+            log.debug("client_close_error", error=str(e))
+        self._owns_client = False  # evita doble cierre si __del__ se invoca después
+
     def __del__(self):
-        if getattr(self, "_owns_client", True):
-            try:
-                self.client.close()
-            except Exception:
-                pass
+        self.close()
 
     # ── Modelo activo ────────────────────────────────────────────────────────
 
@@ -996,10 +271,12 @@ class AgentLoop:
         if not self.is_subagent:
             if self._turn_mem_snippet is None:
                 try:
+                    self._webui_emit({"type": "embed_flash", "op": "read"})
                     self._turn_mem_snippet = self.memory.context_snippet(
                         self._last_user_msg
                     )
-                except Exception:
+                except Exception as e:
+                    log.debug("mem_snippet_error", error=str(e))
                     self._turn_mem_snippet = ""
             mem_snippet = self._turn_mem_snippet
         else:
@@ -1019,7 +296,8 @@ class AgentLoop:
                         top_k=_rag_top_k,
                         threshold=_rag_thresh,
                     )
-                except Exception:
+                except Exception as e:
+                    log.debug("rag_snippet_error", error=str(e))
                     self._turn_rag_snippet = ""
             rag_snippet = self._turn_rag_snippet
 
@@ -1065,14 +343,30 @@ class AgentLoop:
 
     # ── Display helpers ──────────────────────────────────────────────────────
 
+    _RICH_TAG_RE = re.compile(r'\[/?[^\]]+\]')   # sync con ui/app.py: strip Rich + residuos ANSI numéricos
+
+    @staticmethod
+    def _strip_rich(text: str) -> str:
+        return AgentLoop._RICH_TAG_RE.sub('', text)
+
     def _print(self, *args, **kwargs):
         if not self.capture_output:
             if self.is_subagent:
-                # Prefijo │ con color rotativo para distinguir el output del subagente
+                # Prefijo │ con color rotativo; buffer máximo de _MAX_SUB_LINES por turno
                 col = _SUBAGENT_COLORS[self._subagent_color_idx % len(_SUBAGENT_COLORS)]
-                console.print(f"  [bold {col}]│[/bold {col}]", *args, **kwargs)
+                if self._sub_lines_shown < self._MAX_SUB_LINES:
+                    console.print(f"  [bold {col}]│[/bold {col}]", *args, **kwargs)
+                    self._sub_lines_shown += 1
+                    if self._sub_lines_shown == self._MAX_SUB_LINES:
+                        console.print(f"  [dim {col}]│   … buffer lleno (ctrl+o para ver completo)[/dim {col}]")
             else:
                 console.print(*args, **kwargs)
+        # WebUI SSE: emit stripped text
+        if getattr(self, "_webui_queue", None) is not None and args:
+            text = " ".join(str(a) for a in args)
+            plain = self._strip_rich(text).strip()
+            if plain:
+                self._webui_emit({"type": "text", "text": plain})
 
     # Nombres de display al estilo Claude Code: verb capitalizado en lugar del snake_case interno
     _TOOL_DISPLAY_NAMES: dict[str, str] = {
@@ -1108,13 +402,23 @@ class AgentLoop:
         "git_log":          "GitLog",
         "git_branch":       "GitBranch",
         "git_stash":        "GitStash",
+        "smart_replace":    "Replace",
         "regex_replace":    "Replace",
         "bulk_replace":     "ReplaceAll",
         "patch_apply":      "Patch",
+        "read_sections":    "Read",
+        "code_outline":     "Outline",
+        "diff_files":       "Diff",
+        "run_tests":        "Test",
+        "test_file":        "Test",
+        "analyze_codebase": "Analyze",
+        "affected_files":   "CheckUsage",
         "lsp_diagnostics":  "Diagnostics",
         "lsp_hover":        "Hover",
         "lsp_references":   "References",
         "lsp_rename":       "Rename",
+        "lsp_type_definition": "TypeDef",
+        "lsp_implementation":  "Impl",
         "extract_functions": "Extract",
         "extract_classes":  "Extract",
         "spawn_subagent":   "Subagent",
@@ -1123,6 +427,7 @@ class AgentLoop:
         "docker_ps":        "Docker",
         "docker_logs":      "DockerLogs",
         "docker_exec":      "DockerExec",
+        "docker_inspect":   "DockerInspect",
         "strace_run":       "Strace",
         "gdb_run":          "GDB",
         "valgrind_run":     "Valgrind",
@@ -1156,7 +461,7 @@ class AgentLoop:
             )
             return _esc(f"({_short_path(p)})") if p else ""
         if name in ("grep_code", "grep_file"):
-            pat  = str(args.get("pattern", ""))[:50]
+            pat  = str(args.get("pattern", ""))
             d    = args.get("directory", args.get("path", ""))
             base = d.rsplit("/", 1)[-1] if d else ""
             return _esc(f'("{pat}"  {base})') if pat else ""
@@ -1164,73 +469,38 @@ class AgentLoop:
             return _esc(f"({args.get('symbol', '')})")
         if name == "multi_grep":
             pats = args.get("patterns", [])
-            s = ", ".join(str(p) for p in (pats[:2] if isinstance(pats, list) else [str(pats)[:50]]))
-            return _esc(f"([{s}…])" if len(pats) > 2 else f"([{s}])")
+            s = ", ".join(str(p) for p in (pats if isinstance(pats, list) else [str(pats)]))
+            return _esc(f"([{s}])")
         if name == "bash":
             # Primera línea del comando (comandos multilinea: solo el inicio)
             cmd = args.get("command", "").splitlines()[0] if args.get("command") else ""
-            cmd = cmd[:100]
             return _esc(f"({cmd})")
         if name in ("find_file", "find_files", "find_dir"):
             n = args.get("name") or args.get("extension") or args.get("glob", "")
             d = args.get("directory", "")
             base = d.rsplit("/", 1)[-1] if d else ""
             return _esc(f"({n}  {base})") if n and base else _esc(f"({n})") if n else ""
-        if name in ("bulk_replace", "regex_replace"):
-            pat = str(args.get("pattern", ""))[:40]
-            return _esc(f'("{pat}"…)') if pat else ""
+        if name in ("bulk_replace", "regex_replace", "smart_replace"):
+            pat = str(args.get("pattern", "") or args.get("search", ""))
+            return _esc(f'("{pat}")') if pat else ""
         if name == "make_run":
             target = args.get("target", "all")
             d      = args.get("directory", "").rsplit("/", 1)[-1]
             return _esc(f"({target}  {d})") if d else _esc(f"({target})")
         if name == "python_exec":
-            first = str(args.get("code", "")).split("\n")[0][:60]
+            first = str(args.get("code", "")).split("\n")[0]
             return _esc(f"({first}…)") if "\n" in str(args.get("code", "")) else _esc(f"({first})")
         if name in ("git_diff", "git_log", "git_add", "git_commit"):
             msg = args.get("message") or args.get("path") or args.get("files", "")
             if isinstance(msg, list):
-                msg = ", ".join(str(m) for m in msg[:2])
-            return _esc(f"({str(msg)[:40]})") if msg else ""
+                msg = ", ".join(str(m) for m in msg)
+            return _esc(f"({str(msg)})") if msg else ""
         if name in ("lsp_diagnostics", "lint_file", "mypy_check"):
             p = args.get("path", "")
             return _esc(f"({_short_path(p)})") if p else ""
         return ""
 
-    def _show_tool_call(self, name: str, args: dict) -> None:
-        """Muestra un tool call individual (modo REPL o verbose). Internamente llamado
-        solo en el bloque de resultado (_show_tool_block)."""
-        if self.rt.verbose:
-            args_str = json.dumps(args, ensure_ascii=False, indent=2)
-            self._print(f"  [dim cyan]⚙[/dim cyan]  [bold]{name}[/bold]")
-            self._print(f"[dim]{args_str}[/dim]")
-        else:
-            ctx = self._call_context(name, args)
-            self._print(f"  [dim cyan]⚙[/dim cyan]  [bold]{name}[/bold]  [dim]{ctx}[/dim]")
 
-    def _show_tool_result(self, result: str, allowed: bool) -> None:
-        if not allowed:
-            self._print("  [dim red]✗  Denegado por el usuario[/dim red]")
-            return
-        if self.rt.verbose:
-            self._print(f"  [dim green]✓[/dim green]  [dim]{result[:800]}[/dim]")
-            return
-        lines = result.strip().splitlines()
-        n_lines = len(lines)
-        n_chars = len(result)
-        preview = lines[0][:80] if lines else ""
-        if n_lines > 3:
-            self._print(
-                f"  [dim green]✓[/dim green]  [dim]{preview}[/dim]  "
-                f"[dim cyan]▸ {n_lines} líneas · {n_chars} chars[/dim cyan]  "
-                f"[bold yellow](Ctrl+O para expandir)[/bold yellow]"
-            )
-        elif n_lines > 1:
-            self._print(
-                f"  [dim green]✓[/dim green]  [dim]{preview}[/dim]  "
-                f"[dim]+{n_lines - 1} líneas[/dim]"
-            )
-        else:
-            self._print(f"  [dim green]✓[/dim green]  [dim]{preview}[/dim]")
 
     # ── Tools de búsqueda para display compacto ────────────────────────────────
     _SEARCH_DISPLAY_TOOLS = frozenset((
@@ -1244,108 +514,13 @@ class AgentLoop:
         "ls_dir", "ls_file", "file_stat", "tree",
     ))
 
-    def _show_inline_compact_result(self, name: str, args: dict,
-                                    result: str, allowed: bool) -> None:
-        """Muestra resultado compacto inline (una línea ⎿) para tools no-write en TUI mode."""
-        from rich.markup import escape as _esc
 
-        if not allowed:
-            self._print("  [dim red]⎿  Denegado[/dim red]")
-            return
-
-        r = result.strip() if result else ""
-        if not r or r in ("Sin resultados.", "No results."):
-            self._print("  [dim]⎿  Sin resultados[/dim]")
-            return
-        if r.startswith("⛔ AGENTE BLOQUEÓ"):
-            first = r.splitlines()[0][:100]
-            self._print(f"  [bold yellow]⎿  {_esc(first)}[/bold yellow]")
-            return
-        if r.startswith("Error:") or r.startswith("Error ") or r.startswith("Timeout:"):
-            self._print(f"  [dim red]⎿  {_esc(r.splitlines()[0][:100])}[/dim red]")
-            return
-
-        lines = r.splitlines()
-        n_lines = len(lines)
-
-        if name in self._SEARCH_DISPLAY_TOOLS:
-            # Contar matches (▶) y ficheros únicos (líneas que son "path:line:col")
-            n_matches = sum(1 for ln in lines if ln.strip().startswith("▶"))
-            # Ficheros únicos: líneas sin sangría que contienen ":" y no comienzan con " "
-            file_set: set[str] = set()
-            for ln in lines:
-                if ln and not ln.startswith(" ") and ":" in ln:
-                    fp = ln.split(":")[0].strip()
-                    if fp and "/" in fp or "." in fp:
-                        file_set.add(fp)
-            n_files = len(file_set) if file_set else max(1, n_matches)
-            if n_matches > 0:
-                expand = "  [dim](ctrl+o)[/dim]" if n_lines > 5 else ""
-                self._print(
-                    f"  [dim]⎿  {n_matches} resultado{'s' if n_matches != 1 else ''}"
-                    f"  en {n_files} fichero{'s' if n_files != 1 else ''}{expand}[/dim]"
-                )
-            else:
-                preview = lines[0][:90]
-                if n_lines > 2:
-                    self._print(f"  [dim]⎿  {_esc(preview)}  +{n_lines-1}[/dim]")
-                else:
-                    self._print(f"  [dim]⎿  {_esc(preview)}[/dim]")
-        elif name in self._READ_DISPLAY_TOOLS:
-            # Fichero leído: "⎿ nombre  [N líneas]"
-            fname = (args.get("path") or args.get("file_path") or
-                     args.get("directory") or "")
-            fname_short = fname.rsplit("/", 1)[-1][:40] if fname else ""
-            if fname_short:
-                self._print(f"  [dim]⎿  {_esc(fname_short)}  [{n_lines} líneas][/dim]")
-            else:
-                preview = lines[0][:90]
-                self._print(f"  [dim]⎿  {_esc(preview)}[/dim]")
-        else:
-            # Caso general: primera línea + count
-            preview = lines[0][:90]
-            if n_lines > 2:
-                self._print(
-                    f"  [dim]⎿  {_esc(preview)}  "
-                    f"[dim cyan]+{n_lines-1}[/dim cyan][/dim]"
-                )
-            else:
-                self._print(f"  [dim]⎿  {_esc(preview)}[/dim]")
-
-    def _render_tool_diff_print(self, name: str, args: dict, result: str) -> None:
-        """Renderiza diff de write/edit/replace via self._print (TUI-safe)."""
-        if not result or "Error" in result or "fallida" in result or "rollback" in result:
-            return
-        try:
-            import tools.diff_renderer as _dr
-            _dr._dprint_fn = self._print
-            from tools.diff_renderer import (
-                render_edit_diff, render_write_diff,
-                render_replace_diff, render_bulk_diff, render_patch_diff,
-            )
-            _is_edit    = name == "edit_file" or name.endswith("_edit_file")
-            _is_multi   = name == "edit_files" or name.endswith("_edit_files")
-            _is_replace = (name in ("regex_replace", "smart_replace") or
-                           any(name.endswith(s) for s in ("_regex_replace", "_smart_replace")))
-            _is_bulk    = name == "bulk_replace" or name.endswith("_bulk_replace")
-            _is_patch   = name == "patch_apply" or name.endswith("_patch_apply")
-            if _is_edit or _is_multi:
-                render_edit_diff(args, result)
-            elif _is_replace:
-                render_replace_diff(args, result)
-            elif _is_bulk:
-                render_bulk_diff(args, result)
-            elif _is_patch:
-                render_patch_diff(args, result)
-            else:
-                render_write_diff(args, result)
-        except Exception:
-            pass
 
     def _show_tool_block(self, name: str, args: dict, result: str,
                          allowed: bool, block_mode: bool = False,
                          suppress_header: bool = False,
-                         pre_shown: bool = False) -> None:
+                         pre_shown: bool = False,
+                         batch_idx: int = -1) -> None:
         """Muestra un tool call al estilo Claude Code:
 
           ● ToolName(contexto)
@@ -1355,10 +530,87 @@ class AgentLoop:
 
         Bloqueos del agente usan ⊘ en amarillo.
         Hints del agente (⚡) se muestran en cyan al final.
-        suppress_header=True → batch agrupado: muestra solo ⎿ path, sin resultados.
+        suppress_header=True → batch agrupado: Name(ctx_brief) con ⎿ /spaces.
+        batch_idx >= 0       → posición en batch (0=⎿ , >0=spaces, >=3=oculto).
         pre_shown=True       → header ya impreso antes de ejecutar: salta al resultado.
         """
         if self.capture_output:
+            return
+
+        # spawn_subagent: el header ● y el footer ⎿ Done ya se imprimieron dentro
+        # del closure spawn_subagent() — no mostrar resultado estándar
+        if name == "spawn_subagent" and not self.is_subagent:
+            self._webui_emit({"type": "subagent_done", "agent_id": args.get("agent_id", "")})
+            return
+
+        # plan_create: ya emitió su propio evento 'plan' — no emitir tool_done
+        if name == "plan_create" and getattr(self, "_webui_queue", None) is not None:
+            return
+
+        # WebUI: emitir tool_done estructurado y salir — _print() contaminaría el chat
+        if getattr(self, "_webui_queue", None) is not None:
+            _result_str = str(result)
+            _disp  = self._TOOL_DISPLAY_NAMES.get(name, name)
+            _ctx   = self._strip_rich(self._call_context(name, args)).strip()
+            _is_ok = allowed and not _result_str.startswith("⛔")
+            _prev  = _result_str.splitlines()[0] if _result_str else ""
+            _ev: dict = {
+                "type":    "tool_done",
+                "tool":    _disp,
+                "raw":     name,
+                "context": _ctx,
+                "ok":      _is_ok,
+                "n_lines": len(_result_str.splitlines()),
+                "preview": _prev,
+            }
+            # Detectar fichero creado/editado para mostrar tarjeta de descarga
+            if _is_ok:
+                import os as _ose, re as _re_fp
+                _FC = frozenset((
+                    "write_file", "create_file", "save_file",
+                    "doc_create", "doc_create_rfc", "doc_project_save",
+                    "doc_create_from_template", "doc_fill_template",
+                    "doc_fill_corporate_template", "doc_convert",
+                    "xlsx_create_report", "xlsx_create_table",
+                    "pptx_create", "pptx_create_from_template",
+                ))
+                _FE = frozenset((
+                    "edit_file", "edit_files", "regex_replace",
+                    "smart_replace", "bulk_replace", "patch_apply",
+                    "doc_update_section", "xlsx_fill_range",
+                ))
+                _FSC = ("_write_file", "_create_file", "_save_file",
+                        "_doc_create", "_spreadsheet_create",
+                        "_presentation_create", "_export_pdf",
+                        "_create_report", "_create_table",
+                        "_fill_template", "_corporate_template")
+                _FSE = ("_edit_file", "_edit_files", "_regex_replace",
+                        "_smart_replace", "_bulk_replace", "_patch_apply",
+                        "_update_section", "_fill_range")
+                _is_fc = name in _FC or any(name.endswith(s) for s in _FSC)
+                _is_fe = name in _FE or any(name.endswith(s) for s in _FSE)
+                if _is_fc or _is_fe:
+                    _p = (args.get("path") or args.get("file_path") or
+                          args.get("output_path") or args.get("filepath") or
+                          args.get("dest") or "")
+                    if not _p and "edits" in args and isinstance(args["edits"], list):
+                        _paths = [e.get("path", "") for e in args["edits"] if e.get("path")]
+                        _p = _paths[0] if _paths else ""
+                    # Fallback: extraer ruta del texto de resultado (ej. "✅ Guardado: /ruta/f.docx")
+                    if not _p and _result_str:
+                        _ext_p = r'\.(?:docx|xlsx|pptx|pdf|odt|csv|md|txt|json|yaml|yml)'
+                        _fm = _re_fp.search(r'(/\S+' + _ext_p + r')', _result_str)
+                        if _fm:
+                            _p = _fm.group(1).rstrip('.,;)')
+                    if isinstance(_p, str) and _p:
+                        _abs = _ose.path.abspath(_ose.path.expanduser(str(_p)))
+                        if _ose.path.isfile(_abs):
+                            _ev["file_path"]   = _abs
+                            _ev["file_name"]   = _ose.path.basename(_abs)
+                            _ev["file_size"]   = _ose.path.getsize(_abs)
+                            _ev["file_action"] = "created" if _is_fc else "edited"
+            self._webui_emit(_ev)
+            self._webui_emit(self._webui_status())
             return
 
         from rich.markup import escape as _esc
@@ -1371,24 +623,17 @@ class AgentLoop:
         #   mostramos resultado compacto inline y NO añadimos a _turn_block.
         # • pre_shown=False (ejecución paralela): añadimos a _turn_block para resumen al final.
         if getattr(self, "_status_cb", None) is not None and not self.is_subagent and not block_mode:
-            # Sufijos de tools nativas y MCP que modifican ficheros (muestra diff)
-            _WRITE_NAMES = frozenset(("write_file", "edit_file", "edit_files"))
-            _WRITE_SFXS  = ("_write_file", "_edit_file", "_edit_files")
-            _REPLACE_NAMES = frozenset(("regex_replace", "smart_replace", "bulk_replace",
-                                        "patch_apply"))
-            _REPLACE_SFXS  = ("_regex_replace", "_smart_replace", "_bulk_replace",
-                               "_patch_apply")
-            _is_write   = (name in _WRITE_NAMES or any(name.endswith(s) for s in _WRITE_SFXS))
-            _is_replace = (name in _REPLACE_NAMES or any(name.endswith(s) for s in _REPLACE_SFXS))
+            # Tools que modifican ficheros (write/edit/replace/patch, nativas y MCP)
+            _is_modify  = _is_modify_tool(name)
             _result_str = str(result)
             _is_ok = not _result_str.startswith("⛔") and not _result_str.startswith("⚠️ DUPLICADO")
 
             if pre_shown:
                 # Ejecución secuencial: el header ◐ solo se mostró para write/replace/mem.
                 # Write/replace: mostrar diff visual; solo mostrar errores si falla.
-                if _is_write or _is_replace:
+                if _is_modify:
                     if not _is_ok:
-                        self._print(f"  [dim red]⎿  {_esc(_result_str[:120])}[/dim red]")
+                        self._print(f"  [dim red]⎿ {_esc(_result_str.splitlines()[0])}[/dim red]")
                     elif allowed:
                         self._render_tool_diff_print(name, args if isinstance(args, dict) else {}, _result_str)
                 elif name in self._MEM_TOOLS:
@@ -1397,24 +642,30 @@ class AgentLoop:
                 else:
                     # Todas las demás: bufferizar en _turn_block para resumen agrupado
                     self._turn_block.append((name, args if isinstance(args, dict) else {}, _result_str, allowed))
-                # Actualizar contador live (⎿ se ve actualizar en tiempo real)
+                # Actualizar contador live y limpiar label de tool actual (⎿ se ve actualizar en tiempo real)
                 if self._update_live_tools_cb:
                     self._live_tool_count += 1
                     self._update_live_tools_cb(self._live_tool_count)
+                if getattr(self, "_update_live_current_tool_cb", None):
+                    self._update_live_current_tool_cb("")
                 return
 
             # Ejecución paralela: acumular en _turn_block para resumen compacto al final
             self._turn_block.append((name, args if isinstance(args, dict) else {}, _result_str, allowed))
-            if (_is_write or _is_replace) and allowed and not suppress_header and _is_ok:
-                self._print(
-                    f"  [bold green]●[/bold green] [bold]{_esc(display)}[/bold][dim]{ctx}[/dim]"
-                )
+            if _is_modify and allowed and not suppress_header and _is_ok:
+                _ctx_pl = self._strip_rich(ctx).strip() if ctx else ""
+                _ctx_bl = (_ctx_pl.splitlines()[0].strip() if _ctx_pl else "")
+                _ctx_brf = (_ctx_bl[:65] + "…" if len(_ctx_bl) > 65 else _ctx_bl) if _ctx_bl else ""
+                _h = f"[bold]{_esc(display)}({_ctx_brf})[/bold]" if _ctx_brf else f"[bold]{_esc(display)}[/bold]"
+                self._print(f"  [bold green]●[/bold green] {_h}")
                 self._render_tool_diff_print(name, args if isinstance(args, dict) else {}, _result_str)
                 self._turn_block_has_header = True
-            # Actualizar contador live (paralelo: se incrementa conforme llegan resultados)
+            # Actualizar contador live y limpiar label (paralelo: se incrementa conforme llegan resultados)
             if self._update_live_tools_cb:
                 self._live_tool_count += 1
                 self._update_live_tools_cb(self._live_tool_count)
+            if getattr(self, "_update_live_current_tool_cb", None):
+                self._update_live_current_tool_cb("")
             return
 
         # ── Header ────────────────────────────────────────────────────────────
@@ -1422,17 +673,38 @@ class AgentLoop:
         is_mem_tool = name in self._MEM_TOOLS
 
         if suppress_header:
-            # Batch agrupado: listar solo el path/ctx con sangría y volver
-            self._print(f"  [dim]⎿  {_esc(ctx or display)}[/dim]")
-            return  # el resultado completo no se muestra por herramienta en batch
+            # Batch agrupado: Name(ctx_brief) con ⎿ en el primero, spaces en el resto
+            _ctx_pl = self._strip_rich(ctx).strip() if ctx else ""
+            _ctx_brief = (_ctx_pl[:45] + "…") if len(_ctx_pl) > 45 else _ctx_pl
+            _label = f"{_esc(display)}({_esc(_ctx_brief)})" if _ctx_brief else _esc(display)
+            if batch_idx < 0:
+                # Fallback sin posición: ⎿ clásico
+                self._print(f"  [dim]⎿ {_label}[/dim]")
+            elif batch_idx < 3:
+                if batch_idx == 0:
+                    self._print(f"  [dim]⎿ {_label}[/dim]")
+                else:
+                    self._print(f"     [dim]{_label}[/dim]")
+            # batch_idx >= 3: herramienta oculta, no imprimir
+            return
         elif not pre_shown:
             # Header normal (alineado a 2 espacios, como el texto del asistente)
+            # Subagentes: sin negrita para no saturar el output del padre
             if is_blocked:
                 self._print(f"  [bold yellow]⊘[/bold yellow] [yellow]{_esc(display)}[/yellow][dim]{ctx}[/dim]")
             elif is_mem_tool:
-                self._print(f"  [bold cyan]⬡[/bold cyan] [bold cyan]{_esc(display)}[/bold cyan][dim]{ctx}[/dim]")
+                if self.is_subagent:
+                    self._print(f"  [cyan]⬡[/cyan] [dim]{_esc(display)}{ctx}[/dim]")
+                else:
+                    self._print(f"  [bold cyan]⬡[/bold cyan] [bold cyan]{_esc(display)}[/bold cyan][dim]{ctx}[/dim]")
+            elif self.is_subagent:
+                self._print(f"  [dim]●  {_esc(display)}{ctx}[/dim]")
             else:
-                self._print(f"  [bold green]●[/bold green] [bold]{_esc(display)}[/bold][dim]{ctx}[/dim]")
+                _ctx_plain = self._strip_rich(ctx).strip() if ctx else ""
+                _ctx_line1 = _ctx_plain.splitlines()[0].strip() if _ctx_plain else ""
+                _ctx_brief = (_ctx_line1[:65] + "…" if len(_ctx_line1) > 65 else _ctx_line1) if _ctx_line1 else ""
+                _hdr = f"[bold]{_esc(display)}({_ctx_brief})[/bold]" if _ctx_brief else f"[bold]{_esc(display)}[/bold]"
+                self._print(f"  [bold green]●[/bold green] {_hdr}")
         # pre_shown=True → el header ya se mostró en _show_tool_running_header; solo resultados
 
         if self.rt.verbose:
@@ -1440,7 +712,7 @@ class AgentLoop:
 
         # ── Resultado ──────────────────────────────────────────────────────────
         if not allowed:
-            self._print("  [dim red]⎿  Denegado[/dim red]")
+            self._print("  [dim red]⎿ Denegado[/dim red]")
             return
 
         # Los hooks post-write (lint, LSP, autoformat) muestran su propio bloque
@@ -1470,23 +742,22 @@ class AgentLoop:
         if not normal_lines and not hint_lines:
             normal_lines = all_lines        # fallback: mostrar todo
 
-        # ── Líneas de output (máx 5) ──────────────────────────────────────────
-        MAX_SHOW     = 5
-        line_color   = "yellow" if is_blocked else ("cyan" if is_mem_tool else "dim")
-        visible      = normal_lines[:MAX_SHOW]
+        # ── Líneas de output (máx 5) con │ al estilo subagente ─────────────────
+        MAX_SHOW   = 5
+        line_color = "yellow" if is_blocked else ("cyan" if is_mem_tool else "dim")
+        visible    = normal_lines[:MAX_SHOW]
 
-        for i, line in enumerate(visible):
-            pfx = "  [dim]⎿[/dim]  " if i == 0 else "     "
-            self._print(f"{pfx}[{line_color}]{_esc(line[:140])}[/{line_color}]")
+        for line in visible:
+            self._print(f"  [dim]│[/dim]  [{line_color}]{_esc(line)}[/{line_color}]")
 
         hidden = len(normal_lines) - len(visible)
         if hidden > 0:
-            self._print(f"     [dim]… +{hidden} líneas (ctrl+o to expand)[/dim]")
+            self._print(f"  [dim]│  … +{hidden} lines (ctrl+o to expand)[/dim]")
 
-        # ── Hints del agente (⚡) — cyan dim, máx 2 líneas ───────────────────
+        # ── Hints del agente (⚡) — cyan dim ─────────────────────────────────
         if hint_lines:
-            for line in hint_lines[:2]:
-                self._print(f"  [dim cyan]⎿  {_esc(line[:140])}[/dim cyan]")
+            for line in hint_lines:
+                self._print(f"  [dim cyan]│  {_esc(line)}[/dim cyan]")
 
         # ── Diff visual para write/edit en modo no-TUI (subagente o REPL) ────
         if allowed and self.is_subagent:
@@ -1508,33 +779,26 @@ class AgentLoop:
         Llamado antes de cada nuevo ● y al final del turno. En TUI mode con live block,
         hace flush del bloque dinámico al buffer estático con el summary final.
         """
-        _WRITE_NAMES = frozenset((
-            "write_file", "edit_file", "edit_files",
-            "regex_replace", "smart_replace", "bulk_replace", "patch_apply",
-        ))
-        _WRITE_SUFFIXES = ("_write_file", "_edit_file", "_edit_files",
-                           "_regex_replace", "_smart_replace", "_bulk_replace", "_patch_apply")
-
         if self.capture_output:
             self._turn_block = []
             self._turn_block_has_header = False
+            self._current_write_target = ""
             return
 
         # TUI con live block: cerrar el bloque dinámico con summary compacto
         if self._flush_live_block_cb:
             block = self._turn_block
             if getattr(self, "_turn_block_has_header", False):
-                block = [t for t in block
-                         if not (t[0] in _WRITE_NAMES or
-                                 any(t[0].endswith(s) for s in _WRITE_SUFFIXES))]
+                block = [t for t in block if not _is_modify_tool(t[0])]
             summary = _make_compact_summary(block) if block else ""
             if not summary and self._live_tool_count > 0:
                 n = self._live_tool_count
-                summary = f"Used {n} tool{'s' if n != 1 else ''}"
+                summary = f"Used {n} tool{'s' if n != 1 else ''} (ctrl+o to expand)"
             self._flush_live_block_cb(summary)
             self._live_tool_count = 0
             self._turn_block = []
             self._turn_block_has_header = False
+            self._current_write_target = ""
             return
 
         # REPL fallback: print ⎿ summary al buffer estático
@@ -1545,93 +809,25 @@ class AgentLoop:
 
         block = self._turn_block
         if getattr(self, "_turn_block_has_header", False):
-            block = [
-                t for t in block
-                if not (t[0] in _WRITE_NAMES or
-                        any(t[0].endswith(s) for s in _WRITE_SUFFIXES))
-            ]
+            block = [t for t in block if not _is_modify_tool(t[0])]
 
         if block:
             summary = _make_compact_summary(block)
-            self._print(f"  [dim]⎿  {summary}[/dim]")
+            self._print(f"  [dim]{summary}[/dim]")
 
         self._turn_block = []
         self._turn_block_has_header = False
+        self._current_write_target = ""
 
-    def _run_animated_header(self, name: str, args: dict) -> str:
-        """Ejecuta la tool con header animado verde→amarillo en modo REPL.
 
-        Mientras la tool ejecuta: cicla colores ANSI con \\r en la misma línea.
-        Al terminar: limpia la línea y muestra el header definitivo en blanco (◐).
-        En modo capture_output (subagentes) omite la animación.
-        """
-        import sys, os
-        from rich.markup import escape as _esc
-
-        if self.capture_output:
-            return self._execute_tool(name, args)
-
-        display     = self._TOOL_DISPLAY_NAMES.get(name, name)
-        ctx         = self._call_context(name, args)
-        is_mem_tool = name in self._MEM_TOOLS
-
-        # ctx contiene markup Rich escapado — obtener versión plana para ANSI raw
-        ctx_plain = ctx.replace("\\[", "[").replace("\\]", "]")
-
-        try:
-            _width = os.get_terminal_size().columns
-        except OSError:
-            _width = 100
-
-        _done_ev = threading.Event()
-
-        _is_prog_repl = name in (
-            "code_search", "grep_code", "grep_file", "multi_grep",
-            "symbol_lookup", "semantic_search",
-        )
-        if _is_prog_repl:
-            _tool_progress.set_progress_callback(
-                lambda _f, _s=self: setattr(_s, "_tool_current_file", _f)
-            )
-        self._tool_current_file = ""
-
-        def _anim_thread():
-            fi = 0
-            bold  = _ANSI_BOLD
-            reset = _ANSI_RESET
-            while not _done_ev.wait(timeout=0.12):
-                col    = _HEADER_ANIM_CODES[fi % len(_HEADER_ANIM_CODES)]
-                _cf    = self._tool_current_file
-                _sf    = ("  ⎿ " + _cf.rsplit("/", 1)[-1][:28]) if _cf else ""
-                line   = f"  {col}{bold}◐{reset} {bold}{display}{reset}{ctx_plain}{_sf}"
-                pad    = max(0, _width - len(line))
-                sys.stdout.write(f"\r{line}{' ' * pad}")
-                sys.stdout.flush()
-                fi += 1
-
-        _anim_t = threading.Thread(
-            target=_anim_thread, daemon=True, name=f"oocode-hdr-{name[:8]}"
-        )
-        _anim_t.start()
-
-        result = self._execute_tool(name, args)
-
-        _done_ev.set()
-        _anim_t.join(timeout=0.5)
-        if _is_prog_repl:
-            _tool_progress.set_progress_callback(None)
-        self._tool_current_file = ""
-
-        # Limpiar línea animada y mostrar header definitivo en blanco
-        sys.stdout.write(f"\r{' ' * _width}\r")
-        sys.stdout.flush()
-
-        if is_mem_tool:
-            self._print(f"  [bold white]◐[/bold white] [white]{_esc(display)}[/white][dim]{ctx}[/dim]")
-        else:
-            self._print(f"  [white]◐[/white] [bold white]{_esc(display)}[/bold white][dim]{ctx}[/dim]")
-
-        return result
+    def _extract_write_target(self, name: str, args: dict) -> str:
+        """Extrae la ruta del fichero destino de una write/replace tool."""
+        p = (args.get("path") or args.get("file_path") or
+             args.get("filepath") or args.get("output_path") or "")
+        if not p and "edits" in args and isinstance(args["edits"], list):
+            edits = args["edits"]
+            p = edits[0].get("path", "") if edits else ""
+        return str(p) if p else ""
 
     def _show_tool_running_header(self, name: str, args: dict) -> None:
         """Imprime el header de tool ANTES de ejecutarla.
@@ -1648,16 +844,78 @@ class AgentLoop:
         ctx     = self._call_context(name, args)
         is_mem_tool = name in self._MEM_TOOLS
 
+        _in_webui = getattr(self, "_webui_queue", None) is not None
+
+        # WebUI: plan_create se representa con el evento 'plan' — no emitir tool_start
+        if _in_webui and name == "plan_create":
+            return
+
+        # WebUI: emitir evento estructurado tool_start
+        if _in_webui:
+            ctx_plain = self._strip_rich(ctx).strip()
+            self._webui_emit({"type": "tool_start", "tool": display, "raw": name,
+                              "context": ctx_plain})
+
+        # Live block TUI: actualizar la línea |◐ con nombre de tool y preview de args
+        if getattr(self, "_update_live_tool_start_cb", None) and self._status_cb:
+            # Actualización atómica label+preview en una sola operación (evita double-flash)
+            self._update_live_tool_start_cb(f"{display}:", _make_tool_preview(name, args))
+            # ●: actualizar con verbo en gerundio + contexto breve
+            if getattr(self, "_update_live_bullet_cb", None):
+                _ctx_plain2 = self._strip_rich(ctx).strip()
+                _verb = _TOOL_LIVE_VERBS.get(name, "Using")
+                _ctx_brief = (_ctx_plain2[:45] if _ctx_plain2 else display).strip()
+                self._update_live_bullet_cb(
+                    f"{_verb} {_ctx_brief}…  (ctrl+o to expand)"
+                )
+        # spawn_subagent: header especial ● [emoji nombre]: tarea
+        if name == "spawn_subagent" and not self.is_subagent:
+            _sid   = args.get("agent_id", "")
+            _stask = args.get("task", "")
+            _tgt   = next((a for a in self.config.agents if a.id == _sid), None)
+            _semoji = _tgt.emoji if _tgt else "🤖"
+            _sname  = _tgt.name  if _tgt else _sid
+            if not _in_webui:
+                # TUI/REPL: mostrar cabecera inline; WebUI lo gestiona con subagent_start
+                self._print(
+                    f"\n  [bold green]●[/bold green] "
+                    f"[bold][{_esc(_semoji)} {_esc(_sname)}]:[/bold] [dim]{_esc(_stask)}[/dim]"
+                )
+            self._webui_emit({"type": "subagent_start",
+                              "agent_id": _sid, "agent_emoji": _semoji, "agent_name": _sname})
+            self._sub_lines_shown = 0   # resetear buffer para este subagente
+            return
+
+        # WebUI: tool_start event ya emitido arriba; _print() aquí contaminaría el chat
+        if _in_webui:
+            return
+
         if self._status_cb is not None and not self.is_subagent:
-            # TUI mode: sólo write/replace/mem muestran ◐ en la conversación.
+            # TUI puro (no WebUI): sólo write/replace/mem muestran ◐ en la conversación.
             # El resto se bufferiza en _turn_block para resumen agrupado al final.
-            _is_write = (name in ("write_file", "edit_file", "edit_files")
-                         or (name.startswith("mcp_") and any(
-                             name.endswith(s) for s in ("_write_file", "_edit_file", "_edit_files"))))
-            _is_replace = (name in ("regex_replace", "smart_replace", "bulk_replace", "patch_apply")
-                           or any(name.endswith(s) for s in
-                                  ("_regex_replace", "_smart_replace", "_bulk_replace", "_patch_apply")))
-            if _is_write or _is_replace:
+            _is_modify = _is_modify_tool(name)
+            if _is_modify:
+                # Auto-split: si el target es un fichero diferente al anterior, cerrar el bloque
+                # actual con ⎿ y abrir uno nuevo con ● "Updating <nuevo-fichero>".
+                _new_tgt = self._extract_write_target(name, args)
+                if (_new_tgt and getattr(self, "_current_write_target", "") and
+                        _new_tgt != self._current_write_target and
+                        (self._turn_block or
+                         getattr(self, "_turn_block_has_header", False) or
+                         self._live_tool_count > 0)):
+                    self._flush_turn_block()
+                    import os as _ost
+                    _bn = _ost.path.basename(_new_tgt)
+                    _switch_phrase = _pick_file_switch_phrase(_bn)
+                    if getattr(self, "_start_live_block_cb", None):
+                        self._start_live_block_cb(_switch_phrase)
+                        self._live_tool_count = 0
+                    else:
+                        self._print(
+                            f"\n  [bold green]●[/bold green] {_esc(_switch_phrase)}"
+                        )
+                if _new_tgt:
+                    self._current_write_target = _new_tgt
                 self._print(
                     f"  [bold green]◐[/bold green] [bold]{_esc(display)}[/bold][dim]{ctx}[/dim]"
                 )
@@ -1666,54 +924,20 @@ class AgentLoop:
                 self._print(
                     f"  [bold cyan]◐[/bold cyan] [bold cyan]{_esc(display)}[/bold cyan][dim]{ctx}[/dim]"
                 )
-            # Para todas las demás tools: sin ◐ en conversación — el status bar ya muestra el progreso
+            # Para todas las demás tools: sin ◐ en conversación — el status bar y el live block muestran el progreso
             return
 
-        if is_mem_tool:
+        # Subagentes en modo REPL: usar formato más compacto (sin negrita) para no saturar
+        if self.is_subagent:
+            if is_mem_tool:
+                self._print(f"  [cyan]◐[/cyan] [dim]{_esc(display)}{ctx}[/dim]")
+            else:
+                self._print(f"  [dim]◐  {_esc(display)}{ctx}[/dim]")
+        elif is_mem_tool:
             self._print(f"  [bold cyan]◐[/bold cyan] [bold cyan]{_esc(display)}[/bold cyan][dim]{ctx}[/dim]")
         else:
             self._print(f"  [bold green]◐[/bold green] [bold]{_esc(display)}[/bold][dim]{ctx}[/dim]")
 
-    def _show_usage(self, inp: int, out: int) -> None:
-        """Guarda la línea de uso en _pending_usage_line para mostrarla una sola vez antes del prompt."""
-        if self.capture_output or self.rt.usage_display == "off":
-            return
-        if self._status_cb is not None:
-            return  # En App mode las stats ya están en la fila de estado
-
-        ctx_stats  = self.context.stats()
-        ctx_tok    = ctx_stats["tokens_estimate"]
-        max_tok    = ctx_stats["max_tokens"]
-        ctx_pct    = int(ctx_tok / max(max_tok, 1) * 100)
-        thresh_pct = int(self.context.compact_threshold * 100)
-        bar        = _ctx_bar(ctx_tok, max_tok, 10)
-        elapsed    = f"  {self._last_elapsed:.1f}s" if self._last_elapsed > 0 else ""
-
-        if ctx_pct >= thresh_pct:
-            compact_hint = "  [bold yellow]⚠ compactando[/bold yellow]"
-        elif ctx_pct >= thresh_pct - 10:
-            compact_hint = "  [yellow]↻[/yellow] [bold #ff7700]cerca compactación[/bold #ff7700]"
-        else:
-            compact_hint = ""
-
-        if self.rt.usage_display == "tokens":
-            self._pending_usage_line = (
-                f"  [dim]↳ {_fmt_tokens(inp)}↑ {_fmt_tokens(out)}↓{elapsed}  │  "
-                f"ctx: {bar} {ctx_pct}%{compact_hint}[/dim]"
-            )
-        elif self.rt.usage_display == "full":
-            total = self.session.input_tokens + self.session.output_tokens
-            line1 = (
-                f"  [dim]↳ turno: {_fmt_tokens(inp)}↑ {_fmt_tokens(out)}↓  "
-                f"│  sesión: {_fmt_tokens(self.session.input_tokens)}↑"
-                f" {_fmt_tokens(self.session.output_tokens)}↓  "
-                f"│  total: {_fmt_tokens(total)}{elapsed}[/dim]"
-            )
-            line2 = (
-                f"  [dim]   ctx: {bar} {ctx_tok}/{max_tok} ({ctx_pct}%)"
-                f"{'  📝' if ctx_stats['has_summary'] else ''}{compact_hint}[/dim]"
-            )
-            self._pending_usage_line = f"{line1}\n{line2}"
 
     def _trace_header(self, messages: list) -> None:
         if self.capture_output or not self.rt.trace:
@@ -1725,9 +949,9 @@ class AgentLoop:
         )
         ctx = self.context.stats()
         self._print(
-            f"  [dim]trace: {len(messages)} msgs  |  "
-            f"system {sys_len} chars (~{sys_len // 4} tok)  |  "
-            f"ctx ~{ctx['tokens_estimate']} tok  |  "
+            f"  [dim]trace: {len(messages)} msgs  │  "
+            f"system {sys_len} chars (~{sys_len // 4} tok)  │  "
+            f"ctx ~{ctx['tokens_estimate']} tok  │  "
             f"modelo {self._active_model()}[/dim]"
         )
 
@@ -1750,21 +974,36 @@ class AgentLoop:
         return opts
 
     def _chat_kwargs(self, opts: dict) -> dict:
-        """Construye kwargs para client.chat().
-
-        Filtra claves que Ollama rechaza dentro de options:
-        - keep_alive: parámetro top-level de la API, no una option del runner.
-          Ollama mantiene el modelo cargado por defecto; no hace falta enviarlo.
-        """
+        """Construye kwargs para client.chat() a partir del dict ya filtrado de _build_options."""
         if not opts:
             return {}
-        opts = dict(opts)
-        opts.pop("keep_alive", None)
-        return {"options": opts} if opts else {}
+        return {"options": opts}
 
     # ── LLM call ─────────────────────────────────────────────────────────────
 
+    def _close_stream_connection(self) -> None:
+        """Cierra el httpx.Client interno de ollama para interrumpir cualquier
+        streaming en curso.  Marca el cliente para reconstrucción antes del
+        próximo request."""
+        try:
+            if hasattr(self.client, "_client"):
+                self.client._client.close()
+        except Exception as e:
+            log.debug("stream_close_error", error=str(e))
+        self._client_needs_rebuild = True
+
+    def _rebuild_client_if_needed(self) -> None:
+        """Reconstruye el ollama.Client si el anterior fue cerrado por kill."""
+        if not self._client_needs_rebuild:
+            return
+        try:
+            self.client = ollama.Client(host=self.config.ollama_host)
+            self._client_needs_rebuild = False  # solo en éxito: un fallo preserva el flag para reintentar
+        except Exception as e:
+            log.warning("client_rebuild_failed", host=self.config.ollama_host, error=str(e))
+
     def _stream_response(self, messages: list, tools: list) -> tuple[str, list, int, int]:
+        self._rebuild_client_if_needed()
         opts = self._build_options()
 
         # Subagentes y modo captura: stream=False, sin spinner (evita Live en TUI)
@@ -1785,6 +1024,7 @@ class AgentLoop:
                             resp = _fut.result(timeout=fb_timeout)
                         except _FutureTimeout:
                             self._last_elapsed = fb_timeout * 1.0
+                            self._close_stream_connection()  # aborta el thread del executor y marca rebuild
                             return _TIMEOUT_SENTINEL, [], 0, 0
                 else:
                     resp = self.client.chat(
@@ -1802,6 +1042,7 @@ class AgentLoop:
                     getattr(resp, "eval_count", 0) or 0,
                 )
             except Exception as e:
+                self._close_stream_connection()  # marca rebuild: la conexión puede haber quedado rota
                 return f"Error: {e}", [], 0, 0
 
         # Modo display (agente principal): streaming para tokens en tiempo real
@@ -1842,16 +1083,29 @@ class AgentLoop:
                 _inp_sh:       list = [0]
                 _out_sh:       list = [0]
                 _done_ev = threading.Event()
+                _kill_ev = threading.Event()   # señal para abortar stream_bg antes de tiempo
+
+                _think_chars_sh: list = [0]    # chars de thinking acumulados
+                _max_think_chars = (self.config.max_thinking_tokens * 4
+                                    if getattr(self.config, "max_thinking_tokens", 0) > 0
+                                    else 0)
 
                 def _stream_bg() -> None:
                     try:
                         for chunk in stream:
+                            if _kill_ev.is_set():
+                                break   # kill solicitado: dejar de emitir chunks
                             msg = chunk.message
                             if msg.thinking:
-                                _out_chars_sh[0] += len(msg.thinking)
+                                _think_chars_sh[0] += len(msg.thinking)
+                                if _max_think_chars > 0 and _think_chars_sh[0] > _max_think_chars:
+                                    _kill_ev.set()
+                                    break  # thinking excesivo: abortar y reintentar sin thinking
                             if msg.content:
                                 text_parts.append(msg.content)
                                 _out_chars_sh[0] += len(msg.content)
+                                # Streaming en tiempo real al WebUI (SSE stream_chunk)
+                                self._webui_emit({"type": "stream_chunk", "text": msg.content})
                             if msg.tool_calls:
                                 _tc_result[0] = list(msg.tool_calls)
                                 # Contar JSON de tool_calls para que ↓ no muestre siempre "…"
@@ -1863,8 +1117,8 @@ class AgentLoop:
                                         ))
                                         for tc in msg.tool_calls
                                     )
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    log.debug("tool_call_token_count_error", error=str(e))
                             if chunk.done:
                                 _inp_sh[0] = getattr(chunk, "prompt_eval_count", 0) or 0
                                 _out_sh[0] = getattr(chunk, "eval_count", 0) or 0
@@ -1879,19 +1133,19 @@ class AgentLoop:
 
                 threading.Thread(target=_stream_bg, daemon=True, name="oocode-stream").start()
 
-                fb_timeout   = self.config.model_timeout(self._active_model())
-                _timeout_hit = False
+                fb_timeout       = self.config.model_timeout(self._active_model())
+                _timeout_hit     = False
+                _last_alive_emit = t_start   # watchdog: última vez que emitimos "aún vivo"
+                _alive_interval  = 60.0      # emitir cada 60s si no hay output visible
 
                 # Spinner a 200ms — no tight loop
                 while not _done_ev.wait(timeout=_POLL_INTERVAL):
                     elapsed    = time.time() - t_start
                     frame      = _SPINNER_FRAMES[fi % len(_SPINNER_FRAMES)]
-                    think_circ = _SPINNER_FRAMES[fi % len(_SPINNER_FRAMES)]
                     ctx_s      = self.context.stats()
                     cpct       = int(ctx_s["tokens_estimate"] / max(ctx_s["max_tokens"], 1) * 100)
                     plain_bar  = _ctx_bar(ctx_s["tokens_estimate"], ctx_s["max_tokens"], 10, plain=True)
-                    thresh_pct = int(getattr(self.context, "compact_threshold", 0.85) * 100)
-                    hint       = _compact_hint(cpct, thresh_pct)
+                    thresh_pct = int(self.context.compact_threshold * 100)
                     approx_out = _out_chars_sh[0] // 4
                     out_str    = f"~{_fmt_tokens(approx_out)}" if approx_out > 0 else "…"
                     if self._turn_inp > 0:
@@ -1916,15 +1170,16 @@ class AgentLoop:
                             _active_task_txt = _pt["text"]
                             break
                     if _active_task_txt:
-                        _tlabel = _active_task_txt[:38].rstrip()
-                        if len(_active_task_txt) > 38:
-                            _tlabel += "…"
-                        # Modo multitarea: ◈ + progreso N/M + tarea activa + tiempo
+                        _tlabel = _active_task_txt.rstrip()
+                        # Modo multitarea: ◈ animado + "Multitarea:" coloreado + progreso + tarea
                         _tok_up = f"↑{_fmt_tokens(self._turn_inp)}" if self._turn_inp > 0 else ""
                         _tok_dn = f"↓~{_fmt_tokens(approx_out)}" if approx_out > 0 else ""
                         _tok_inline = "  ·  " + "  ".join(filter(None, [_tok_up, _tok_dn])) if (_tok_up or _tok_dn) else ""
                         _prog = f"[{_plan_done + 1}/{_plan_total}]" if _plan_total > 1 else ""
-                        line1 = f"{frame}  ◈ multitarea {_prog}  {_tlabel}  ({_time_str}{_tok_inline})"
+                        _mic_st = _MULTI_ICON_STYLES[(fi // 2) % len(_MULTI_ICON_STYLES)]
+                        _diamond = _sfmt(_mic_st, "◈")
+                        _multi_lbl = _sfmt("status-word", "Multitarea:")
+                        line1 = f"{frame}  {_diamond} {_multi_lbl} {_prog}  {_tlabel}  ({_time_str}{_tok_inline})"
                         line2 = ""  # task list se renderiza desde _plan_tasks en _get_status_text
                         self._sep_label = f"{frame} {_tlabel}"
                     else:
@@ -1949,9 +1204,27 @@ class AgentLoop:
                         _cbar = _sfmt(_bstyle, plain_bar)
                         _chint = _hint_styled(cpct, thresh_pct)
                         line2 = f"↳  {tok_part}ctx: {_cbar} {cpct}%{_chint}{mem_part}{rag_part}"
-                        self._sep_label = f"{think_circ} {_display_word}"
+                        self._sep_label = f"{frame} {_display_word}"
                     self._status_cb(f"{line1}\n{line2}")
                     fi += 1
+
+                    # Watchdog "aún vivo": avisar al WebUI cada 60s si no hay output
+                    # y enviar t/s si hay tokens generándose
+                    if elapsed - _last_alive_emit >= _alive_interval:
+                        _last_alive_emit = elapsed
+                        _tps = approx_out / max(elapsed, 1)
+                        if approx_out > 0:
+                            _alive_msg = f"Generando… ({_fmt_elapsed(elapsed)} · ~{_tps:.1f} t/s)"
+                        else:
+                            _alive_msg = f"Procesando… ({_fmt_elapsed(elapsed)})"
+                        self._webui_emit({"type": "preflight", "label": _alive_msg})
+
+                    # Kill solicitado: detener stream y salir inmediatamente
+                    if self._kill_requested:
+                        _kill_ev.set()              # señalizar _stream_bg
+                        self._close_stream_connection()  # cierra HTTP → desbloquea _stream_bg
+                        self._status_cb("")
+                        return "", [], 0, 0
 
                     # Timeout → señalizar para usar fallback
                     if fb_timeout > 0 and elapsed >= fb_timeout and _out_chars_sh[0] < _FALLBACK_MIN_CHARS:
@@ -1959,6 +1232,8 @@ class AgentLoop:
                         break
 
                 if _timeout_hit:
+                    _kill_ev.set()                   # detiene _stream_bg
+                    self._close_stream_connection()  # cierra HTTP y marca rebuild para el retry
                     self._last_elapsed = time.time() - t_start
                     self._status_cb("")
                     return _TIMEOUT_SENTINEL, [], 0, 0
@@ -1981,11 +1256,14 @@ class AgentLoop:
                     _err_r:       list = [None]
                     _inp_r:       list = [0]
                     _out_r:       list = [0]
-                    _done_r = threading.Event()
+                    _done_r  = threading.Event()
+                    _kill_r  = threading.Event()   # señal para abortar _stream_bg_repl
 
                     def _stream_bg_repl() -> None:
                         try:
                             for chunk in stream:
+                                if _kill_r.is_set():
+                                    break
                                 msg = chunk.message
                                 if msg.thinking:
                                     _out_chars_r[0] += len(msg.thinking)
@@ -2002,8 +1280,8 @@ class AgentLoop:
                                             ))
                                             for tc in msg.tool_calls
                                         )
-                                    except Exception:
-                                        pass
+                                    except Exception as e:
+                                        log.debug("tool_call_token_count_error", error=str(e))
                                 if chunk.done:
                                     _inp_r[0] = getattr(chunk, "prompt_eval_count", 0) or 0
                                     _out_r[0] = getattr(chunk, "eval_count", 0) or 0
@@ -2019,6 +1297,11 @@ class AgentLoop:
 
                     with Live(console=console, refresh_per_second=5, transient=True) as live:
                         while not _done_r.wait(timeout=_POLL_INTERVAL):
+                            # Kill solicitado: detener stream y salir
+                            if self._kill_requested:
+                                _kill_r.set()
+                                self._close_stream_connection()  # cierra HTTP → desbloquea _stream_bg_repl
+                                return "", [], 0, 0
                             elapsed = time.time() - t_start
                             frame   = _SPINNER_FRAMES[fi % len(_SPINNER_FRAMES)]
                             txt = Text()
@@ -2039,6 +1322,8 @@ class AgentLoop:
                                 break
 
                     if _timeout_hit_r:
+                        _kill_r.set()                    # detiene _stream_bg_repl
+                        self._close_stream_connection()  # cierra HTTP y marca rebuild para el retry
                         self._last_elapsed = time.time() - t_start
                         return _TIMEOUT_SENTINEL, [], 0, 0
                     if _err_r[0] is not None:
@@ -2048,9 +1333,12 @@ class AgentLoop:
                         inp_tokens = _inp_r[0]
                         out_tokens = _out_r[0]
                 else:
-                    # Sin fallback: comportamiento original
+                    # Sin fallback: comportamiento original + check kill por chunk
                     with Live(console=console, refresh_per_second=5, transient=True) as live:
                         for chunk in stream:
+                            if self._kill_requested:
+                                self._close_stream_connection()
+                                break
                             msg = chunk.message
                             if msg.content:
                                 text_parts.append(msg.content)
@@ -2144,17 +1432,48 @@ class AgentLoop:
                     log.warn("xml_eof_retry_failed", error=str(_retry_exc))
                     # Caer al mensaje de error original
 
-            # Intentar recuperar texto parcial generado antes del error
+            # Para errores XML no-EOF: retry simple antes de rendirse.
+            # "element <function> closed by </parameter>" es no-determinístico:
+            # el modelo a veces genera cierre erróneo; un retry suele producir XML válido.
             partial = "".join(text_parts)
+            if _is_xml and not _is_eof_truncation:
+                log.warn("xml_malformed_retry", model=self._active_model(),
+                         error=error_str[:120])
+                if not self.capture_output:
+                    console.print(
+                        "\n  [yellow]⚡[/yellow]  XML de tool call malformado "
+                        "(tag incorrecto) — reintentando…\n"
+                    )
+                try:
+                    resp2 = self.client.chat(
+                        model=self._active_model(),
+                        messages=messages,
+                        tools=tools,
+                        stream=False,
+                        **self._chat_kwargs(opts),
+                    )
+                    _rm2 = resp2.message
+                    return (
+                        _rm2.content or "",
+                        _rm2.tool_calls or [],
+                        getattr(resp2, "prompt_eval_count", 0) or 0,
+                        getattr(resp2, "eval_count", 0) or 0,
+                    )
+                except Exception as _rx2:
+                    log.warn("xml_malformed_retry_failed", error=str(_rx2)[:80])
+                    # Si el retry también falló pero tenemos texto parcial, devolverlo
+                    if partial:
+                        return partial, [], inp_tokens, out_tokens
+
+            # Fallback: devolver texto parcial si existe
             if partial and _is_xml:
                 log.warn("xml_tool_call_recovered", chars=len(partial),
                          model=self._active_model())
-                console.print(
-                    "\n  [yellow]⚠[/yellow]  El modelo intentó llamar a una herramienta "
-                    "en formato XML en vez de JSON — Ollama no pudo procesarlo. "
-                    "Respuesta parcial recuperada. Puedes repetir la pregunta si la "
-                    "respuesta está incompleta.\n"
-                )
+                if not self.capture_output:
+                    console.print(
+                        "\n  [yellow]⚠[/yellow]  El modelo generó tool calls en XML no válido "
+                        "y el retry falló. Respuesta parcial recuperada.\n"
+                    )
                 return partial, [], inp_tokens, out_tokens
 
             # Error de red/conexión real o XML malformado sin texto previo
@@ -2172,6 +1491,7 @@ class AgentLoop:
                     )
             else:
                 msg = f"Error conectando con Ollama: {error_str}"
+                self._close_stream_connection()  # error de red: marca rebuild para el siguiente intento
             return msg, [], 0, 0
 
         text = "".join(text_parts)
@@ -2208,11 +1528,11 @@ class AgentLoop:
             role = m.get("role", "")
             content = str(m.get("content") or "")
             if role == "user":
-                lines.append(f"Usuario: {content[:300]}")
+                lines.append(f"Usuario: {content}")
             elif role == "assistant":
-                lines.append(f"Asistente: {content[:300]}")
+                lines.append(f"Asistente: {content}")
             elif role == "tool":
-                lines.append(f"Tool({m.get('name', '')}): {content[:200]}")
+                lines.append(f"Tool({m.get('name', '')}): {content}")
         if not lines:
             return ""
 
@@ -2238,7 +1558,7 @@ class AgentLoop:
             )
 
         # Estado estructurado: ficheros modificados y tests para preservar en el resumen
-        _ckpt_modified = getattr(self, "_task_modified_files", set())
+        _ckpt_modified = {p for p, _, is_edit in getattr(self, "_session_reads", []) if is_edit and p}
         _ckpt_test = getattr(self, "_task_last_test", "")
         _state_section = ""
         if _ckpt_modified or _ckpt_test:
@@ -2260,6 +1580,46 @@ class AgentLoop:
             + _plan_section
             + _state_section
         )
+        # Bloque estructurado de estado — se inyecta siempre en el summary, sin depender
+        # del LLM para preservar los paths. Garantiza que tras compactación el agente
+        # conoce los ficheros activos y el directorio de proyecto.
+        _structured_lines: list[str] = []
+        _pdir = getattr(self.config, "project_dir", "") or ""
+        if _pdir:
+            _structured_lines.append(f"- Directorio de proyecto activo: {_pdir}")
+        # Paths de ficheros editados/escritos (rutas absolutas desde _task_modified_files)
+        _mod_paths = sorted(p for p in _ckpt_modified if p)
+        if _mod_paths:
+            _structured_lines.append(
+                "- Ficheros modificados (rutas absolutas): "
+                + ", ".join(_mod_paths[:10])
+            )
+        # Paths de ficheros leídos/editados esta sesión (desde _session_reads)
+        # Usamos orden de última aparición: pop+reinsertar para que ficheros
+        # re-accedidos queden al final del dict y aparezcan en [-10:].
+        _sreads = getattr(self, "_session_reads", [])
+        if _sreads:
+            _seen_sr: dict[str, bool] = {}
+            for _srpath, _, _sr_edit in _sreads:
+                if _srpath:
+                    _seen_sr.pop(_srpath, None)   # reubica al final si ya existía
+                    _seen_sr[_srpath] = _sr_edit
+            # Separar editados de solo-leídos y priorizar los editados
+            _edited_abs = [p for p, ed in _seen_sr.items() if ed and p.startswith("/")]
+            _read_only_abs = [p for p, ed in _seen_sr.items() if not ed and p.startswith("/")]
+            # Últimos 6 editados + últimos 4 solo-leídos (máx 10 en total)
+            _read_abs = _edited_abs[-6:] + _read_only_abs[-4:]
+            if _read_abs:
+                _structured_lines.append(
+                    "- Ficheros accedidos recientemente (rutas absolutas): "
+                    + ", ".join(_read_abs)
+                )
+        _structured_block = (
+            "\n**Estado estructurado al compactar (conservar en el resumen):**\n"
+            + "\n".join(_structured_lines)
+            + "\n"
+        ) if _structured_lines else ""
+
         try:
             opts = self._build_options()
             resp = self.client.chat(
@@ -2268,7 +1628,9 @@ class AgentLoop:
                 stream=False,
                 **self._chat_kwargs(opts),
             )
-            summary = resp.message.content or ""
+            llm_summary = resp.message.content or ""
+            # Combinar: bloque estructurado (siempre fiable) + resumen LLM (narrativo)
+            summary = (_structured_block + "\n" + llm_summary).strip() if llm_summary else _structured_block.strip()
             if summary:
                 # Escribe en memoria diaria como checkpoint
                 self.ws.write_daily_memory(
@@ -2276,269 +1638,30 @@ class AgentLoop:
                 )
             return summary
         except Exception:
-            return ""
+            # Sin LLM: al menos preservar el bloque estructurado
+            return _structured_block.strip()
 
-    def _show_compact_reset(self, dropped: int, freed_tok: int, has_summary: bool) -> None:
-        """Reset visual al estilo Claude Code tras compactación automática.
-
-        1. Limpia el área visible (sin borrar el scroll buffer del terminal).
-        2. Muestra el mini banner de OOCode (3 líneas).
-        3. Muestra el aviso «Conversación compactada».
-        4. Lista los ficheros leídos/editados durante la sesión compactada.
-        """
-        from ui.console import console as _con
-        from ui.renderer import print_compact_banner
-
-        # ── Paso 1: limpiar área visible ─────────────────────────────────────
-        if self._clear_output_cb is not None:
-            self._clear_output_cb()          # TUI: vacía _output_parts
-        else:
-            import sys as _sys
-            # ESC[H = cursor inicio · ESC[2J = borrar pantalla visible (scroll buffer intacto)
-            _sys.stdout.write("\033[H\033[2J")
-            _sys.stdout.flush()
-
-        # ── Paso 2: mini banner ───────────────────────────────────────────────
-        print_compact_banner(self.config)
-
-        # ── Paso 3: aviso de compactación ────────────────────────────────────
-        _con.print(
-            "  [bold]✻[/bold]  "
-            "[dim]Conversación compactada[/dim]"
-            "  [dim](ctrl+o para ver historial)[/dim]"
-        )
-        if has_summary:
-            _con.print("  [dim]  ↻ resumen LLM preservado en contexto[/dim]")
-        _con.print()
-
-        # ── Paso 4: referencias de ficheros y memorias ────────────────────────
-        ws = str(self.config.workspace or "")
-
-        if self._session_reads:
-            seen: dict[str, tuple] = {}
-            for path, n_lines, is_edit in self._session_reads:
-                seen[path] = (n_lines, is_edit)
-
-            for path, (n_lines, is_edit) in list(seen.items())[-15:]:
-                rel = path[len(ws):].lstrip("/") if (ws and path.startswith(ws)) else path
-                if is_edit:
-                    _con.print(f"  [dim]⎿  Updated {rel}[/dim]")
-                elif n_lines is not None:
-                    _con.print(f"  [dim]⎿  Read {rel} ({n_lines} líneas)[/dim]")
-                else:
-                    _con.print(f"  [dim]⎿  Referenciado {rel}[/dim]")
-
-        if self._session_mems:
-            seen_mems = list(dict.fromkeys(self._session_mems))  # deduplica preservando orden
-            for mname in seen_mems[-5:]:
-                _con.print(f"  [dim]⎿  Memory saved: {mname}[/dim]")
-
-        if self._session_reads or self._session_mems:
-            _con.print()
-
-        self._session_reads = []
-        self._session_mems  = []
-
-        # Mostrar tarea que se reanuda — el LLM puede tardar minutos antes de emitir texto
-        if getattr(self, "_plan_tasks", None) and not self._all_plan_tasks_done():
-            _ai_idx = next(
-                (i for i, t in enumerate(self._plan_tasks) if t["status"] == "active"), -1
-            )
-            _total  = len(self._plan_tasks)
-            _done_n = sum(1 for t in self._plan_tasks if t["status"] == "done")
-            if _ai_idx >= 0:
-                _task_txt = self._plan_tasks[_ai_idx]["text"][:70]
-                _con.print(
-                    f"  [dim yellow]↻[/dim yellow]  "
-                    f"[dim]Reanudando tarea {_ai_idx + 1}/{_total}"
-                    f" ({_done_n} completadas): \"{_task_txt}\"...[/dim]"
-                )
-            else:
-                _con.print(
-                    f"  [dim yellow]↻[/dim yellow]  "
-                    f"[dim]Reanudando plan ({_done_n}/{_total} completadas)...[/dim]"
-                )
-            _con.print()
 
     def _do_compact(self, with_summary: bool = True) -> int:
         """Compacta el contexto con barra de progreso. Devuelve msgs eliminados."""
+        # Garantiza cliente fresco antes de cualquier llamada LLM del resumen,
+        # independientemente del caller (turn loop, /compact, atajo de teclado).
+        self._rebuild_client_if_needed()
         dropped_count = self._do_compact_impl(with_summary)
         if dropped_count > 0 and getattr(self.config, "snapshots_save_on_compact", False):
             self._save_session_snapshot()
         return dropped_count
 
     def _do_compact_impl(self, with_summary: bool = True) -> int:
-        """Implementación real de compactación — llamada desde _do_compact."""
-        if self.capture_output:
-            summarize_fn = self._summarize_messages if with_summary else None
-            dropped = self.context.compact(summarize_fn=summarize_fn)
-            if dropped:
-                self.session.log_compaction(len(dropped))
-            return len(dropped)
+        """Implementación real de compactación — llamada desde _do_compact.
 
-        # Subagente dentro de la TUI: Rich Progress escribe \x1b[?25l al buffer
-        # y aparece como "25l" literal. Usar ruta simple sin widgets de progreso.
-        if self.is_subagent:
-            ctx     = self.context
-            n_msgs  = len(ctx.messages)
-            cur_tok = ctx.token_estimate()
-            self._print(
-                f"\n  [bold yellow]↻[/bold yellow]  "
-                f"[bold white]Compactando[/bold white]  "
-                f"[cyan]{n_msgs} msgs · ~{cur_tok:,} tok[/cyan]"
-            )
-            summarize_fn = self._summarize_messages if with_summary else None
-            dropped = ctx.compact(summarize_fn=summarize_fn)
-            if dropped:
-                self.session.log_compaction(len(dropped))
-                new_tok = ctx.token_estimate()
-                self._print(
-                    f"  [bold green]✓[/bold green]  "
-                    f"[green]{len(dropped)} msgs eliminados · ~{cur_tok - new_tok:,} tok liberados[/green]\n"
-                )
-            return len(dropped)
+        El _COMPACT_LOCK global asegura que solo un agente (principal o subagente)
+        compacta a la vez. Esto evita saturar el LLM con múltiples llamadas de
+        resumen simultáneas cuando varios subagentes necesitan compactar a la vez.
+        """
+        with _COMPACT_LOCK:
+            return self._do_compact_locked(with_summary)
 
-        # En modo TUI: barra de progreso en el status window (status_cb),
-        # cabecera y resultado van a la conversación.
-        if self._status_cb is not None:
-            from ui.console import console as _con
-
-            # Cerrar live block abierto antes de la animación de compactación
-            if self._flush_live_block_cb:
-                self._flush_live_block_cb("")
-            # Suprimir task panel durante compactación + señalizar a run() que espere
-            self._compacting_ctx = True
-            self._compact_running.set()
-            try:
-                ctx      = self.context
-                n_msgs   = len(ctx.messages)
-                cur_tok  = ctx.token_estimate()
-                max_tok  = ctx.max_tokens
-                cur_pct  = int(cur_tok / max(max_tok, 1) * 100)
-
-                # ── Cabecera + progreso en el status window (con colores) ──
-                _hdr = (
-                    _sfmt("compact-arrow", "↻") + "  "
-                    + _sfmt("compact-title", "Compactando") + "  "
-                    + _sfmt("compact-dim", f"{n_msgs} msgs · ~{cur_tok:,} tok · {cur_pct}%")
-                )
-                self._status_cb(
-                    f"{_hdr}\n"
-                    f"○  {_sfmt('compact-bar', _pbar_thin_ratio(0.0))}"
-                    f"   {_sfmt('compact-pct', '0%')}  "
-                    + _sfmt("compact-phrase", "analizando mensajes…")
-                )
-
-                # ── Fase 2 (opcional): resumen LLM con animación ─────────────
-                summarize_fn = None
-                if with_summary:
-                    def _cb_summarize(msgs: list[dict]) -> str:
-                        import threading as _th
-                        _result: list = [None]
-                        _done_ev = _th.Event()
-
-                        def _bg() -> None:
-                            _result[0] = self._summarize_messages(msgs)
-                            _done_ev.set()
-
-                        _th.Thread(target=_bg, daemon=True).start()
-
-                        step = 0
-                        _fi_cmp = 0
-                        while not _done_ev.wait(timeout=0.4):
-                            step    += 1
-                            _fi_cmp += 1
-                            ratio = 1.0 - 1.0 / (1 + step * 0.12)
-                            ratio = min(ratio, 0.95)
-                            pct   = int(ratio * 100)
-                            _frame_cmp = _SPINNER_FRAMES[_fi_cmp % len(_SPINNER_FRAMES)]
-                            self._status_cb(
-                                f"{_hdr}\n{_frame_cmp}  "
-                                + _sfmt("compact-bar", _pbar_thin_ratio(ratio))
-                                + f"  {_sfmt('compact-pct', f'{pct:3d}%')}  "
-                                + _sfmt("compact-phrase", f"resumiendo {len(msgs)} msgs…")
-                            )
-                        return _result[0] or ""
-
-                    summarize_fn = _cb_summarize
-
-                dropped = ctx.compact(summarize_fn=summarize_fn)
-                self._status_cb("")  # Limpia status
-
-                if dropped:
-                    self.session.log_compaction(len(dropped))
-                    new_tok = ctx.token_estimate()
-                    freed   = cur_tok - new_tok
-                    has_sum = bool(ctx.summary)
-                    self._show_compact_reset(len(dropped), freed, has_sum)
-                else:
-                    _con.print("  [dim]sin cambios — umbral no alcanzado[/dim]")
-                return len(dropped)
-            finally:
-                self._compacting_ctx = False
-                self._compact_running.clear()
-
-        from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn
-
-        ctx     = self.context
-        n_msgs  = len(ctx.messages)
-        cur_tok = ctx.token_estimate()
-        max_tok = ctx.max_tokens
-        cur_pct = int(cur_tok / max(max_tok, 1) * 100)
-        bar_pre = _ctx_bar(cur_tok, max_tok, 14)
-
-        self._print()
-        self._print(
-            f"  [bold yellow]↻[/bold yellow]  [bold white]Compactando[/bold white]  "
-            f"[cyan]{n_msgs} mensajes · ~{cur_tok:,} tok  {bar_pre}  [bold]{cur_pct}%[/bold][/cyan]"
-        )
-
-        dropped = []
-        n_phases = 3 if with_summary else 2
-
-        with Progress(
-            SpinnerColumn("dots"),
-            BarColumn(bar_width=18, complete_style="bold yellow", finished_style="bold green"),
-            TextColumn("  [bold cyan]{task.description}[/bold cyan]"),
-            console=console,
-            transient=True,
-        ) as progress:
-            ptask = progress.add_task("analizando mensajes…", total=n_phases)
-
-            summarize_fn = None
-            if with_summary:
-                def _wrap_summarize(msgs: list[dict]) -> str:
-                    progress.update(ptask, description=f"resumiendo {len(msgs)} msgs con LLM…")
-                    result = self._summarize_messages(msgs)
-                    progress.advance(ptask)
-                    return result
-                summarize_fn = _wrap_summarize  # type: ignore[assignment]
-
-            progress.update(ptask, description="eliminando mensajes…")
-            progress.advance(ptask)
-            dropped = ctx.compact(summarize_fn=summarize_fn)
-            progress.advance(ptask)
-            progress.update(ptask, description="completado ✓")
-
-        if dropped:
-            self.session.log_compaction(len(dropped))
-            new_tok  = ctx.token_estimate()
-            new_pct  = int(new_tok / max(max_tok, 1) * 100)
-            bar_post = _ctx_bar(new_tok, max_tok, 14)
-            freed    = cur_tok - new_tok
-            has_sum  = bool(ctx.summary)
-            self._print(
-                f"  [bold green]✓[/bold green]  [bold white]Compactado[/bold white]  "
-                f"[green]{len(dropped)} msgs eliminados · ~{freed:,} tok liberados[/green]"
-            )
-            self._print(
-                f"  [bold yellow]{bar_post}[/bold yellow]  [bold green]{new_pct}%[/bold green]"
-                f"{' [dim]· resumen guardado[/dim]' if has_sum else ''}"
-            )
-        else:
-            self._print("  [dim]El contexto no necesita compactación todavía.[/dim]")
-
-        return len(dropped)
 
     # ── Ejecución de tools con caché y deduplicación ─────────────────────────
 
@@ -2929,7 +2052,7 @@ class AgentLoop:
                 return self._bash_block("docker_exec", (
                     "⛔ AGENTE BLOQUEÓ bash — usa docker_exec en lugar de 'docker exec'.\n"
                     "  docker_exec(container='CONTAINER', command='CMD', user='root')\n"
-                    "  Ejemplo: docker_exec(container='sandra-wordpress', command='php -v')"
+                    "  Ejemplo: docker_exec(container='myapp-web', command='php -v')"
                 ))
 
             # docker compose ps/up/down/logs/restart/stop/build → compose_* tools
@@ -3068,7 +2191,7 @@ class AgentLoop:
             min_indent = min(ind for ind, _ in numbered)
             top = [t for ind, t in numbered if ind == min_indent]
             if len(top) >= 2:
-                return top[:12]
+                return top[:_MAX_PLAN_TASKS]
 
         # Prioridad 2: bullets solo al nivel mínimo de indentación
         min_bullet: int | None = None
@@ -3084,7 +2207,7 @@ class AgentLoop:
                     if indent == min_bullet:
                         bullets.append(task)
         if len(bullets) >= 2:
-            return bullets[:12]
+            return bullets[:_MAX_PLAN_TASKS]
         return []
 
     _COMPLETION_REPORT_RE = re.compile(
@@ -3123,23 +2246,6 @@ class AgentLoop:
 
     # ── Task plan tracker ────────────────────────────────────────────────────
 
-    def _set_plan_task_active(self, idx: int) -> None:
-        """Marca tareas < idx como done, idx como active, resto pending."""
-        now = time.time()
-        for i, task in enumerate(self._plan_tasks):
-            if i < idx:
-                if task["status"] != "done":
-                    task["status"] = "done"
-                    if not task["end_ts"]:
-                        task["end_ts"] = now
-            elif i == idx:
-                if task["status"] != "active":
-                    task["status"] = "active"
-                    if not task["start_ts"]:
-                        task["start_ts"] = now
-            else:
-                if task["status"] == "active":
-                    task["status"] = "pending"
 
     def _all_plan_tasks_done(self) -> bool:
         """True si hay plan y todas las tareas están completadas."""
@@ -3147,14 +2253,7 @@ class AgentLoop:
             t["status"] == "done" for t in self._plan_tasks
         )
 
-    def _mark_all_plan_tasks_done(self) -> None:
-        """Marca todas las tareas del plan como done (si no lo estaban ya)."""
-        now = time.time()
-        for t in self._plan_tasks:
-            if t["status"] != "done":
-                t["status"] = "done"
-                if not t["end_ts"]:
-                    t["end_ts"] = now
+
 
     # Señal de completado explícita — sin mínimo de longitud (puede ser frase corta)
     _DONE_SIGNAL_RE = re.compile(
@@ -3192,9 +2291,13 @@ class AgentLoop:
         Capa 1: señal de completado global ("todas las tareas") → marca todas done.
         Capa 2: detecta anuncio explícito "Tarea N:" / "Paso N:".
         Capa 3 (fallback): sincroniza con _auto_continue_count, solo avanza (nunca retrocede).
+        Imprime _print_plan_panel_update() cuando la tarea activa cambia.
         """
         if not self._plan_tasks:
             return
+        _prev_active = next(
+            (i for i, t in enumerate(self._plan_tasks) if t["status"] == "active"), -1
+        )
         # Capa 1: señal de completado global — SOLO si menciona "todas" / "all tasks"
         # NO usar _is_completion_report aquí: "he completado [un fichero]" no es completado global
         if self._DONE_SIGNAL_RE.search(text):
@@ -3230,7 +2333,8 @@ class AgentLoop:
                         if _t["status"] == "done":
                             _t["status"] = "active"
                             break
-            # Si es prematura, no marcar todas done — Capa 2/3 tomará el relevo
+            # El panel de plan se actualiza en la status window automáticamente;
+            # no imprimir bloque estático aquí (evita reprint por cada respuesta).
             return
         # Capa 2: anuncio de tarea específica
         _ANNOUNCE = re.compile(r'\b(?:tarea|paso|step|task)\s+(\d+)\s*[:\-]', re.I)
@@ -3240,10 +2344,17 @@ class AgentLoop:
             if 0 <= idx < len(self._plan_tasks):
                 self._set_plan_task_active(idx)
                 return
-        # Capa 3: sincronizar con iteración actual — solo avanza, nunca retrocede
-        # (evita resetear la tarea activa a 0 tras compactación cuando _auto_continue_count es 0)
+        # Capa 3: sincronizar con iteración actual — solo avanza, nunca retrocede.
+        # Si el plan ya está completo no tocamos nada (evita regresión cuando
+        # _auto_continue_count < índice de la última tarea y current_active cae a 0).
+        if self._all_plan_tasks_done():
+            return
         current_active = next(
-            (i for i, t in enumerate(self._plan_tasks) if t["status"] == "active"), 0
+            (i for i, t in enumerate(self._plan_tasks) if t["status"] == "active"),
+            # Si no hay activa, anclar al índice del último "done" para que nunca
+            # retroceda al 0 por defecto.
+            max((i for i, t in enumerate(self._plan_tasks) if t["status"] == "done"),
+                default=0),
         )
         target = min(self._auto_continue_count, len(self._plan_tasks) - 1)
         if target > current_active:
@@ -3285,22 +2396,14 @@ class AgentLoop:
             tasks_str = "\n".join(
                 f"  {i + 1}. {t}" for i, t in enumerate(self._pending_tasks)
             )
+            _review_note = (
+                " Si hay ambigüedad o riesgo alto, añade '⚠ REQUIERE REVISIÓN: [motivo]' "
+                "al final del plan para pausar y esperar confirmación."
+            ) if not self.is_subagent else ""
             hints.append(
-                f"\n⚡ PLAN OBLIGATORIO [{n} tarea{'s' if n != 1 else ''} en la solicitud]:\n"
+                f"\n[{n} tarea{'s' if n != 1 else ''} en la solicitud]:\n"
                 f"{tasks_str}\n"
-                f"PROTOCOLO — responde SOLO con texto detallado (sin llamar tools todavía):\n"
-                f"  0. ANALIZA: ¿tareas solapadas o dependientes entre sí? ¿alguna tarea implícita?\n"
-                f"  1. EMITE UN PLAN DETALLADO con este formato para cada acción:\n"
-                f"       N. [Acción]: [qué harás] — ficheros: [rutas exactas] — tools: [tools a usar]\n"
-                f"     Incluye: cambios concretos, por qué, si puede romper algo existente.\n"
-                f"  2. Si alguna acción tiene BLOQUEADORES (decisión de diseño no clara, dependencia\n"
-                f"     faltante, riesgo alto de romper funcionalidad), añade al final del plan:\n"
-                f"       ⚠ REQUIERE REVISIÓN: [descripción exacta del problema]\n"
-                f"     Esto PAUSA la ejecución hasta que el usuario responda o envíe /steer.\n"
-                f"  3. Sin '⚠ REQUIERE REVISIÓN', el sistema continúa automáticamente.\n"
-                f"     El usuario puede redirigir en cualquier momento con /steer o /subagents steer.\n"
-                f"  4. Durante la ejecución: anuncia cada tarea con 'Tarea N: descripción breve' "
-                f"antes de empezarla."
+                f"Aborda TODAS en orden.{_review_note}\n"
             )
             return "".join(hints)  # solo la guía de tareas — no hay historial aún
 
@@ -3347,7 +2450,7 @@ class AgentLoop:
         )
 
         # ── 1. Ratio bash alto en este turno (≥3 calls, >40% bash) ──────────
-        if total >= 3 and bash_n / total > 0.4:
+        if total >= 3 and bash_n / total > _BASH_OVERUSE_RATIO:
             hints.append(
                 f"\n⚡ EVALUACIÓN AGENTE [{bash_n}/{total} bash este turno]: "
                 "Estás sobreusando bash. TABLA RÁPIDA:\n"
@@ -3401,8 +2504,8 @@ class AgentLoop:
                     _path = json.loads(a_str).get("path", "")
                     if _path:
                         _read_paths[_path] = _read_paths.get(_path, 0) + 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("read_path_parse_error", error=str(e))
         _repeated = [(p, c) for p, c in _read_paths.items() if c >= 3]
         if _repeated:
             _rep_str = ", ".join(
@@ -3626,7 +2729,7 @@ class AgentLoop:
         # ── 16. Checkpoint de tarea — inyecta estado en auto-continúas ─────────
         # Solo se muestra a partir del 1.er auto-continue y cuando hay ficheros
         # modificados, para evitar redundancia en el primer turno.
-        _ckpt_modified = getattr(self, "_task_modified_files", set())
+        _ckpt_modified = {p for p, _, is_edit in getattr(self, "_session_reads", []) if is_edit and p}
         _ckpt_test = getattr(self, "_task_last_test", "")
         _ckpt_ac = getattr(self, "_auto_continue_count", 0)
         if _ckpt_ac > 0 and _ckpt_modified:
@@ -3661,14 +2764,15 @@ class AgentLoop:
             try:
                 hits = self.memory.search(content[:300], top_k=3)
                 n_recalled = len(hits)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("mem_search_error", error=str(e))
         r_word = "memory" if n_recalled == 1 else "memories"
 
         # Fase 2: Write
         self._tool_phase = (
             f"Recalled {n_recalled} {r_word}, writing 1 memory…"
         )
+        self._webui_emit({"type": "embed_flash", "op": "save"})
         self.memory.save(mem_name, content, description)
 
         # Fase 3: Done
@@ -3703,32 +2807,44 @@ class AgentLoop:
         self._plan_tasks[0]["status"] = "active"
         self._plan_tasks[0]["start_ts"] = time.time()
 
-        # Mostrar panel visual al usuario
+        # Panel visual: impresión inmediata en formato simple MD — una sola vez al crear el plan.
+        # No se repite tras compactación ni con cada cambio de tarea.
+        # En modo app (live block activo), se activa _set_plan_header_mode_cb para que el output
+        # vaya al header del live block y aparezca ENCIMA del ● en lugar de dentro del body.
+        # En WebUI, _print() no se llama — solo se emite el evento estructurado 'plan'.
         if not self.capture_output:
             from rich.markup import escape as _mesc
             _ic = _TASK_ICON_COLORS[int(time.time()) % len(_TASK_ICON_COLORS)]
             _n = len(tasks)
-            self._print(
-                f"\n  [{_ic}]◈[/{_ic}]  [bold]Plan de ejecución[/bold]  "
-                f"[dim]({_n} tarea{'s' if _n != 1 else ''})[/dim]"
-            )
-            if summary:
-                self._print(f"  [dim italic]{_mesc(summary[:120])}[/dim italic]")
-            for i, task in enumerate(tasks[:12], 1):
-                _short = (task[:80] + "…") if len(task) > 80 else task
-                _icon  = "◼" if i == 1 else "◻"
-                self._print(f"  [dim]  {_icon} {i}. {_mesc(_short)}[/dim]")
-            if len(tasks) > 12:
-                self._print(f"  [dim]  … +{len(tasks) - 12} más[/dim]")
-            self._print(
-                f"\n  [bold cyan]↻[/bold cyan]  "
-                f"[cyan]Ejecutando tarea 1/{_n}: {_mesc(tasks[0][:60])}…[/cyan]"
-            )
+            _hdr = summary[:100] if summary else f"{_n} tareas"
+            _in_webui_plan = getattr(self, "_webui_queue", None) is not None
+            if not _in_webui_plan:
+                _pmode = getattr(self, "_set_plan_header_mode_cb", None)
+                if _pmode:
+                    _pmode(True)
+                self._print(
+                    f"\n  [{_ic}]◈[/{_ic}]  [bold]Plan de ejecución:[/bold] "
+                    f"[dim]{_mesc(_hdr)}[/dim]"
+                )
+                for task in tasks[:_MAX_PLAN_TASKS]:
+                    _short = (task[:80] + "…") if len(task) > 80 else task
+                    self._print(f"  [dim]  - {_mesc(_short)}[/dim]")
+                if len(tasks) > _MAX_PLAN_TASKS:
+                    self._print(f"  [dim]  … +{len(tasks) - _MAX_PLAN_TASKS} más[/dim]")
+                self._print("")
+                if _pmode:
+                    _pmode(False)
+            else:
+                # WebUI: emitir evento estructurado (sin _print() para evitar duplicación)
+                self._webui_emit({"type": "plan", "tasks": tasks[:_MAX_PLAN_TASKS], "n": _n,
+                                  "summary": summary,
+                                  "extra": max(0, len(tasks) - _MAX_PLAN_TASKS)})
 
         first = tasks[0][:80]
         return (
             f"Plan creado: {len(tasks)} tareas. "
             f"Activa ahora [1/{len(tasks)}]: '{first}'. "
+            f"Emite ahora un nuevo mensaje anunciando 'Tarea 1: ...' y luego ejecuta sus herramientas. "
             f"Usa task_done() al completar cada tarea para avanzar."
         )
 
@@ -3756,8 +2872,9 @@ class AgentLoop:
             self._plan_tasks[active_idx]["start_ts"] = time.time()
 
         # Marcar como done
+        now_ts = time.time()
         self._plan_tasks[active_idx]["status"] = "done"
-        self._plan_tasks[active_idx]["end_ts"] = time.time()
+        self._plan_tasks[active_idx]["end_ts"] = now_ts
 
         done_count = sum(1 for t in self._plan_tasks if t["status"] == "done")
         total = len(self._plan_tasks)
@@ -3768,18 +2885,50 @@ class AgentLoop:
         )
         if next_idx >= 0:
             self._plan_tasks[next_idx]["status"] = "active"
-            self._plan_tasks[next_idx]["start_ts"] = time.time()
+            self._plan_tasks[next_idx]["start_ts"] = now_ts
             next_text = self._plan_tasks[next_idx]["text"][:80]
+            # Emitir progreso al WebUI y actualizar panel TUI
+            self._webui_emit({
+                "type":   "plan_progress",
+                "done":   done_count,
+                "total":  total,
+                "active": next_idx,
+                "active_text": self._plan_tasks[next_idx]["text"],
+                "tasks":  [{"text": t["text"], "status": t["status"]}
+                           for t in self._plan_tasks],
+            })
+            # 1. Flush ⎿ de tools de esta tarea (va al cuerpo del live block si está activo)
+            self._flush_task_intermediate_summary()
+            # 2. Cerrar live block actual para crear frontera visual de tarea.
+            #    _flush_live_block_cb("") es no-op si no había live block activo.
+            if not self.capture_output and self._flush_live_block_cb:
+                self._flush_live_block_cb("")
+            # 3. Panel ◈ Plan [N/total] al buffer estático (live block ya cerrado)
+            if not self.capture_output:
+                self._print_plan_panel_update()
+            # 4. Abrir nuevo live block con ● para la siguiente tarea,
+            #    creando el mismo efecto visual que Claude Code entre tareas.
+            if not self.capture_output and self._start_live_block_cb:
+                from rich.markup import escape as _td_esc
+                self._start_live_block_cb(_td_esc(next_text))
+                self._live_tool_count = 0
             return (
                 f"✔ Tarea {active_idx + 1}/{total} completada. "
                 f"Activa ahora [{done_count + 1}/{total}]: '{next_text}'. "
                 f"Continúa con ella directamente."
             )
 
-        # Todas completadas
+        # Todas completadas → marcar todas las activas/pending como done también
+        self._mark_all_plan_tasks_done()
+        # Flush ⎿ final y cerrar live block de la última tarea
+        self._flush_task_intermediate_summary()
+        if not self.capture_output and self._flush_live_block_cb:
+            self._flush_live_block_cb("")
+        if not self.capture_output:
+            self._print_plan_panel_update()
         return (
-            f"✔ Todas las {total} tareas completadas. "
-            f"Responde al usuario con un resumen conciso y di "
+            f"✔ Todas las {total} tareas completadas.\n"
+            f"⚠️ Responde al usuario con un resumen conciso y di "
             f"'He completado todas las tareas.' como primera frase."
         )
 
@@ -3858,7 +3007,7 @@ class AgentLoop:
         if name in self._CACHEABLE_TOOLS:
             cached = self._turn_read_cache.get(key_hash)
             if cached is not None:
-                return f"[caché] {cached}"
+                return cached
             result = self.registry.call(name, args)
             self._turn_read_cache[key_hash] = str(result)
             # Registrar fichero leído para el reset visual post-compactación
@@ -3870,10 +3019,16 @@ class AgentLoop:
                     self._session_reads.append((str(path), n_lines, False))
                     self._turn_read_paths.add(str(path))
             elif name in ("read_files", "read_project_file"):
-                # read_files: lista de paths
-                for _p in (args.get("paths") or []):
+                # read_files: lista de paths — también persistir en _session_reads
+                _paths_arg = args.get("paths") or []
+                if isinstance(_paths_arg, str):
+                    # si el modelo pasa "a.c,b.c" como string, separar individualmente
+                    _paths_arg = [p.strip() for p in _paths_arg.split(",") if p.strip()]
+                for _p in _paths_arg:
                     if _p:
                         self._turn_read_paths.add(str(_p))
+                        if not str(result).startswith("Error"):
+                            self._session_reads.append((str(_p), None, False))
             return result
 
         if name in self._WRITE_TOOLS:
@@ -3910,14 +3065,19 @@ class AgentLoop:
                 if _rag is not None:
                     try:
                         _rag.invalidate_file(path)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug("rag_invalidate_error", path=str(path), error=str(e))
                 # Invalidar caché del system prompt para que el próximo call use RAG fresco
                 self._sys_prompt_cache = None
                 self._turn_rag_snippet = None
             return result
 
-        return self.registry.call(name, args)
+        result = self.registry.call(name, args)
+        # Actualizar estadísticas del subagente activo (si estamos en modo subagente)
+        _sub = getattr(self, "_sub_stats_ref", None)
+        if _sub is not None:
+            _sub.n_tool_uses += 1
+        return result
 
     # ── Truncación de tool results largos ────────────────────────────────────
 
@@ -4127,8 +3287,8 @@ class AgentLoop:
         # los summaries de compactación de sesiones anteriores del mismo día.
         try:
             self.ws.mark_new_session()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("mark_new_session_error", error=str(e))
 
         # Resetear estado interno residual (evita que _system_prompt use msg stale)
         self._last_user_msg      = ""
@@ -4142,45 +3302,29 @@ class AgentLoop:
         if callable(getattr(self, '_on_new_session', None)):
             try:
                 self._on_new_session()  # type: ignore[attr-defined]
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("on_new_session_error", error=str(e))
 
     def restore_session(self, session_id: str) -> int:
         messages = self.session.load_messages(session_id)
         self.context.clear()
         for msg in messages:
             self.context.messages.append(msg)
+        self.context._invalidate_token_cache()
         return len(messages)
 
     # ── Turno principal ──────────────────────────────────────────────────────
 
-    def run(self, user_message: str,
-            images: Optional[list[str]] = None) -> Optional[str]:
-        """Ejecuta un turno del agente.
-
-        Args:
-            user_message: texto del usuario.
-            images: lista de rutas de imagen o strings base64 (solo si el modelo soporta visión).
-        """
-        if self.rt.activation == "mention" and not self.capture_output:
-            if not user_message.lower().startswith(self.config.agent_name.lower()):
-                return None
-
-        # Si una compactación manual está en curso (hilo F3), esperar antes de empezar
-        # el turno para evitar solapamiento con el contexto en modificación.
-        if self._compact_running.is_set():
-            self._compact_running.wait(timeout=30.0)
-
+    def _turn_reset_state(self, user_message: str, images: Optional[list[str]]) -> None:
+        """Inicializa el estado del turno: resets, MCP hot-reload, contexto, permisos, hooks."""
         self._last_user_msg    = user_message
-        self._turn_mem_snippet = None   # recalcular snippet para este turno
-        self._turn_rag_snippet = None   # recalcular RAG para este turno
-        self._sys_prompt_cache = None   # invalidar cache de system prompt (lee ficheros de disco)
-        self.memory.reset_turn_cache()  # 1 embed por turno, no por sesión
-        self.registry.clear_cache()     # caché intra-turno: fresca cada turno
-        self._task_modified_files = set()   # checkpoint: ficheros modificados en esta tarea
-        self._task_last_test = ""           # checkpoint: último resultado de tests
+        self._turn_mem_snippet = None
+        self._turn_rag_snippet = None
+        self._sys_prompt_cache = None
+        self.memory.reset_turn_cache()
+        self.registry.clear_cache()
+        self._task_last_test = ""
 
-        # Re-registrar tools de servidores MCP que hayan cambiado (notifications/tools/list_changed)
         _mcp_pool = getattr(self, "_mcp_pool", None)
         if _mcp_pool is not None:
             changed = _mcp_pool.pop_tools_changed()
@@ -4196,7 +3340,6 @@ class AgentLoop:
                             self.registry.register(_tname, _tfn, _tschema)
                         log.info("mcp_tools_updated", server=srv_name, count=len(client.tools))
 
-        # Mensaje con imágenes opcionales (solo si el modelo soporta visión)
         if images and self._model_supports_images():
             img_b64 = _load_images_b64(images)
             if img_b64:
@@ -4212,29 +3355,17 @@ class AgentLoop:
             self.session.log_message("user", user_message)
         self.chatlog.log_user(user_message)
         log.debug("user_message", chars=len(user_message))
-        # tools se calcula dentro del while para refrescar si el registry cambia
-        # (p.ej. si un servidor MCP actualiza su lista durante el turno)
-        _tools_cache: list[dict] | None = None
 
         # Actualizar permisos según elevated.
-        # "full"/"on"/"off" → resolve_mode() lo maneja; aplica a CUALQUIER tool.
-        # "ask"             → restaura _perms a los defaults salvo personalizaciones.
         if not self.capture_output and self.rt.elevated != self._last_elevated_applied:
             _def  = _DEFAULT_CONFIG["permissions"]
             _elev = self.rt.elevated
-            # Propagar nivel a PermissionManager (aplica a todas las tools vía resolve_mode)
             self.permissions.set_elevated(_elev)
-            # Solo "ask" necesita actualizar _perms: restaura defaults respetando
-            # cualquier personalización explícita del usuario (auto, deny, …).
-            # "on"/"full"/"off" los maneja resolve_mode() directamente sin tocar _perms,
-            # lo que evita sobreescribir permisos "deny" configurados por el usuario.
             if _elev == "ask":
                 for _tool in list(self.permissions._perms):
                     _bare    = self.permissions._bare_name(_tool)
                     _lookup  = _bare if _bare else _tool
                     _default = _def.get(_lookup, "ask")
-                    # Respetar cualquier personalización explícita del usuario:
-                    # si difiere del default (auto elevado, deny bloqueado…), no tocar.
                     user_perm = (self.config.permissions.get(_lookup)
                                  or self.config.permissions.get(_tool))
                     if user_perm is not None and user_perm != _default:
@@ -4242,169 +3373,1010 @@ class AgentLoop:
                     self.permissions._perms[_tool] = _default
             self._last_elevated_applied = _elev
 
-        full_output_parts: list[str] = []
-        self._last_tool_calls = []  # resetea al inicio de cada turno
-        self._pending_usage_line = ""  # resetea el usage pendiente
-        self._auto_continue_count = 0  # resetea contador de auto-continuaciones
-        self._turn_text_emitted = False  # ningún texto emitido al usuario aún
+        self._last_tool_calls = []
+        self._pending_usage_line = ""
+        self._auto_continue_count = 0
+        self._turn_text_emitted = False
+        self._sub_lines_shown  = 0
 
-        # Conectar hooks y diff renderer al canal TUI (_print) para visualización correcta.
-        # Siempre usamos self._print: funciona para TUI, REPL y subagentes (prefija │).
         import tools.hooks as _hooks_mod
         import tools.diff_renderer as _diff_mod
         _hooks_mod.set_hook_print_fn(self._print)
-        _diff_mod._dprint_fn = self._print
-        self._empty_search_streak = 0   # resetea detector de bucles vacíos
+        _diff_mod.set_dprint_fn(self._print)
+        self._empty_search_streak = 0
         self._empty_search_patterns = []
-        self._failed_edit_streak = 0    # resetea detector de ediciones fallidas
+        self._failed_edit_streak = 0
         self._failed_edit_patterns = []
-        self._turn_read_cache = {}      # resetea caché de reads
-        self._turn_write_seen = {}      # resetea registro de writes
-        self._turn_read_paths = set()   # resetea rutas leídas este turno
-        self._turn_written_scripts = set()  # resetea scripts escritos este turno
-        self._bash_block_counts = {}        # resetea contador de bloqueos bash
-        self._tool_phase = ""               # resetea fase de operación de memoria
-        self._tool_current_file = ""        # resetea fichero actual de búsqueda
-        _tool_progress.set_progress_callback(None)  # limpia callback de progreso
-        self._turn_block = []               # resetea buffer compacto TUI
-        self._turn_block_has_header = False  # resetea flag de header mostrado
+        self._turn_read_cache = {}
+        self._turn_write_seen = {}
+        self._turn_read_paths = set()
+        self._turn_written_scripts = set()
+        self._bash_block_counts = {}
+        self._tool_phase = ""
+        self._tool_current_file = ""
+        _tool_progress.set_progress_callback(None)
+        self._turn_block = []
+        self._turn_block_has_header = False
         self._turn_expanded = False
-        self._plan_tasks = []               # resetea task progress panel
+        self._current_write_target = ""
+        self._plan_tasks = []
 
-        # ── Detección pre-vuelo de tareas múltiples ───────────────────────────
-        # Detecta listas numeradas/bullets en el mensaje del usuario y muestra
-        # un indicador visual ANTES de enviar al modelo, y las inyecta en
-        # _turn_guidance() para que el modelo las aborde todas de una vez.
+    def _turn_start(self, user_message: str) -> tuple[list[str], float]:
+        """Detección preflight, display inicial, emisión de thinking. Devuelve (output_parts, t_start)."""
         self._pending_tasks = self._detect_tasks(user_message)
         if self._pending_tasks:
             _n_tasks = len(self._pending_tasks)
-            _s = "s" if _n_tasks != 1 else ""
-            # Inicializar task progress panel
             self._plan_tasks = [
                 {"text": t, "status": "pending", "start_ts": 0.0, "end_ts": 0.0}
                 for t in self._pending_tasks
             ]
             self._plan_tasks[0]["status"] = "active"
             self._plan_tasks[0]["start_ts"] = time.time()
-            if not self.capture_output:
+            if not self.capture_output and not self.is_subagent:
+                _uname       = getattr(self.ws, "user_name", "") if self.ws else ""
                 _phrase_tmpl = random.choice(_TASK_PREFLIGHT_PHRASES)
                 _phrase      = _phrase_tmpl.format(n=_n_tasks)
-                _icon_col    = _TASK_ICON_COLORS[int(time.time()) % len(_TASK_ICON_COLORS)]
-                self._print(
-                    f"\n  [{_icon_col}]⊡[/{_icon_col}]  [cyan]{_phrase}[/cyan]"
-                )
+                if _uname and random.random() < 0.35:
+                    _greet  = random.choice(_PREFLIGHT_USER_GREETINGS).format(user=_uname)
+                    _phrase = f"{_greet} {_phrase[0].lower()}{_phrase[1:]}"
+                _icon_col = _TASK_ICON_COLORS[int(time.time()) % len(_TASK_ICON_COLORS)]
+                if not getattr(self, "_webui_queue", None):
+                    self._print(
+                        f"\n  [{_icon_col}]●[/{_icon_col}]  [cyan]{_phrase}[/cyan]"
+                    )
+                self._webui_emit({"type": "preflight", "label": _phrase})
+        elif not self.capture_output and not self.is_subagent:
+            _uname  = getattr(self.ws, "user_name", "") if self.ws else ""
+            _pf     = _pick_preflight_phrase(user_message, _uname)
+            _pf_cols = ["cyan", "magenta", "yellow", "blue", "green"]
+            _pf_col  = _pf_cols[hash(user_message[:24]) % len(_pf_cols)]
+            if not getattr(self, "_webui_queue", None):
+                self._print(f"\n  [bold {_pf_col}]●[/bold {_pf_col}]  [dim]{_pf}[/dim]")
+            self._webui_emit({"type": "preflight", "label": _pf})
 
-        total_inp, total_out = 0, 0
-        self._turn_inp = 0
-        self._turn_out = 0
+        if not self.capture_output:
+            self._webui_emit(self._webui_status())
+            self._webui_emit({"type": "thinking"})
+
         t_run_start = time.time()
         self._task_start_time = t_run_start
         self._task_elapsed = 0.0
-        _had_tools_prev = False        # True cuando la iteración anterior ejecutó tools
-        _last_tool_call_count = 0      # número acumulado de tool calls de iteraciones previas
+        return [], t_run_start
 
-        while True:
-            # /kill local interrumpe entre iteraciones
-            if self._kill_requested:
-                self._kill_requested = False
-                if any(c >= 3 for c in self._bash_block_counts.values()):
-                    # Parada forzada por bloqueo bash repetido
-                    _cat = next(k for k, v in self._bash_block_counts.items() if v >= 3)
-                    self._print(
-                        f"\n  [bold red]⛔[/bold red]  Agente detenido — {self._bash_block_counts[_cat]} intentos "
-                        f"de usar bash para '{_cat}' (operación permanentemente bloqueada).\n"
-                        "  Usa la tool equivalente o escribe al usuario para pedir ayuda.\n"
-                        "  Tip: [dim]/elevated on[/dim] amplía permisos si realmente necesitas bash."
-                    )
-                else:
-                    self._print("\n  [yellow]↯[/yellow]  Turno interrumpido por /kill.")
+    def _turn_loop_guard(self) -> bool:
+        """Comprueba señales de kill/steer al inicio de cada iteración. Devuelve True si hay que romper."""
+        if self._kill_requested:
+            self._kill_requested = False
+            if any(c >= 3 for c in self._bash_block_counts.values()):
+                _cat = next(k for k, v in self._bash_block_counts.items() if v >= 3)
+                self._print(
+                    f"\n  [bold red]⛔[/bold red]  Agente detenido — {self._bash_block_counts[_cat]} intentos "
+                    f"de usar bash para '{_cat}' (operación permanentemente bloqueada).\n"
+                    "  Usa la tool equivalente o escribe al usuario para pedir ayuda.\n"
+                    "  Tip: [dim]/elevated on[/dim] amplía permisos si realmente necesitas bash."
+                )
+            else:
+                self._print("\n  [yellow]↯[/yellow]  Turno interrumpido por /kill.")
+            return True
+
+        if self._ext_kill is not None and self._ext_kill.is_set():
+            self._print("\n  [yellow]↯[/yellow]  Subagente detenido por el usuario.")
+            return True
+
+        if self._steer_queue is not None:
+            try:
+                import queue as _q
+                new_instr = self._steer_queue.get_nowait()
+                self._print(
+                    f"\n  [bold cyan]⟳  Steer:[/bold cyan]  [dim]{new_instr}[/dim]\n"
+                )
+                self.context.add("user", f"[STEER] {new_instr}")
+            except _q.Empty:
+                pass
+
+        return False
+
+    def _turn_iter_prepare(self) -> tuple[list, list]:
+        """Compacta contexto, emite avisos de contexto, refresca schemas y mensajes. Devuelve (messages, tools_cache)."""
+        # Reconstruir cliente antes de cualquier llamada LLM del turno (compactación incluida).
+        # Si el turno anterior cerró la conexión por error/timeout, _summarize_messages usaría
+        # un cliente cerrado desde el hilo _bg. _stream_response también llama este método,
+        # pero si hay compactación ocurre primero — el segundo check es siempre no-op.
+        self._rebuild_client_if_needed()
+        if self.context.should_compact():
+            self._do_compact(with_summary=True)
+
+        _think_active = getattr(self.rt, "think_level", "off") != "off"
+        if _think_active and not self.capture_output and not self.is_subagent:
+            _ctx_s = self.context.stats()
+            _ctx_pct = _ctx_s["tokens_estimate"] / max(_ctx_s["max_tokens"], 1)
+            if _ctx_pct > 0.65 and not getattr(self, "_webui_queue", None):
+                self._print(
+                    f"\n  [yellow]⚠[/yellow]  Contexto al "
+                    f"{int(_ctx_pct*100)}% con thinking ON — riesgo de truncamiento XML. "
+                    "Considera /think off o /compact.\n"
+                )
+
+        self._sep_label = ""
+        _tools_cache = self._filtered_schemas(self._last_user_msg)
+        messages = self.context.get_messages(system=self._system_prompt())
+        self._trace_header(messages)
+        return messages, _tools_cache
+
+    def _turn_llm_call(
+        self,
+        messages: list,
+        tools_cache: list,
+        total_inp: int,
+        total_out: int,
+    ) -> tuple[str, list, int, int]:
+        """Llama al LLM con retry automático y fallback por timeout. Devuelve (text, tool_calls, inp, out)."""
+        _retry_max   = self.config.ollama_retry_count
+        _retry_delay = self.config.ollama_retry_delay
+        for _retry_n in range(_retry_max + 1):
+            text, tool_calls, inp, out = self._stream_response(messages, tools_cache)
+            if text != _TIMEOUT_SENTINEL or _retry_n >= _retry_max:
                 break
+            _retry_wait = _retry_delay * (2 ** _retry_n)
+            if not getattr(self, "_webui_queue", None):
+                self._print(
+                    f"\n  [yellow]⟳[/yellow]  Timeout — reintentando "
+                    f"({_retry_n + 1}/{_retry_max}) en {_retry_wait:.0f}s…"
+                )
+            self._webui_emit({"type": "preflight",
+                              "label": f"Timeout — reintentando ({_retry_n+1}/{_retry_max})…"})
+            time.sleep(_retry_wait)
 
-            # Kill externo desde /subagents kill
-            if self._ext_kill is not None and self._ext_kill.is_set():
-                self._print("\n  [yellow]↯[/yellow]  Subagente detenido por el usuario.")
-                break
+        _sub_s = getattr(self, "_sub_stats_ref", None)
+        if _sub_s is not None and out > 0:
+            _sub_s.n_tokens_out += out
+            try:
+                _cs = self.context.stats()
+                _sub_s.ctx_pct = int(_cs["tokens_estimate"] / max(_cs["max_tokens"], 1) * 100)
+            except Exception as e:
+                log.debug("subagent_stats_error", error=str(e))
 
-            # Steer: nueva instrucción del usuario via /subagents steer
-            if self._steer_queue is not None:
+        if text == _TIMEOUT_SENTINEL:
+            _actual_timeout = self.config.model_timeout(self._active_model())
+            if self.config.fallback_active_config:
+                _fb_model = self.config.fallback_model
+                _to_secs  = _actual_timeout
+                self._print(
+                    f"\n  [bold yellow]⚡  Timeout ({_to_secs}s) — "
+                    f"usando fallback:[/bold yellow]  [cyan]{_fb_model}[/cyan]\n"
+                )
+                log.debug("fallback_trigger", timeout=_to_secs, fallback=_fb_model)
+                self._fallback_active = True
                 try:
-                    import queue as _q
-                    new_instr = self._steer_queue.get_nowait()
-                    self._print(
-                        f"\n  [bold cyan]⟳  Steer:[/bold cyan]  [dim]{new_instr}[/dim]\n"
-                    )
-                    # Prefijo [STEER] para que el modelo reconozca la instrucción
-                    # como una actualización de tarea y no como input del usuario final.
-                    self.context.add("user", f"[STEER] {new_instr}")
-                except _q.Empty:
-                    pass
-
-            # Detectar si la iteración anterior ejecutó tools (para suprimir ↻ espurio)
-            _new_count = len(self._last_tool_calls)
-            _had_tools_prev = _new_count > _last_tool_call_count
-            _last_tool_call_count = _new_count
-
-            # Actualizar el color del prefijo cada iteración del while
-            self._subagent_color_idx += 1
-
-            # Compactar si el contexto supera el umbral (antes de construir el prompt)
-            if self.context.should_compact():
-                self._do_compact(with_summary=True)
-
-            # Advertencia preventiva: thinking ON + contexto muy lleno = riesgo de
-            # truncamiento XML. Avisar al usuario antes de que falle.
-            _think_active = getattr(self.rt, "think_level", "off") != "off"
-            if _think_active and not self.capture_output and not self.is_subagent:
-                _ctx_s = self.context.stats()
-                _ctx_pct = _ctx_s["tokens_estimate"] / max(_ctx_s["max_tokens"], 1)
-                if _ctx_pct > 0.65:
-                    self._print(
-                        f"\n  [yellow]⚠[/yellow]  Contexto al "
-                        f"{int(_ctx_pct*100)}% con thinking ON — riesgo de truncamiento XML. "
-                        "Considera /think off o /compact.\n"
-                    )
-
-            # Durante llamada al LLM el separador muestra el proyecto
-            self._sep_label = ""
-
-            # Refrescar schemas de tools en cada iteración (captura cambios MCP en caliente)
-            _tools_cache = self._filtered_schemas(self._last_user_msg)
-            messages = self.context.get_messages(system=self._system_prompt())
-            self._trace_header(messages)
-            text, tool_calls, inp, out = self._stream_response(messages, _tools_cache)
-
-            # ── Fallback por timeout ────────────────────────────────────────────
-            if text == _TIMEOUT_SENTINEL:
-                _actual_timeout = self.config.model_timeout(self._active_model())
-                if self.config.fallback_active_config:
-                    _fb_model = self.config.fallback_model
-                    _to_secs  = _actual_timeout
-                    self._print(
-                        f"\n  [bold yellow]⚡  Timeout ({_to_secs}s) — "
-                        f"usando fallback:[/bold yellow]  [cyan]{_fb_model}[/cyan]\n"
-                    )
-                    log.debug("fallback_trigger", timeout=_to_secs, fallback=_fb_model)
-                    self._fallback_active = True
-                    try:
-                        text, tool_calls, inp, out = self._stream_response(messages, _tools_cache)
-                    finally:
-                        self._fallback_active = False
-                    if text == _TIMEOUT_SENTINEL:
-                        text = (
-                            f"Error: el modelo de fallback '{_fb_model}' también excedió "
-                            f"el tiempo de espera ({_to_secs}s). Comprueba la conexión con "
-                            "Ollama o aumenta `timeoutSeconds` en `models.configs` de oocode.json."
-                        )
-                        tool_calls = []
-                        inp = out = 0
-                else:
+                    text, tool_calls, inp, out = self._stream_response(messages, tools_cache)
+                finally:
+                    self._fallback_active = False
+                if text == _TIMEOUT_SENTINEL:
                     text = (
-                        f"Error: timeout esperando respuesta del modelo "
-                        f"({_actual_timeout}s). Configura un modelo de fallback "
-                        "en `fallback.model` de oocode.json para reintentar automáticamente."
+                        f"Error: el modelo de fallback '{_fb_model}' también excedió "
+                        f"el tiempo de espera ({_to_secs}s). Comprueba la conexión con "
+                        "Ollama o aumenta `timeoutSeconds` en `models.configs` de oocode.json."
                     )
                     tool_calls = []
                     inp = out = 0
+            else:
+                text = (
+                    f"Error: timeout esperando respuesta del modelo "
+                    f"({_actual_timeout}s). Configura un modelo de fallback "
+                    "en `fallback.model` de oocode.json para reintentar automáticamente."
+                )
+                tool_calls = []
+                inp = out = 0
+
+        return text, tool_calls, inp, out
+
+    def _turn_print_kill_stopped(self) -> None:
+        """Imprime el mensaje de stop tras kill post-LLM."""
+        if any(c >= 3 for c in self._bash_block_counts.values()):
+            _cat = next(k for k, v in self._bash_block_counts.items() if v >= 3)
+            self._print(
+                f"\n  [bold red]⛔[/bold red]  Agente detenido — {self._bash_block_counts[_cat]} intentos "
+                f"de usar bash para '{_cat}'.\n"
+            )
+        else:
+            self._print("\n  [yellow]↯[/yellow]  Turno interrumpido por /kill.")
+
+    def _turn_handle_empty(
+        self,
+        text: str,
+        tool_calls: list,
+        had_tools_prev: bool,
+    ) -> Optional[str]:
+        """Maneja respuesta vacía (sin texto ni tool_calls). Devuelve 'break', 'continue' o None."""
+        if text.strip() or tool_calls:
+            return None
+
+        _max_ac = self.config.auto_continue_max
+        _did_tools = bool(self._last_tool_calls)
+        if self._all_plan_tasks_done():
+            log.debug("auto_continue_skip_done", reason="all_plan_tasks_done")
+            self._flush_turn_block()
+            return "break"
+        if _did_tools and _max_ac > 0 and self._auto_continue_count < _max_ac:
+            _last_asst = next(
+                (m for m in reversed(self.context.messages)
+                 if m.get("role") == "assistant"),
+                None,
+            )
+            _last_asst_text = _last_asst.get("content", "") if _last_asst else ""
+            if self._is_completion_report(_last_asst_text):
+                _pending_ct = sum(
+                    1 for t in self._plan_tasks if t["status"] == "pending"
+                ) if self._plan_tasks else 0
+                if _pending_ct > 0:
+                    pass  # fall through → auto_continue
+                else:
+                    log.debug("auto_continue_skip_done",
+                              reason="completion_report_in_last_message")
+                    self._mark_all_plan_tasks_done()
+                    self._flush_turn_block()
+                    return "break"
+
+            self._auto_continue_count += 1
+            _n = self._auto_continue_count
+            if self._plan_tasks and not self._all_plan_tasks_done():
+                _tgt = min(_n, len(self._plan_tasks) - 1)
+                _prev_tgt = next(
+                    (i for i, t in enumerate(self._plan_tasks)
+                     if t["status"] == "active"), -1
+                )
+                if _tgt > _prev_tgt:
+                    self._set_plan_task_active(_tgt)
+            if not self.capture_output and not had_tools_prev and not getattr(self, "_webui_queue", None):
+                self._print(
+                    f"\n  [bold yellow]↻[/bold yellow]  [yellow]Auto-continúa ({_n}/{_max_ac})…[/yellow]"
+                )
+            self._webui_emit({"type": "thinking"})
+            log.debug("auto_continue", count=_n, max=_max_ac,
+                      model=self._active_model(),
+                      tools_done=len(self._last_tool_calls))
+            if self._plan_tasks:
+                _pac_i = next((i for i, t in enumerate(self._plan_tasks)
+                               if t["status"] == "active"), -1)
+                if _pac_i >= 0:
+                    _pac_t = self._plan_tasks[_pac_i]
+                    _pac_ni = _pac_i + 1
+                    _pac_msg = (f"Continúa con la tarea activa "
+                                f"({_pac_i + 1}/{len(self._plan_tasks)}): "
+                                f"{_pac_t['text']}.")
+                    if _pac_ni < len(self._plan_tasks):
+                        _pac_msg += f" Cuando termines, anuncia \"Tarea {_pac_ni + 1}:\"."
+                else:
+                    _pac_msg = "Continúa con la tarea."
+            else:
+                _pac_msg = "Continúa con la tarea."
+            self.context.add("user", _pac_msg)
+            return "continue"
+
+        if not self.capture_output:
+            self._print(
+                "\n  [dim yellow]⚠  El modelo no ha producido respuesta. "
+                "Si la tarea está incompleta, indícame qué falta.[/dim yellow]"
+            )
+        log.debug("empty_response", model=self._active_model(),
+                  inp=self._turn_inp, out=self._turn_out,
+                  iteration=len(self._last_tool_calls))
+        self._flush_turn_block()
+        return "break"
+
+    def _turn_display_bullet(self, text: str, tool_calls: list) -> None:
+        """Renderiza el ● con el texto del LLM y arranca el live block si hay tools."""
+        from rich.markup import escape as _mesc
+        import re as _re_bullet
+        _ac = COLOR_PRESETS.get(self.rt.accent_color, COLOR_PRESETS["cyan"])[1]
+        text_clean = text.lstrip()
+        lines   = text_clean.split('\n', 1)
+        first   = lines[0].rstrip()
+        rest    = lines[1] if len(lines) > 1 else ""
+        _s0 = first.lstrip()
+        _is_md_block = bool(_s0 and (
+            _s0[0] == '#' or
+            _s0.startswith('```') or _s0.startswith('~~~') or
+            _s0[0] in ('|', '>') or
+            (len(_s0) >= 2 and _s0[0] in ('-', '+', '!') and _s0[1] in (' ', '\t')) or
+            (len(_s0) >= 2 and _s0[0] == '*' and _s0[1] in (' ', '\t'))
+        ))
+        _plain_first = bool(first and not _is_md_block)
+        if _plain_first:
+            _first_clean = _re_bullet.sub(r'\*{1,3}([^*\n]+)\*{1,3}', r'\1', first).strip()
+            if _first_clean:
+                first = _first_clean
+
+        if self._start_live_block_cb and tool_calls:
+            # ── Multi-párrafo: primer(os) párrafos → ● estático, último → ● live block ──
+            # Cuando el LLM manda varias frases separadas por línea en blanco antes de
+            # ejecutar tools, cada bloque de párrafos merece su propio ●.
+            # El live block usa el ÚLTIMO párrafo para que el ⎿ quede debajo del contexto
+            # inmediato (en vez de bajo la frase introductoria lejana).
+            _mp_paras = [_p for _p in text_clean.split('\n\n') if _p.strip()]
+            if len(_mp_paras) > 1:
+                # Primer párrafo → ● estático (antes de activar el live block)
+                _mp0 = _mp_paras[0]
+                _mp0_sp = _mp0.split('\n', 1)
+                _mp0_f  = _re_bullet.sub(r'\*{1,3}([^*\n]+)\*{1,3}', r'\1',
+                                         _mp0_sp[0]).strip() or _mp0_sp[0].rstrip()
+                _mp0_r  = _mp0_sp[1] if len(_mp0_sp) > 1 else ""
+                console.print()
+                console.print(f"  [bold {_ac}]●[/bold {_ac}] {_mesc(_mp0_f)}")
+                if _mp0_r.strip():
+                    console.print(Padding(Markdown(_mp0_r.lstrip('\n')), (0, 0, 0, 2)))
+                # Párrafos intermedios → Markdown estático sin ●
+                for _mp_mid in _mp_paras[1:-1]:
+                    console.print()
+                    console.print(Padding(Markdown(_mp_mid.strip()), (0, 0, 0, 2)))
+                # Último párrafo → ● del live block
+                _mp_last = _mp_paras[-1]
+                _mp_last_sp = _mp_last.split('\n', 1)
+                _mp_last_f  = _re_bullet.sub(r'\*{1,3}([^*\n]+)\*{1,3}', r'\1',
+                                             _mp_last_sp[0]).strip() or _mp_last_sp[0].rstrip()
+                _mp_last_r  = _mp_last_sp[1] if len(_mp_last_sp) > 1 else ""
+                self._start_live_block_cb(_mesc(_mp_last_f or "…"))
+                self._live_tool_count = 0
+                if _mp_last_r.strip():
+                    # El resto va a _live_block_body → se preserva para el flush
+                    console.print(Padding(Markdown(_mp_last_r.lstrip('\n')), (0, 0, 0, 2)))
+                return  # el bloque else al final no se ejecuta
+            if _plain_first:
+                try:
+                    _cols = os.get_terminal_size().columns
+                except OSError:
+                    _cols = 120
+                _max_hdr = max(60, _cols - 4)
+                if len(first) <= _max_hdr:
+                    _hdr        = first
+                    _body_extra = ""
+                else:
+                    _cut = first.rfind(' ', 0, _max_hdr)
+                    if _cut > _max_hdr // 2:
+                        _hdr        = first[:_cut] + "…"
+                        _body_extra = first[_cut + 1:]
+                    else:
+                        _hdr        = first[:_max_hdr - 1] + "…"
+                        _body_extra = first[_max_hdr - 1:]
+                _bullet_text = _mesc(_hdr)
+            else:
+                _bullet_text = "…"
+                _body_extra  = ""
+
+            # ── Auto-split: planning text largo + write tools sin mención de fichero ──
+            _write_tool_names = frozenset((
+                "write_file", "edit_file", "edit_files",
+                "regex_replace", "smart_replace", "bulk_replace", "patch_apply",
+            ))
+            _write_sfxs = ("_edit_file", "_edit_files", "_write_file",
+                           "_smart_replace", "_regex_replace", "_bulk_replace",
+                           "_patch_apply")
+            _write_files_auto: list[str] = []
+            for _wtc in tool_calls:
+                try:
+                    _wfn = getattr(getattr(_wtc, "function", None), "name", "") or ""
+                    _wfn = _TOOL_ALIASES.get(_wfn, _wfn)
+                    _wfa = getattr(getattr(_wtc, "function", None), "arguments", {}) or {}
+                    if isinstance(_wfa, str):
+                        try:
+                            _wfa = json.loads(_wfa)
+                        except Exception:
+                            _wfa = {}
+                    if _wfn in _write_tool_names or any(_wfn.endswith(s) for s in _write_sfxs):
+                        if _wfn in ("edit_files",) or _wfn.endswith("_edit_files"):
+                            for _we in (_wfa.get("edits") or []):
+                                _wp = (_we.get("path", "") if isinstance(_we, dict) else "")
+                                if _wp:
+                                    _wb = _wp.rsplit("/", 1)[-1]
+                                    if _wb and _wb not in _write_files_auto:
+                                        _write_files_auto.append(_wb)
+                        else:
+                            _wp = _wfa.get("path", "")
+                            if _wp:
+                                _wb = _wp.rsplit("/", 1)[-1]
+                                if _wb and _wb not in _write_files_auto:
+                                    _write_files_auto.append(_wb)
+                except Exception as e:
+                    log.debug("bullet_args_parse_error", error=str(e))
+            _first_lower = first.lower()
+            _files_mentioned = any(_f.lower() in _first_lower for _f in _write_files_auto)
+            _should_split = (
+                _plain_first and _write_files_auto
+                and len(first) > 60
+                and not _files_mentioned
+            )
+            if _should_split:
+                console.print()
+                console.print(f"  [bold {_ac}]●[/bold {_ac}] {_mesc(first)}")
+                if rest.strip():
+                    console.print(Padding(Markdown(rest.lstrip('\n')), (0, 0, 0, 2)))
+                if len(_write_files_auto) == 1:
+                    _wh = f"Updating {_write_files_auto[0]}:"
+                elif len(_write_files_auto) == 2:
+                    _wh = f"Updating {_write_files_auto[0]}, {_write_files_auto[1]}:"
+                else:
+                    _wh = f"Updating {_write_files_auto[0]} (+{len(_write_files_auto)-1} more):"
+                self._start_live_block_cb(_wh)
+                self._live_tool_count = 0
+            else:
+                self._start_live_block_cb(_bullet_text)
+                self._live_tool_count = 0
+                _body = (_body_extra + "\n" + rest).lstrip('\n') if _body_extra else rest
+                if _plain_first and _body.strip():
+                    console.print(Padding(Markdown(_body.lstrip('\n')), (0, 0, 0, 2)))
+                elif not _plain_first:
+                    console.print(Padding(Markdown(text_clean), (0, 0, 0, 2)))
+        else:
+            # REPL o respuesta sin tools: ● estático normal
+            console.print()
+            if _plain_first:
+                console.print(f"[bold {_ac}]●[/bold {_ac}] {_mesc(first)}")
+                if rest.strip():
+                    console.print(Padding(Markdown(rest.lstrip('\n')), (0, 0, 0, 2)))
+            else:
+                console.print(f"[bold {_ac}]●[/bold {_ac}]")
+                console.print(Padding(Markdown(text_clean), (0, 0, 0, 2)))
+
+    def _turn_no_tools(self, text: str) -> str:
+        """Decide si auto-continuar o parar cuando el LLM no generó tool_calls. Devuelve 'break' o 'continue'."""
+        if self._all_plan_tasks_done():
+            log.debug("auto_continue_skip_done", reason="all_plan_tasks_done_no_tools")
+            self._flush_turn_block()
+            return "break"
+
+        _max_ac = self.config.auto_continue_max
+        _requires_review = (
+            text and (
+                "⚠ REQUIERE REVISIÓN" in text
+                or "REQUIERE REVISIÓN" in text
+                or "requiere revisión" in text.lower()
+            )
+        )
+        if _requires_review and not self.capture_output:
+            from rich.markup import escape as _mesc
+            self._print(
+                "\n  [bold yellow]⚠[/bold yellow]  [yellow]El agente ha marcado "
+                "este plan como pendiente de revisión.[/yellow]"
+            )
+            self._print(
+                "  [dim]Responde con tus indicaciones o envía [bold]/steer[/bold] "
+                "para redirigir antes de continuar.[/dim]"
+            )
+            self._flush_turn_block()
+            return "break"
+
+        if (text
+                and not self._last_tool_calls
+                and _max_ac > 0
+                and self._auto_continue_count < _max_ac
+                and not self.capture_output):
+            _plan_steps = self._detect_tasks(text)
+            if _plan_steps and len(_plan_steps) >= 2 and not self._is_completion_report(text):
+                self._auto_continue_count += 1
+                _n_ac = self._auto_continue_count
+                log.debug("auto_continue_plan",
+                          steps=len(_plan_steps), count=_n_ac, max=_max_ac)
+                if _n_ac == 1:
+                    from rich.markup import escape as _mesc
+                    _icon_c = _TASK_ICON_COLORS[int(time.time()) % len(_TASK_ICON_COLORS)]
+                    if not getattr(self, "_webui_queue", None):
+                        self._print(
+                            f"\n  [{_icon_c}]◈[/{_icon_c}]  "
+                            f"[bold]Plan de ejecución[/bold]  "
+                            f"[dim]({len(_plan_steps)} pasos)[/dim]"
+                        )
+                        for _si, _step in enumerate(_plan_steps[:10], 1):
+                            _step_short = (_step[:78] + "…") if len(_step) > 78 else _step
+                            self._print(
+                                f"  [dim]  {_si}.[/dim]  [dim]{_mesc(_step_short)}[/dim]"
+                            )
+                        self._print(
+                            f"\n  [bold yellow]↻[/bold yellow]  [yellow]Ejecutando plan…[/yellow]"
+                        )
+                    else:
+                        self._webui_emit({"type": "plan",
+                                          "tasks": _plan_steps[:_MAX_PLAN_TASKS],
+                                          "n": len(_plan_steps), "summary": "",
+                                          "extra": max(0, len(_plan_steps) - _MAX_PLAN_TASKS)})
+                elif not getattr(self, "_webui_queue", None):
+                    self._print(
+                        f"\n  [bold yellow]↻[/bold yellow]  [yellow]Continuando "
+                        f"({_n_ac}/{_max_ac})…[/yellow]"
+                    )
+                if _plan_steps and _n_ac == 1:
+                    self._plan_tasks = [
+                        {"text": t, "status": "pending", "start_ts": 0.0, "end_ts": 0.0}
+                        for t in _plan_steps
+                    ]
+                    self._plan_tasks[0]["status"] = "active"
+                    self._plan_tasks[0]["start_ts"] = time.time()
+                if self._plan_tasks:
+                    _pp_i = next((i for i, t in enumerate(self._plan_tasks)
+                                  if t["status"] == "active"), 0)
+                    _pp_t = self._plan_tasks[_pp_i]
+                    _pp_msg = (f"Continúa ejecutando el plan. "
+                               f"Tarea activa ({_pp_i + 1}/{len(self._plan_tasks)}): "
+                               f"\"{_pp_t['text']}\".")
+                    if _pp_i + 1 < len(self._plan_tasks):
+                        _pp_msg += f" Anuncia \"Tarea {_pp_i + 2}:\" al avanzar."
+                else:
+                    _pp_msg = ("Continúa ejecutando el plan que acabas de anunciar, "
+                               "paso a paso, usando las tools necesarias.")
+                self.context.add("user", _pp_msg)
+                self._webui_emit({"type": "thinking"})
+                return "continue"
+
+        if (self._plan_tasks and not self._all_plan_tasks_done()
+                and _max_ac > 0 and self._auto_continue_count < _max_ac
+                and not self.capture_output):
+            _resume_idx = next(
+                (i for i, t in enumerate(self._plan_tasks)
+                 if t["status"] in ("active", "pending")),
+                -1,
+            )
+            if _resume_idx >= 0:
+                if text and self._is_completion_report(text):
+                    self._mark_all_plan_tasks_done()
+                    self._flush_turn_block()
+                    return "break"
+                self._set_plan_task_active(_resume_idx)
+                self._auto_continue_count += 1
+                _n = self._auto_continue_count
+                _rt = self._plan_tasks[_resume_idx]
+                _rn = _resume_idx + 1
+                _resume_msg = (
+                    f"La tarea {_rn}/{len(self._plan_tasks)} "
+                    f"\"{_rt['text'][:80]}\" aún no está completada. "
+                    f"Continúa ejecutando con las tools necesarias. "
+                    f"NO digas \"He completado todas las tareas\" hasta haber "
+                    f"ejecutado todas las acciones requeridas con tools."
+                )
+                if not getattr(self, "_webui_queue", None):
+                    self._print(
+                        f"\n  [bold yellow]↻[/bold yellow]  "
+                        f"[yellow]Tarea {_rn} pendiente — retomando "
+                        f"({_n}/{_max_ac})…[/yellow]"
+                    )
+                log.debug("auto_continue_pending_task",
+                          task_idx=_resume_idx, count=_n, max=_max_ac)
+                self.context.add("user", _resume_msg)
+                return "continue"
+
+        return "break"
+
+    def _turn_dispatch_tools(
+        self,
+        tool_calls: list,
+        total_inp: int,
+        total_out: int,
+    ) -> tuple[list, dict, dict, set, bool]:
+        """Parsea, verifica permisos y ejecuta tool calls. Devuelve (parsed_calls, allowed_map, results_map, pre_shown_idxs, safe_parallel)."""
+        parsed_calls: list[tuple] = []
+        for tc in tool_calls:
+            name = tc.function.name
+            name = _TOOL_ALIASES.get(name, name)
+            args = tc.function.arguments
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+            parsed_calls.append((tc, name, args))
+
+        _block_mode = len(parsed_calls) > 1
+        allowed_map: dict[int, bool] = {}
+        for idx, (_tc, name, args) in enumerate(parsed_calls):
+            description = f"{name}({json.dumps(args, ensure_ascii=False)[:80]})"
+            allowed_map[idx] = self.permissions.check(name, description)
+
+        _safe_parallel = (
+            len(parsed_calls) > 1
+            and not any(n == "bash" for _, n, _ in parsed_calls)
+            and not self.capture_output
+        )
+
+        results_map: dict[int, str] = {}
+        _pre_shown_idxs: set[int] = set()
+
+        if _safe_parallel:
+            names_label = " + ".join(n for _, n, _ in parsed_calls)
+            self._sep_label = f"⚙ {names_label}…"
+
+            if getattr(self, "_update_live_bullet_cb", None):
+                _SEARCH_N = frozenset(("grep_code", "grep_file", "multi_grep",
+                                       "code_search", "symbol_lookup"))
+                _READ_N   = frozenset(("read_file", "read_files", "read_sections", "ls_dir"))
+                _FIND_N   = frozenset(("find_file", "find_files", "find_dir", "file_stat"))
+                _pn_list  = [n for _, n, _ in parsed_calls]
+                _ns = sum(1 for n in _pn_list if n in _SEARCH_N)
+                _nr = sum(1 for n in _pn_list if n in _READ_N)
+                _nf = sum(1 for n in _pn_list if n in _FIND_N)
+                _no = len(_pn_list) - _ns - _nr - _nf
+                _pp = []
+                if _ns: _pp.append(f"Searching for {_ns} pattern{'s' if _ns != 1 else ''}")
+                if _nr: _pp.append(f"reading {_nr} file{'s' if _nr != 1 else ''}")
+                if _nf: _pp.append(f"finding {_nf} path{'s' if _nf != 1 else ''}")
+                if _no: _pp.append(f"running {_no} tool{'s' if _no != 1 else ''}")
+                if _pp:
+                    self._update_live_bullet_cb(", ".join(_pp) + " (ctrl+o to expand)")
+
+            if getattr(self, "_webui_queue", None) is not None:
+                for _pidx, (_, _pn, _pa) in enumerate(parsed_calls):
+                    if allowed_map[_pidx]:
+                        _pd = self._TOOL_DISPLAY_NAMES.get(_pn, _pn)
+                        _pc = self._strip_rich(self._call_context(_pn, _pa)).strip()
+                        self._webui_emit({"type": "tool_start", "tool": _pd,
+                                          "raw": _pn, "context": _pc})
+
+            _pool_done  = threading.Event()
+            _pool_start = time.time()
+
+            def _parallel_spinner() -> None:
+                fi2 = 0
+                while not _pool_done.wait(timeout=_POLL_INTERVAL):
+                    if self._status_cb:
+                        elapsed2   = time.time() - _pool_start
+                        frame2     = _SPINNER_FRAMES[fi2 % len(_SPINNER_FRAMES)]
+                        ctx_s2     = self.context.stats()
+                        cpct2      = int(ctx_s2["tokens_estimate"] / max(ctx_s2["max_tokens"], 1) * 100)
+                        pbar2      = _ctx_bar(ctx_s2["tokens_estimate"], ctx_s2["max_tokens"], 10, plain=True)
+                        tok_p2     = (f"{_fmt_tokens(total_inp)}↑ {_fmt_tokens(total_out)}↓  ·  "
+                                      if (total_inp or total_out) else "")
+                        _t2p = _fmt_elapsed(elapsed2)
+                        if elapsed2 > 25:
+                            _ph2p = _NEAR_FINISH_PHRASES[(fi2 // 5) % len(_NEAR_FINISH_PHRASES)]
+                            _tp2p = f"({_t2p} · {_ph2p})"
+                        else:
+                            _tp2p = f"({_t2p})"
+                        mem_p2 = f"  ·  ⬡ {self.memory.last_hits} mem" if self.memory.last_hits > 0 else ""
+                        rag_p2 = _rag_display(self._workspace_rag)
+                        _act2  = next(
+                            (t["text"] for t in getattr(self, "_plan_tasks", [])
+                             if t["status"] == "active"), ""
+                        )
+                        _thresh2p = int(self.context.compact_threshold * 100)
+                        _cbar2p   = _sfmt(_bar_style(cpct2, _thresh2p), pbar2)
+                        if _act2:
+                            _lbl2 = (_act2[:40] + "…") if len(_act2) > 40 else _act2
+                            _up2  = f"  ·  ↑{_fmt_tokens(total_inp)}" if total_inp > 0 else ""
+                            self._status_cb(f"{frame2}  {_lbl2}  ({_t2p}{_up2})\n")
+                        else:
+                            self._status_cb(
+                                f"{frame2}  {names_label} [paralelo]  {_tp2p}\n"
+                                f"↳  {tok_p2}ctx: {_cbar2p} {cpct2}%{mem_p2}{rag_p2}"
+                            )
+                        fi2 += 1
+
+            _spin_t = threading.Thread(
+                target=_parallel_spinner, daemon=True, name="oocode-par-spin"
+            )
+            _spin_t.start()
+
+            submitted: list[tuple] = []
+            with ThreadPoolExecutor(
+                max_workers=min(len(parsed_calls), 4),
+                thread_name_prefix="oocode-tool",
+            ) as pool:
+                for idx, (_tc, name, args) in enumerate(parsed_calls):
+                    if allowed_map[idx]:
+                        submitted.append((pool.submit(self._execute_tool, name, args), idx))
+                    else:
+                        submitted.append((None, idx))
+
+                for future, idx in submitted:
+                    if future is None:
+                        results_map[idx] = "Operación denegada."
+                    else:
+                        try:
+                            while True:
+                                try:
+                                    results_map[idx] = future.result(timeout=0.25)
+                                    break
+                                except TimeoutError:
+                                    if self._kill_requested:
+                                        future.cancel()
+                                        results_map[idx] = "⛔ Cancelado por kill."
+                                        break
+                        except Exception as exc:
+                            results_map[idx] = f"Error: {exc}"
+
+            _pool_done.set()
+            _spin_t.join(timeout=1.0)
+
+        else:
+            # ── Ejecución secuencial con spinner animado ────────────────────
+            for idx, (_tc, name, args) in enumerate(parsed_calls):
+                if self._kill_requested:
+                    results_map[idx] = "⛔ Operación cancelada — agente detenido por bloqueo bash."
+                    continue
+                self._sep_label = f"⚙ {name}…"
+
+                if self._status_cb and allowed_map[idx]:
+                    self._show_tool_running_header(name, args)
+                    _pre_shown_idxs.add(idx)
+
+                    _seq_done  = threading.Event()
+                    _seq_start = time.time()
+                    _is_subagent_tool = (name == "spawn_subagent")
+                    _seq_color_cycle  = list(_SUBAGENT_COLORS) if _is_subagent_tool else ["cyan"]
+                    _seq_poll = _SUBAGENT_SPINNER_POLL if _is_subagent_tool else _POLL_INTERVAL
+
+                    def _seq_spinner(
+                        _name=name, _done=_seq_done,
+                        _colors=_seq_color_cycle, _t0=_seq_start,
+                        _poll=_seq_poll,
+                    ) -> None:
+                        _fi = 0
+                        while not _done.wait(timeout=_poll):
+                            elapsed2  = time.time() - _t0
+                            frame2    = _SPINNER_FRAMES[_fi % len(_SPINNER_FRAMES)]
+                            ctx_s2    = self.context.stats()
+                            cpct2     = int(ctx_s2["tokens_estimate"] / max(ctx_s2["max_tokens"], 1) * 100)
+                            pbar2     = _ctx_bar(ctx_s2["tokens_estimate"], ctx_s2["max_tokens"], 10, plain=True)
+                            tok_p2    = (f"{_fmt_tokens(total_inp)}↑ {_fmt_tokens(total_out)}↓  ·  "
+                                         if (total_inp or total_out) else "")
+                            _t2 = _fmt_elapsed(elapsed2)
+                            if elapsed2 > 25:
+                                _ph2 = _NEAR_FINISH_PHRASES[(_fi // 5) % len(_NEAR_FINISH_PHRASES)]
+                                _tp2 = f"({_t2} · {_ph2})"
+                            else:
+                                _tp2 = f"({_t2})"
+                            mem_s2 = f"  ·  ⬡ {self.memory.last_hits} mem" if self.memory.last_hits > 0 else ""
+                            rag_s2 = _rag_display(self._workspace_rag)
+                            _phase = self._tool_phase
+                            _cur_f = self._tool_current_file
+                            if _phase:
+                                _label = _phase
+                                _icon  = "⬡"
+                            elif _cur_f:
+                                _sf2   = _cur_f.rsplit("/", 1)[-1][:30]
+                                _label = f"{_name}…  ⎿ {_sf2}  {_tp2}"
+                                _icon  = frame2
+                            else:
+                                _label = f"{_name}…  {_tp2}"
+                                _icon  = frame2
+                            _thresh2 = int(self.context.compact_threshold * 100)
+                            _cbar2   = _sfmt(_bar_style(cpct2, _thresh2), pbar2)
+                            self._status_cb(
+                                f"{_icon}  {_label}\n"
+                                f"↳  {tok_p2}ctx: {_cbar2} {cpct2}%{mem_s2}{rag_s2}"
+                            )
+                            _fi += 1
+
+                    _seq_spin = threading.Thread(
+                        target=_seq_spinner, daemon=True,
+                        name=f"oocode-seq-spin-{name[:8]}",
+                    )
+                    _seq_spin.start()
+                    _is_prog_tool = name in (
+                        "code_search", "grep_code", "grep_file", "multi_grep",
+                        "symbol_lookup", "semantic_search",
+                    )
+                    self._tool_current_file = ""
+                    if _is_prog_tool:
+                        _tool_progress.set_progress_callback(
+                            lambda _f, _s=self: setattr(_s, "_tool_current_file", _f)
+                        )
+                    results_map[idx] = self._execute_tool(name, args)
+                    if _is_prog_tool:
+                        _tool_progress.set_progress_callback(None)
+                    self._tool_current_file = ""
+                    _seq_done.set()
+                    _seq_spin.join(timeout=1.0)
+                elif self._status_cb:
+                    ctx_s      = self.context.stats()
+                    cpct       = int(ctx_s["tokens_estimate"] / max(ctx_s["max_tokens"], 1) * 100)
+                    plain_bar  = _ctx_bar(ctx_s["tokens_estimate"], ctx_s["max_tokens"], 10, plain=True)
+                    tok_part   = (f"{_fmt_tokens(total_inp)}↑ {_fmt_tokens(total_out)}↓  ·  "
+                                  if (total_inp or total_out) else "")
+                    _thr_d = int(self.context.compact_threshold * 100)
+                    _cb_d  = _sfmt(_bar_style(cpct, _thr_d), plain_bar)
+                    self._status_cb(f"⚙  {name}…\n↳  {tok_part}ctx: {_cb_d} {cpct}%")
+                    results_map[idx] = "Operación denegada."
+                else:
+                    if allowed_map[idx]:
+                        if self.is_subagent:
+                            self._show_tool_running_header(name, args)
+                            results_map[idx] = self._execute_tool(name, args)
+                        else:
+                            results_map[idx] = self._run_animated_header(name, args)
+                        _pre_shown_idxs.add(idx)
+                    else:
+                        results_map[idx] = "Operación denegada."
+
+        return parsed_calls, allowed_map, results_map, _pre_shown_idxs, _safe_parallel
+
+    def _turn_log_results(
+        self,
+        parsed_calls: list,
+        allowed_map: dict,
+        results_map: dict,
+        pre_shown_idxs: set,
+        safe_parallel: bool,
+    ) -> None:
+        """Registra resultados, actualiza contexto, checkpoints y auto-avanza el plan."""
+        _READ_GROUP = frozenset((
+            "read_file", "read_files", "grep_code", "grep_file",
+            "find_file", "find_files", "find_dir", "ls_dir", "file_stat",
+            "symbol_lookup", "multi_grep", "code_compare",
+        ))
+        _WRITE_GROUP = frozenset((
+            "edit_file", "edit_files", "write_file", "regex_replace",
+            "bulk_replace", "patch_apply",
+        ))
+        _block_mode = len(parsed_calls) > 1
+        _batch_names = [n for _, n, _ in parsed_calls]
+        _in_read_batch  = (safe_parallel and not self.capture_output
+                           and all(n in _READ_GROUP for n in _batch_names)
+                           and len(parsed_calls) > 1)
+        _in_write_batch = (safe_parallel and not self.capture_output
+                           and all(n in _WRITE_GROUP for n in _batch_names)
+                           and len(parsed_calls) > 1)
+        _in_batch = _in_read_batch or _in_write_batch
+
+        # En TUI mode el resumen agrupado se genera en _flush_turn_block
+        if safe_parallel and not self.capture_output and self._status_cb is None:
+            _all_reads  = all(n in _READ_GROUP for n in _batch_names)
+            _all_writes = all(n in _WRITE_GROUP for n in _batch_names)
+            _n = len(_batch_names)
+            if _all_reads and _n > 1:
+                self._print(
+                    f"  [bold green]●[/bold green] [bold]Reading {_n} files…[/bold]"
+                )
+            elif _all_writes and _n > 1:
+                self._print(
+                    f"  [bold green]●[/bold green] [bold]Updating {_n} files…[/bold]"
+                )
+
+        for idx, (_tc, name, args) in enumerate(parsed_calls):
+            result  = results_map[idx]
+            allowed = allowed_map[idx]
+            self.session.log_tool_call(name, args, result)
+            self.chatlog.log_tool_call(name, args, str(result))
+            log.debug("tool_call", tool=name, allowed=allowed,
+                      args=json.dumps(args, ensure_ascii=False)[:120])
+            _is_pre_shown = idx in pre_shown_idxs if not safe_parallel else False
+            self._show_tool_block(name, args, str(result), allowed,
+                                  block_mode=_block_mode,
+                                  suppress_header=_in_batch,
+                                  pre_shown=_is_pre_shown,
+                                  batch_idx=idx if _in_batch else -1)
+            if self.plugins and allowed:
+                self.plugins.fire("on_tool_result", name, args, str(result))
+            args_str = json.dumps(args, ensure_ascii=False)
+            self._last_tool_calls.append((name, args_str, str(result)))
+            if allowed:
+                if _is_modify_tool(name):
+                    _wp = str(args.get("path") or args.get("file_path", ""))
+                    if _wp:
+                        self._session_reads.append((_wp, None, True))
+                    for _wed in args.get("edits", []):
+                        if isinstance(_wed, dict) and _wed.get("path"):
+                            self._session_reads.append((str(_wed["path"]), None, True))
+                elif name in ("run_tests", "test_file"):
+                    self._task_last_test = str(result)[:400]
+            result_for_ctx = self._postprocess_tool_result(name, args, str(result))
+            result_for_ctx = self._truncate_tool_result(result_for_ctx)
+            tool_call_id = getattr(_tc, "id", None) or name
+            self.context.add_tool_result(tool_call_id, name, result_for_ctx)
+
+        # Truncación de batch en REPL mode (… +N tool uses)
+        if (_in_batch and len(parsed_calls) > 3
+                and not self.capture_output
+                and getattr(self, "_webui_queue", None) is None
+                and self._status_cb is None):
+            _n_hidden = len(parsed_calls) - 3
+            self._print(
+                f"     [dim]… +{_n_hidden} tool use{'s' if _n_hidden != 1 else ''}"
+                f" (ctrl+o to expand)[/dim]"
+            )
+
+        # Auto-advance plan tras spawn_subagent/explore exitosos sin task_done() explícito
+        _SPAWN_NAMES = frozenset({"spawn_subagent", "explore"})
+        _spawn_ok = [
+            (i, n) for i, (_, n, _) in enumerate(parsed_calls)
+            if n in _SPAWN_NAMES
+            and allowed_map.get(i, False)
+            and not str(results_map.get(i, "")).startswith("Error")
+            and not str(results_map.get(i, "")).startswith("⛔")
+        ]
+        _has_explicit_task_done = any(n == "task_done" for _, n, _ in parsed_calls)
+        if (_spawn_ok
+                and not _has_explicit_task_done
+                and self._plan_tasks
+                and not self._all_plan_tasks_done()
+                and not self.capture_output):
+            self._execute_task_done("")
+
+    def _turn_finish(
+        self,
+        full_output_parts: list[str],
+        total_inp: int,
+        total_out: int,
+        t_run_start: float,
+    ) -> Optional[str]:
+        """Teardown del turno: flush, auto-memoria, status final, usage y limpieza."""
+        self._flush_turn_block()
+        self._auto_save_task_memory(full_output_parts)
+
+        if self._status_cb:
+            total_elapsed = time.time() - t_run_start
+            done_word  = random.choice(_DONE_WORDS)
+            ctx_s      = self.context.stats()
+            cpct       = int(ctx_s["tokens_estimate"] / max(ctx_s["max_tokens"], 1) * 100)
+            plain_bar  = _ctx_bar(ctx_s["tokens_estimate"], ctx_s["max_tokens"], 10, plain=True)
+            thresh_pct = int(self.context.compact_threshold * 100)
+            tok_part   = (f"{_fmt_tokens(total_inp)}↑ {_fmt_tokens(total_out)}↓  ·  "
+                          if (total_inp or total_out) else "")
+            line1      = f"⚙  {done_word} durante {total_elapsed:.1f}s  ✓"
+            _bstyle_f  = _bar_style(cpct, thresh_pct)
+            _chint_f   = _hint_styled(cpct, thresh_pct)
+            line2      = f"↳  {tok_part}ctx: {_sfmt(_bstyle_f, plain_bar)} {cpct}%{_chint_f}"
+            self._status_cb(f"{line1}\n{line2}")
+            self._sep_label = ""
+
+        _now_done = time.time()
+        for _pt in self._plan_tasks:
+            if _pt["status"] in ("active", "pending"):
+                _pt["status"] = "done"
+                if not _pt["end_ts"]:
+                    _pt["end_ts"] = _now_done
+
+        self._task_elapsed = time.time() - self._task_start_time
+        self._task_start_time = None
+
+        self._show_usage(total_inp, total_out)
+
+        import tools.hooks as _hooks_mod_end
+        import tools.diff_renderer as _diff_mod_end
+        _hooks_mod_end.set_hook_print_fn(None)
+        _diff_mod_end.set_dprint_fn(None)
+
+        self._last_response = "\n".join(full_output_parts)
+        log.debug("assistant_reply", chars=len(self._last_response))
+        if self.capture_output:
+            return self._last_response
+        return None
+
+    def run(self, user_message: str,
+            images: Optional[list[str]] = None) -> Optional[str]:
+        """Ejecuta un turno del agente.
+
+        Args:
+            user_message: texto del usuario.
+            images: lista de rutas de imagen o strings base64 (solo si el modelo soporta visión).
+        """
+        if self.rt.activation == "mention" and not self.capture_output:
+            if not user_message.lower().startswith(self.config.agent_name.lower()):
+                return None
+        if self._compact_running.is_set():
+            self._compact_running.wait(timeout=30.0)
+
+        self._turn_reset_state(user_message, images)
+        full_output_parts, t_run_start = self._turn_start(user_message)
+
+        total_inp = total_out = 0
+        _had_tools_prev    = False
+        _last_tool_call_count = 0
+
+        while True:
+            if self._turn_loop_guard():
+                break
+
+            _new_count = len(self._last_tool_calls)
+            _had_tools_prev       = _new_count > _last_tool_call_count
+            _last_tool_call_count = _new_count
+            self._subagent_color_idx += 1
+
+            messages, _tools_cache = self._turn_iter_prepare()
+
+            text, tool_calls, inp, out = self._turn_llm_call(
+                messages, _tools_cache, total_inp, total_out)
+
+            if self._kill_requested:
+                self._kill_requested = False
+                self._turn_print_kill_stopped()
+                break
 
             total_inp += inp
             total_out += out
@@ -4413,85 +4385,12 @@ class AgentLoop:
             if inp or out:
                 self.session.log_usage(inp, out)
 
-            # Respuesta vacía: el modelo no generó texto ni herramientas.
-            # No añadir al contexto (evita contaminar el historial).
-            if not text.strip() and not tool_calls:
-                _max_ac = self.config.auto_continue_max
-                _did_tools = bool(self._last_tool_calls)
-                # Parar si todas las tareas del plan están done
-                if self._all_plan_tasks_done():
-                    log.debug("auto_continue_skip_done", reason="all_plan_tasks_done")
-                    self._flush_turn_block()
-                    break
-                if _did_tools and _max_ac > 0 and self._auto_continue_count < _max_ac:
-                    # Comprobar si el último mensaje del asistente es un informe de completado.
-                    # Si lo es, el modelo ya terminó — no continuar innecesariamente.
-                    _last_asst = next(
-                        (m for m in reversed(self.context.messages)
-                         if m.get("role") == "assistant"),
-                        None,
-                    )
-                    _last_asst_text = _last_asst.get("content", "") if _last_asst else ""
-                    if self._is_completion_report(_last_asst_text):
-                        _pending_ct = sum(
-                            1 for t in self._plan_tasks if t["status"] == "pending"
-                        ) if self._plan_tasks else 0
-                        if _pending_ct > 0:
-                            # Hay tareas ◻ pendientes — el informe es prematuro; continuar
-                            pass  # fall through → auto_continue_count++ abajo
-                        else:
-                            log.debug("auto_continue_skip_done",
-                                      reason="completion_report_in_last_message")
-                            self._mark_all_plan_tasks_done()
-                            self._flush_turn_block()
-                            break
-
-                    # Hay trabajo activo → auto-continuar inyectando un mensaje de usuario
-                    self._auto_continue_count += 1
-                    _n = self._auto_continue_count
-                    # Avanzar tarea del plan según iteración
-                    if self._plan_tasks:
-                        _tgt = min(_n, len(self._plan_tasks) - 1)
-                        self._set_plan_task_active(_tgt)
-                    # Solo mostrar ↻ si el modelo está realmente atascado (no procesando results)
-                    if not self.capture_output and not _had_tools_prev:
-                        self._print(
-                            f"\n  [bold yellow]↻[/bold yellow]  [yellow]Auto-continúa ({_n}/{_max_ac})…[/yellow]"
-                        )
-                    log.debug("auto_continue", count=_n, max=_max_ac,
-                              model=self._active_model(),
-                              tools_done=len(self._last_tool_calls))
-                    # Mensaje específico por tarea o genérico
-                    if self._plan_tasks:
-                        _pac_i = next((i for i, t in enumerate(self._plan_tasks)
-                                       if t["status"] == "active"), -1)
-                        if _pac_i >= 0:
-                            _pac_t = self._plan_tasks[_pac_i]
-                            _pac_ni = _pac_i + 1
-                            _pac_msg = (f"Continúa con la tarea activa "
-                                        f"({_pac_i + 1}/{len(self._plan_tasks)}): "
-                                        f"{_pac_t['text']}.")
-                            if _pac_ni < len(self._plan_tasks):
-                                _pac_msg += f" Cuando termines, anuncia \"Tarea {_pac_ni + 1}:\"."
-                        else:
-                            _pac_msg = "Continúa con la tarea."
-                    else:
-                        _pac_msg = "Continúa con la tarea."
-                    self.context.add("user", _pac_msg)
-                    continue  # reiniciar el bucle sin romperlo
-                # Sin más auto-continuaciones (o desactivado, o tarea sin tools)
-                if not self.capture_output:
-                    self._print(
-                        "\n  [dim yellow]⚠  El modelo no ha producido respuesta. "
-                        "Si la tarea está incompleta, indícame qué falta.[/dim yellow]"
-                    )
-                log.debug("empty_response", model=self._active_model(),
-                          inp=inp, out=out, iteration=len(self._last_tool_calls))
-                self._flush_turn_block()
+            ctrl = self._turn_handle_empty(text, tool_calls, _had_tools_prev)
+            if ctrl == "break":
                 break
+            if ctrl == "continue":
+                continue
 
-            # No reseteamos _auto_continue_count aquí: solo se resetea al inicio de run().
-            # Así el contador se acumula correctamente a lo largo de todo el turno del usuario.
             assistant_msg: dict = {"role": "assistant", "content": text}
             if tool_calls:
                 assistant_msg["tool_calls"] = [
@@ -4499,580 +4398,28 @@ class AgentLoop:
                     for tc in tool_calls
                 ]
             self.context.messages.append(assistant_msg)
+            self.context._invalidate_token_cache()
 
             if text:
-                self._advance_plan_task(text)  # actualiza task tracker según anuncio del modelo
+                self._advance_plan_task(text)
                 self._turn_text_emitted = True
                 full_output_parts.append(text)
                 self.session.log_message("assistant", text)
                 self.chatlog.log_assistant(text)
-                # Flush tools acumulados de iteraciones anteriores ANTES del nuevo ●.
-                # Así todos los tools entre dos ● se agrupan en una sola línea ⎿.
                 self._flush_turn_block()
                 if not self.capture_output:
-                    from rich.markup import escape as _mesc
-                    import re as _re_bullet
-                    _ac = COLOR_PRESETS.get(self.rt.accent_color, COLOR_PRESETS["cyan"])[1]
-                    # strip de whitespace inicial: evita que ● quede en su propia línea
-                    # (lstrip() también elimina espacios/tabs antes de \n, lo que lstrip('\n')
-                    # no hacía — causa de "● …" cuando el modelo emite " \nPlan: ...")
-                    text_clean = text.lstrip()
-                    lines   = text_clean.split('\n', 1)
-                    first   = lines[0].rstrip()
-                    rest    = lines[1] if len(lines) > 1 else ""
-                    # Detectar si la primera línea es un bloque markdown real (heading, lista,
-                    # código, quote, tabla). Negrita (**texto**) NO es bloque — el * debe ir
-                    # seguido de espacio para ser lista; **bold** tiene * seguido de *.
-                    _s0 = first.lstrip()
-                    _is_md_block = bool(_s0 and (
-                        _s0[0] == '#' or                                           # heading
-                        _s0.startswith('```') or _s0.startswith('~~~') or         # code fence
-                        _s0[0] in ('|', '>') or                                   # table / quote
-                        (len(_s0) >= 2 and _s0[0] in ('-', '+', '!') and _s0[1] in (' ', '\t')) or
-                        (len(_s0) >= 2 and _s0[0] == '*' and _s0[1] in (' ', '\t'))  # lista * item
-                    ))
-                    _plain_first = bool(first and not _is_md_block)
-                    if _plain_first:
-                        # Quitar marcadores inline de negrita/cursiva del header (** y *)
-                        # para mostrar "Plan: ..." en vez de "**Plan:**" en la línea ●
-                        _first_clean = _re_bullet.sub(r'\*{1,3}([^*\n]+)\*{1,3}', r'\1', first).strip()
-                        if _first_clean:
-                            first = _first_clean
-
-                    if self._start_live_block_cb and tool_calls:
-                        # TUI + hay tools: live block con ● pulsante y ⎿ actualizable
-                        console.print()   # línea en blanco → buffer estático
-                        if _plain_first:
-                            # Texto plano: mostrar inline con ●; truncar al ancho del terminal
-                            # en límite de palabra para evitar cortes mid-word.
-                            # Reservamos 4 cols para el prefijo "  ● ".
-                            try:
-                                _cols = os.get_terminal_size().columns
-                            except OSError:
-                                _cols = 120
-                            _max_hdr = max(60, _cols - 4)
-                            if len(first) <= _max_hdr:
-                                _hdr       = first
-                                _body_extra = ""
-                            else:
-                                # Cortar en el último espacio antes de _max_hdr
-                                _cut = first.rfind(' ', 0, _max_hdr)
-                                if _cut > _max_hdr // 2:
-                                    _hdr        = first[:_cut] + "…"
-                                    _body_extra = first[_cut + 1:]
-                                else:
-                                    _hdr        = first[:_max_hdr - 1] + "…"
-                                    _body_extra = first[_max_hdr - 1:]
-                            _bullet_text = _mesc(_hdr)
-                        else:
-                            _bullet_text = "…"
-                            _body_extra = ""
-                        self._start_live_block_cb(_bullet_text)
-                        self._live_tool_count = 0
-                        # Resto del mensaje (markdown) al cuerpo del live block
-                        _body = (_body_extra + "\n" + rest).lstrip('\n') if _body_extra else rest
-                        if _plain_first and _body.strip():
-                            console.print(Padding(Markdown(_body.lstrip('\n')), (0, 0, 0, 2)))
-                        elif not _plain_first:
-                            console.print(Padding(Markdown(text_clean), (0, 0, 0, 2)))
-                    else:
-                        # REPL o respuesta sin tools: ● estático normal
-                        console.print()
-                        if _plain_first:
-                            console.print(f"  [bold {_ac}]●[/bold {_ac}] {_mesc(first)}")
-                            if rest.strip():
-                                console.print(Padding(Markdown(rest.lstrip('\n')), (0, 0, 0, 2)))
-                        else:
-                            console.print(f"  [bold {_ac}]●[/bold {_ac}]")
-                            console.print(Padding(Markdown(text_clean), (0, 0, 0, 2)))
+                    self._turn_display_bullet(text, tool_calls)
 
             if not tool_calls:
-                # ── Registrar métricas de rendimiento ──────────────
-                if self._last_tool_calls:
-                    for _tc, _name, _args in self._last_tool_calls:
-                        _tool_name = _name
-                        _record_tool_metrics(_tool_name, 0.0, True)
-                # ── Parar si todas las tareas del plan están done ──────────────
-                if self._all_plan_tasks_done():
-                    log.debug("auto_continue_skip_done", reason="all_plan_tasks_done_no_tools")
-                    self._flush_turn_block()
+                ctrl = self._turn_no_tools(text)
+                if ctrl == "break":
                     break
-
-                # ── Auto-continue si el modelo anunció un plan sin ejecutarlo ──
-                # Detecta: respuesta con lista de pasos numerados/bullets + sin
-                # historial de tool calls previo (= plan forward, no resumen).
-                # Excepción: si el plan contiene "⚠ REQUIERE REVISIÓN", pausar y
-                # esperar respuesta del usuario en lugar de continuar automáticamente.
-                _max_ac = self.config.auto_continue_max
-                _requires_review = (
-                    text and (
-                        "⚠ REQUIERE REVISIÓN" in text
-                        or "REQUIERE REVISIÓN" in text
-                        or "requiere revisión" in text.lower()
-                    )
-                )
-                if _requires_review and not self.capture_output:
-                    from rich.markup import escape as _mesc
-                    self._print(
-                        "\n  [bold yellow]⚠[/bold yellow]  [yellow]El agente ha marcado "
-                        "este plan como pendiente de revisión.[/yellow]"
-                    )
-                    self._print(
-                        "  [dim]Responde con tus indicaciones o envía [bold]/steer[/bold] "
-                        "para redirigir antes de continuar.[/dim]"
-                    )
-                    self._flush_turn_block()
-                    break
-                if (text
-                        and not self._last_tool_calls
-                        and _max_ac > 0
-                        and self._auto_continue_count < _max_ac
-                        and not self.capture_output):
-                    _plan_steps = self._detect_tasks(text)
-                    if _plan_steps and len(_plan_steps) >= 2 and not self._is_completion_report(text):
-                        self._auto_continue_count += 1
-                        _n_ac = self._auto_continue_count
-                        log.debug("auto_continue_plan",
-                                  steps=len(_plan_steps), count=_n_ac, max=_max_ac)
-                        # Primera auto-continuación: mostrar panel de plan antes de ejecutar
-                        if _n_ac == 1:
-                            from rich.markup import escape as _mesc
-                            _ac_col = COLOR_PRESETS.get(self.rt.accent_color, COLOR_PRESETS["cyan"])[1]
-                            _icon_c = _TASK_ICON_COLORS[int(time.time()) % len(_TASK_ICON_COLORS)]
-                            self._print(
-                                f"\n  [{_icon_c}]◈[/{_icon_c}]  "
-                                f"[bold]Plan de ejecución[/bold]  "
-                                f"[dim]({len(_plan_steps)} pasos)[/dim]"
-                            )
-                            for _si, _step in enumerate(_plan_steps[:10], 1):
-                                _step_short = (_step[:78] + "…") if len(_step) > 78 else _step
-                                self._print(
-                                    f"  [dim]  {_si}.[/dim]  [dim]{_mesc(_step_short)}[/dim]"
-                                )
-                            self._print(
-                                f"\n  [bold yellow]↻[/bold yellow]  [yellow]Ejecutando plan…[/yellow]"
-                            )
-                        else:
-                            self._print(
-                                f"\n  [bold yellow]↻[/bold yellow]  [yellow]Continuando "
-                                f"({_n_ac}/{_max_ac})…[/yellow]"
-                            )
-                        # Sincronizar _plan_tasks con el plan refinado del LLM.
-                        # Primera auto-continuación: si el LLM elaboró su propio plan
-                        # (puede diferir del de usuario — pasos consolidados, reordenados),
-                        # reemplazar _plan_tasks con los pasos del LLM para que el panel
-                        # refleje la ejecución real, no solo las frases originales del usuario.
-                        if _plan_steps and _n_ac == 1:
-                            self._plan_tasks = [
-                                {"text": t, "status": "pending", "start_ts": 0.0, "end_ts": 0.0}
-                                for t in _plan_steps
-                            ]
-                            self._plan_tasks[0]["status"] = "active"
-                            self._plan_tasks[0]["start_ts"] = time.time()
-                        # Mensaje específico con contexto de tarea
-                        if self._plan_tasks:
-                            _pp_i = next((i for i, t in enumerate(self._plan_tasks)
-                                          if t["status"] == "active"), 0)
-                            _pp_t = self._plan_tasks[_pp_i]
-                            _pp_msg = (f"Continúa ejecutando el plan. "
-                                       f"Tarea activa ({_pp_i + 1}/{len(self._plan_tasks)}): "
-                                       f"\"{_pp_t['text']}\".")
-                            if _pp_i + 1 < len(self._plan_tasks):
-                                _pp_msg += f" Anuncia \"Tarea {_pp_i + 2}:\" al avanzar."
-                        else:
-                            _pp_msg = ("Continúa ejecutando el plan que acabas de anunciar, "
-                                       "paso a paso, usando las tools necesarias.")
-                        self.context.add("user", _pp_msg)
-                        continue
-
-                # ── Auto-continue si el plan tiene tareas sin ejecutar ────────────
-                # El modelo puede haber declarado "done" prematuramente (señal ignorada
-                # en _advance_plan_task) o simplemente no haber ejecutado la tarea activa.
-                # Si hay tareas active/pending y no superamos el límite, reinyectar.
-                if (self._plan_tasks and not self._all_plan_tasks_done()
-                        and _max_ac > 0 and self._auto_continue_count < _max_ac
-                        and not self.capture_output):
-                    _resume_idx = next(
-                        (i for i, t in enumerate(self._plan_tasks)
-                         if t["status"] in ("active", "pending")),
-                        -1,
-                    )
-                    if _resume_idx >= 0:
-                        self._set_plan_task_active(_resume_idx)
-                        self._auto_continue_count += 1
-                        _n = self._auto_continue_count
-                        _rt = self._plan_tasks[_resume_idx]
-                        _rn = _resume_idx + 1
-                        _resume_msg = (
-                            f"La tarea {_rn}/{len(self._plan_tasks)} "
-                            f"\"{_rt['text'][:80]}\" aún no está completada. "
-                            f"Continúa ejecutando con las tools necesarias. "
-                            f"NO digas \"He completado todas las tareas\" hasta haber "
-                            f"ejecutado todas las acciones requeridas con tools."
-                        )
-                        self._print(
-                            f"\n  [bold yellow]↻[/bold yellow]  "
-                            f"[yellow]Tarea {_rn} pendiente — retomando "
-                            f"({_n}/{_max_ac})…[/yellow]"
-                        )
-                        log.debug("auto_continue_pending_task",
-                                  task_idx=_resume_idx, count=_n, max=_max_ac)
-                        self.context.add("user", _resume_msg)
-                        continue
-
+                if ctrl == "continue":
+                    continue
                 break
 
-            # ── Normaliza tool calls ────────────────────────────────────────────
-            parsed_calls: list[tuple] = []
-            for tc in tool_calls:
-                name = tc.function.name
-                name = _TOOL_ALIASES.get(name, name)
-                args = tc.function.arguments
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except json.JSONDecodeError:
-                        args = {}
-                parsed_calls.append((tc, name, args))
+            parsed, allowed_map, results_map, pre_shown, safe_parallel = \
+                self._turn_dispatch_tools(tool_calls, total_inp, total_out)
+            self._turn_log_results(parsed, allowed_map, results_map, pre_shown, safe_parallel)
 
-            # ── Permisos: siempre secuencial (interactivo con el usuario) ──────
-            # El display del call se hace en el loop de resultados (_show_tool_block),
-            # no aquí, para mostrarlo junto al resultado (estilo Claude Code).
-            # En modo 'ask' el permiso ya incluye el nombre en el prompt.
-            allowed_map: dict[int, bool] = {}
-            _block_mode = len(parsed_calls) > 1
-            for idx, (_tc, name, args) in enumerate(parsed_calls):
-                description = f"{name}({json.dumps(args, ensure_ascii=False)[:80]})"
-                allowed_map[idx] = self.permissions.check(name, description)
-
-            # ── Ejecución: paralela si hay >1 call y ninguna es bash ──────────
-            # bash tiene side-effects secuenciales (cd, exports, etc.)
-            _safe_parallel = (
-                len(parsed_calls) > 1
-                and not any(n == "bash" for _, n, _ in parsed_calls)
-                and not self.capture_output   # subagentes: siempre secuencial
-            )
-
-            results_map: dict[int, str] = {}
-
-            if _safe_parallel:
-                names_label = " + ".join(n for _, n, _ in parsed_calls)
-                self._sep_label = f"⚙ {names_label}…"
-
-                _pool_done = threading.Event()
-                _pool_start = time.time()
-
-                # Spinner que sigue animando mientras el pool trabaja
-                def _parallel_spinner() -> None:
-                    fi2 = 0
-                    while not _pool_done.wait(timeout=_POLL_INTERVAL):
-                        if self._status_cb:
-                            elapsed2   = time.time() - _pool_start
-                            frame2     = _SPINNER_FRAMES[fi2 % len(_SPINNER_FRAMES)]
-                            ctx_s2     = self.context.stats()
-                            cpct2      = int(ctx_s2["tokens_estimate"] / max(ctx_s2["max_tokens"], 1) * 100)
-                            pbar2      = _ctx_bar(ctx_s2["tokens_estimate"], ctx_s2["max_tokens"], 10, plain=True)
-                            tok_p2     = (f"{_fmt_tokens(total_inp)}↑ {_fmt_tokens(total_out)}↓  ·  "
-                                          if (total_inp or total_out) else "")
-                            _t2p = _fmt_elapsed(elapsed2)
-                            if elapsed2 > 25:
-                                _ph2p = _NEAR_FINISH_PHRASES[(fi2 // 5) % len(_NEAR_FINISH_PHRASES)]
-                                _tp2p = f"({_t2p} · {_ph2p})"
-                            else:
-                                _tp2p = f"({_t2p})"
-                            mem_p2 = f"  ·  ⬡ {self.memory.last_hits} mem" if self.memory.last_hits > 0 else ""
-                            rag_p2 = _rag_display(self._workspace_rag)
-                            # Modo plan: ✶ + tarea activa, modo normal: frame + label
-                            _act2 = next(
-                                (t["text"] for t in getattr(self, "_plan_tasks", [])
-                                 if t["status"] == "active"), ""
-                            )
-                            _thresh2p = int(getattr(self.context, "compact_threshold", 0.85) * 100)
-                            _cbar2p   = _sfmt(_bar_style(cpct2, _thresh2p), pbar2)
-                            if _act2:
-                                _lbl2 = (_act2[:40] + "…") if len(_act2) > 40 else _act2
-                                _up2  = f"  ·  ↑{_fmt_tokens(total_inp)}" if total_inp > 0 else ""
-                                self._status_cb(f"{frame2}  {_lbl2}  ({_t2p}{_up2})\n")
-                            else:
-                                self._status_cb(
-                                    f"{frame2}  {names_label} [paralelo]  {_tp2p}\n"
-                                    f"↳  {tok_p2}ctx: {_cbar2p} {cpct2}%{mem_p2}{rag_p2}"
-                                )
-                            fi2 += 1
-
-                _spin_t = threading.Thread(
-                    target=_parallel_spinner, daemon=True, name="oocode-par-spin"
-                )
-                _spin_t.start()
-
-                # Enviar todas las calls permitidas al pool
-                # Usamos lista de pares (future|None, idx) — sin dict para evitar
-                # la colisión de None como key cuando varias calls son denegadas.
-                submitted: list[tuple] = []
-                with ThreadPoolExecutor(
-                    max_workers=min(len(parsed_calls), 4),
-                    thread_name_prefix="oocode-tool",
-                ) as pool:
-                    for idx, (_tc, name, args) in enumerate(parsed_calls):
-                        if allowed_map[idx]:
-                            submitted.append((pool.submit(self._execute_tool, name, args), idx))
-                        else:
-                            submitted.append((None, idx))
-
-                    for future, idx in submitted:
-                        if future is None:
-                            results_map[idx] = "Operación denegada."
-                        else:
-                            try:
-                                results_map[idx] = future.result()
-                            except Exception as exc:
-                                results_map[idx] = f"Error: {exc}"
-
-                _pool_done.set()
-                _spin_t.join(timeout=1.0)
-
-            else:
-                # ── Ejecución secuencial con spinner animado ────────────────────
-                # _pre_shown_idxs: tools cuyo header ya se mostró antes de ejecutar
-                _pre_shown_idxs: set[int] = set()
-
-                for idx, (_tc, name, args) in enumerate(parsed_calls):
-                    # Parar si el agente fue kill-requested por una call anterior del mismo batch
-                    if self._kill_requested:
-                        results_map[idx] = "⛔ Operación cancelada — agente detenido por bloqueo bash."
-                        continue
-                    self._sep_label = f"⚙ {name}…"
-
-                    if self._status_cb and allowed_map[idx]:
-                        # Mostrar header de la tool ANTES de ejecutarla (◐ amarillo)
-                        # para que el usuario vea inmediatamente qué se está ejecutando.
-                        self._show_tool_running_header(name, args)
-                        _pre_shown_idxs.add(idx)
-
-                        # Lanzar spinner thread para tools que pueden tardar
-                        _seq_done  = threading.Event()
-                        _seq_start = time.time()
-                        _is_subagent_tool = (name == "spawn_subagent")
-                        _seq_color_cycle  = list(_SUBAGENT_COLORS) if _is_subagent_tool else ["cyan"]
-                        # spawn_subagent: 500ms (reduce CPU durante ejecuciones largas)
-                        _seq_poll = 0.5 if _is_subagent_tool else _POLL_INTERVAL
-
-                        def _seq_spinner(
-                            _name=name, _done=_seq_done,
-                            _colors=_seq_color_cycle, _t0=_seq_start,
-                            _poll=_seq_poll,
-                        ) -> None:
-                            _fi = 0
-                            while not _done.wait(timeout=_poll):
-                                elapsed2  = time.time() - _t0
-                                frame2    = _SPINNER_FRAMES[_fi % len(_SPINNER_FRAMES)]
-
-                                ctx_s2    = self.context.stats()
-                                cpct2     = int(ctx_s2["tokens_estimate"] / max(ctx_s2["max_tokens"], 1) * 100)
-                                pbar2     = _ctx_bar(ctx_s2["tokens_estimate"], ctx_s2["max_tokens"], 10, plain=True)
-                                tok_p2    = (f"{_fmt_tokens(total_inp)}↑ {_fmt_tokens(total_out)}↓  ·  "
-                                             if (total_inp or total_out) else "")
-                                _t2 = _fmt_elapsed(elapsed2)
-                                if elapsed2 > 25:
-                                    _ph2 = _NEAR_FINISH_PHRASES[(_fi // 5) % len(_NEAR_FINISH_PHRASES)]
-                                    _tp2 = f"({_t2} · {_ph2})"
-                                else:
-                                    _tp2 = f"({_t2})"
-                                mem_s2 = f"  ·  ⬡ {self.memory.last_hits} mem" if self.memory.last_hits > 0 else ""
-                                rag_s2 = _rag_display(self._workspace_rag)
-                                # Mostrar fase de memoria o fichero actual de búsqueda
-                                _phase = self._tool_phase
-                                _cur_f = self._tool_current_file
-                                if _phase:
-                                    _label  = _phase
-                                    _icon   = "⬡"
-                                elif _cur_f:
-                                    _sf2 = _cur_f.rsplit("/", 1)[-1][:30]
-                                    _label  = f"{_name}…  ⎿ {_sf2}  {_tp2}"
-                                    _icon   = frame2
-                                else:
-                                    _label  = f"{_name}…  {_tp2}"
-                                    _icon   = frame2
-                                _thresh2  = int(getattr(self.context, "compact_threshold", 0.85) * 100)
-                                _cbar2    = _sfmt(_bar_style(cpct2, _thresh2), pbar2)
-                                self._status_cb(
-                                    f"{_icon}  {_label}\n"
-                                    f"↳  {tok_p2}ctx: {_cbar2} {cpct2}%{mem_s2}{rag_s2}"
-                                )
-                                _fi += 1
-
-                        _seq_spin = threading.Thread(
-                            target=_seq_spinner, daemon=True,
-                            name=f"oocode-seq-spin-{name[:8]}",
-                        )
-                        _seq_spin.start()
-                        # Registrar callback de progreso para búsquedas
-                        _is_prog_tool = name in (
-                            "code_search", "grep_code", "grep_file", "multi_grep",
-                            "symbol_lookup", "semantic_search",
-                        )
-                        self._tool_current_file = ""
-                        if _is_prog_tool:
-                            _tool_progress.set_progress_callback(
-                                lambda _f, _s=self: setattr(_s, "_tool_current_file", _f)
-                            )
-                        results_map[idx] = self._execute_tool(name, args)
-                        if _is_prog_tool:
-                            _tool_progress.set_progress_callback(None)
-                        self._tool_current_file = ""
-                        _seq_done.set()
-                        _seq_spin.join(timeout=1.0)
-                    elif self._status_cb:
-                        # Tool denegada — actualiza status una vez
-                        ctx_s      = self.context.stats()
-                        cpct       = int(ctx_s["tokens_estimate"] / max(ctx_s["max_tokens"], 1) * 100)
-                        plain_bar  = _ctx_bar(ctx_s["tokens_estimate"], ctx_s["max_tokens"], 10, plain=True)
-                        tok_part   = (f"{_fmt_tokens(total_inp)}↑ {_fmt_tokens(total_out)}↓  ·  "
-                                      if (total_inp or total_out) else "")
-                        _thr_d = int(getattr(self.context, "compact_threshold", 0.85) * 100)
-                        _cb_d  = _sfmt(_bar_style(cpct, _thr_d), plain_bar)
-                        self._status_cb(f"⚙  {name}…\n↳  {tok_part}ctx: {_cb_d} {cpct}%")
-                        results_map[idx] = "Operación denegada."
-                    else:
-                        # Sin status_cb (modo REPL clásico o subagente)
-                        if allowed_map[idx]:
-                            if self.is_subagent:
-                                # Subagente en TUI: sys.stdout → _AppWriter → convierte \r→\n,
-                                # así que la animación con \r crea líneas sueltas en el buffer.
-                                # Usar header estático y ejecutar directamente.
-                                self._show_tool_running_header(name, args)
-                                results_map[idx] = self._execute_tool(name, args)
-                            else:
-                                # REPL clásico: header animado verde→amarillo, blanco al terminar
-                                results_map[idx] = self._run_animated_header(name, args)
-                            _pre_shown_idxs.add(idx)
-                        else:
-                            results_map[idx] = "Operación denegada."
-
-            # ── Encabezado agrupado para lotes de lecturas paralelas ─────────
-            # "Reading N files…" al estilo Claude Code cuando todas las calls
-            # del batch son operaciones de lectura (sin escritura ni bash).
-            _READ_GROUP = frozenset((
-                "read_file", "read_files", "grep_code", "grep_file",
-                "find_file", "find_files", "find_dir", "ls_dir", "file_stat",
-                "symbol_lookup", "multi_grep", "code_compare",
-            ))
-            _WRITE_GROUP = frozenset((
-                "edit_file", "edit_files", "write_file", "regex_replace",
-                "bulk_replace", "patch_apply",
-            ))
-            # En TUI mode el resumen agrupado se genera en _flush_turn_block
-            if _safe_parallel and not self.capture_output and self._status_cb is None:
-                _all_names = [n for _, n, _ in parsed_calls]
-                _all_reads = all(n in _READ_GROUP for n in _all_names)
-                _all_writes = all(n in _WRITE_GROUP for n in _all_names)
-                _n = len(_all_names)
-                if _all_reads and _n > 1:
-                    self._print(
-                        f"[bold green]●[/bold green] [bold]Reading {_n} files…[/bold]  "
-                        f"[dim](ctrl+o para expandir)[/dim]"
-                    )
-                elif _all_writes and _n > 1:
-                    self._print(
-                        f"[bold green]●[/bold green] [bold]Updating {_n} files…[/bold]"
-                    )
-
-            # ── Logging y contexto (siempre secuencial, en orden original) ─────
-            for idx, (_tc, name, args) in enumerate(parsed_calls):
-                result  = results_map[idx]
-                allowed = allowed_map[idx]
-                self.session.log_tool_call(name, args, result)
-                self.chatlog.log_tool_call(name, args, str(result))
-                log.debug("tool_call", tool=name, allowed=allowed,
-                          args=json.dumps(args, ensure_ascii=False)[:120])
-                # Determinar modo de display:
-                # suppress_header → batch agrupado (muestra solo ⎿ path, sin resultado)
-                # pre_shown → header ya impreso antes de ejecutar (muestra solo resultado)
-                _in_read_batch  = (_safe_parallel and not self.capture_output
-                                   and all(n in _READ_GROUP for _, n, _ in parsed_calls)
-                                   and len(parsed_calls) > 1)
-                _in_write_batch = (_safe_parallel and not self.capture_output
-                                   and all(n in _WRITE_GROUP for _, n, _ in parsed_calls)
-                                   and len(parsed_calls) > 1)
-                _is_pre_shown   = idx in _pre_shown_idxs if not _safe_parallel else False
-                self._show_tool_block(name, args, str(result), allowed,
-                                      block_mode=_block_mode,
-                                      suppress_header=_in_read_batch or _in_write_batch,
-                                      pre_shown=_is_pre_shown)
-                if self.plugins and allowed:
-                    self.plugins.fire("on_tool_result", name, args, str(result))
-                args_str = json.dumps(args, ensure_ascii=False)
-                self._last_tool_calls.append((name, args_str, str(result)))
-                # ── Checkpoint tracking ───────────────────────────────────────
-                if allowed:
-                    _WRITE_CKPT = frozenset({
-                        "write_file", "edit_file", "edit_files", "bulk_replace",
-                        "smart_replace", "regex_replace", "patch_apply",
-                    })
-                    _WRITE_SFX = ("_write_file", "_edit_file", "_edit_files")
-                    if name in _WRITE_CKPT or any(name.endswith(s) for s in _WRITE_SFX):
-                        _wp = str(args.get("path") or args.get("file_path", ""))
-                        if _wp:
-                            self._task_modified_files.add(_wp)
-                        for _wed in args.get("edits", []):
-                            if isinstance(_wed, dict) and _wed.get("path"):
-                                self._task_modified_files.add(str(_wed["path"]))
-                    elif name in ("run_tests", "test_file"):
-                        self._task_last_test = str(result)[:400]
-                result_for_ctx = self._postprocess_tool_result(name, args, str(result))
-                result_for_ctx = self._truncate_tool_result(result_for_ctx)
-                tool_call_id = getattr(tc, "id", None) or name
-                self.context.add_tool_result(tool_call_id, name, result_for_ctx)
-            # _turn_block NO se vacía aquí: los tools se acumulan entre ●●.
-            # El flush ocurre antes del siguiente ● o al salir del bucle.
-
-        # Flush final: herramientas pendientes si el bucle terminó sin nuevo ●
-        self._flush_turn_block()
-
-        # Auto-memoria: guardar resumen si fue una tarea significativa
-        self._auto_save_task_memory(full_output_parts)
-
-        # Estado final: "Finalizado" solo cuando TODAS las iteraciones y tools han terminado
-        if self._status_cb:
-            total_elapsed = time.time() - t_run_start
-            done_word  = random.choice(_DONE_WORDS)
-            ctx_s      = self.context.stats()
-            cpct       = int(ctx_s["tokens_estimate"] / max(ctx_s["max_tokens"], 1) * 100)
-            plain_bar  = _ctx_bar(ctx_s["tokens_estimate"], ctx_s["max_tokens"], 10, plain=True)
-            thresh_pct = int(getattr(self.context, "compact_threshold", 0.85) * 100)
-            hint       = _compact_hint(cpct, thresh_pct)
-            tok_part   = (f"{_fmt_tokens(total_inp)}↑ {_fmt_tokens(total_out)}↓  ·  "
-                          if (total_inp or total_out) else "")
-            line1      = f"⚙  {done_word} durante {total_elapsed:.1f}s  ✓"
-            _bstyle_f  = _bar_style(cpct, thresh_pct)
-            _chint_f   = _hint_styled(cpct, thresh_pct)
-            line2      = f"↳  {tok_part}ctx: {_sfmt(_bstyle_f, plain_bar)} {cpct}%{_chint_f}"
-            self._status_cb(f"{line1}\n{line2}")
-            self._sep_label = ""  # vuelve a mostrar el proyecto
-
-        # Marcar tareas activas/pendientes como completadas al finalizar el turno
-        _now_done = time.time()
-        for _pt in self._plan_tasks:
-            if _pt["status"] in ("active", "pending"):
-                _pt["status"] = "done"
-                if not _pt["end_ts"]:
-                    _pt["end_ts"] = _now_done
-
-        # Congelar tiempo de tarea: el elapsed queda fijo, el blink se detiene
-        self._task_elapsed = time.time() - self._task_start_time
-        self._task_start_time = None
-
-        # Usage: una sola vez al final del turno completo (se mostrará antes del próximo prompt)
-        self._show_usage(total_inp, total_out)
-
-        # Desconectar canales TUI de hooks y diff renderer
-        import tools.hooks as _hooks_mod_end
-        import tools.diff_renderer as _diff_mod_end
-        _hooks_mod_end.set_hook_print_fn(None)
-        _diff_mod_end._dprint_fn = None
-
-        self._last_response = "\n".join(full_output_parts)
-        log.debug("assistant_reply", chars=len(self._last_response))
-        if self.capture_output:
-            return self._last_response
-        return None
+        return self._turn_finish(full_output_parts, total_inp, total_out, t_run_start)

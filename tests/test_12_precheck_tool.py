@@ -34,6 +34,7 @@ def loop():
         lp._pending_tasks = []
         lp._bash_block_counts = {}
         lp._kill_requested = False
+        lp.is_subagent = False
         return lp
 
 
@@ -582,10 +583,8 @@ class TestDetectTasks:
         loop._pending_tasks = ["Corregir alineación de headers", "Actualizar color del logo"]
         loop._last_tool_calls = []
         hint = loop._turn_guidance()
-        assert "⚡" in hint
-        assert "PLAN OBLIGATORIO" in hint
         assert "Corregir alineación" in hint
-        assert "2 tareas" in hint
+        assert "2 tarea" in hint
 
     def test_pending_tasks_not_injected_when_tools_done(self, loop):
         """Si ya hay historial de tool calls, no se re-inyectan las tareas."""

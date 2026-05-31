@@ -159,31 +159,31 @@ class TestIcdPre:
         p = _py(tmp_path, "sample.py", "def f(a): pass\n")
         returned = _builtin_icd_pre("edit_file", {"path": str(p)})
         assert returned == {"path": str(p)}  # always returns args
-        assert str(p.resolve()) in _icd_snapshots
+        assert str(p.resolve()) in _icd_snapshots()
 
     def test_captures_content(self, tmp_path):
         p = _py(tmp_path, "sample.py", "def f(a, b): pass\n")
         _builtin_icd_pre("write_file", {"path": str(p)})
         key = str(p.resolve())
-        assert "def f" in _icd_snapshots[key]
+        assert "def f" in _icd_snapshots()[key]
 
     def test_ignores_non_py(self, tmp_path):
         p = tmp_path / "script.sh"
         p.write_text("echo hello")
         _builtin_icd_pre("write_file", {"path": str(p)})
-        assert str(p.resolve()) not in _icd_snapshots
+        assert str(p.resolve()) not in _icd_snapshots()
 
     def test_non_write_tool_skips(self, tmp_path):
         p = _py(tmp_path, "sample.py", "def f(): pass\n")
         _builtin_icd_pre("read_file", {"path": str(p)})
-        assert str(p.resolve()) not in _icd_snapshots
+        assert str(p.resolve()) not in _icd_snapshots()
 
     def test_does_not_overwrite_existing_snapshot(self, tmp_path):
         p = _py(tmp_path, "sample.py", "def f(a): pass\n")
         key = str(p.resolve())
-        _icd_snapshots[key] = "ORIGINAL CONTENT"
+        _icd_snapshots()[key] = "ORIGINAL CONTENT"
         _builtin_icd_pre("edit_file", {"path": str(p)})
-        assert _icd_snapshots[key] == "ORIGINAL CONTENT"
+        assert _icd_snapshots()[key] == "ORIGINAL CONTENT"
 
     def test_always_returns_args(self, tmp_path):
         """Pre-hook MUST return args (not None) or the tool gets blocked."""
@@ -204,7 +204,7 @@ class TestIcdPost:
     def test_detects_added_parameter(self, tmp_path):
         p = _py(tmp_path, "sample.py", "def greet(name): pass\n")
         key = str(p.resolve())
-        _icd_snapshots[key] = "def greet(name): pass\n"
+        _icd_snapshots()[key] = "def greet(name): pass\n"
         # Now "after" has a new param
         p.write_text("def greet(name, loud=False): pass\n")
         result = _builtin_icd_post("edit_file", {"path": str(p)}, "ok")
@@ -215,7 +215,7 @@ class TestIcdPost:
     def test_detects_removed_parameter(self, tmp_path):
         p = _py(tmp_path, "sample.py", "def f(a, b): pass\n")
         key = str(p.resolve())
-        _icd_snapshots[key] = "def f(a, b): pass\n"
+        _icd_snapshots()[key] = "def f(a, b): pass\n"
         p.write_text("def f(a): pass\n")
         result = _builtin_icd_post("edit_file", {"path": str(p)}, "ok")
         assert result is not None
@@ -224,7 +224,7 @@ class TestIcdPost:
     def test_no_change_returns_none(self, tmp_path):
         p = _py(tmp_path, "sample.py", "def f(a): pass\n")
         key = str(p.resolve())
-        _icd_snapshots[key] = "def f(a): pass\n"
+        _icd_snapshots()[key] = "def f(a): pass\n"
         p.write_text("def f(a): pass\n")  # same
         result = _builtin_icd_post("edit_file", {"path": str(p)}, "ok")
         assert result is None
@@ -232,7 +232,7 @@ class TestIcdPost:
     def test_body_change_no_sig_change_returns_none(self, tmp_path):
         p = _py(tmp_path, "sample.py", "def f(a):\n    return a\n")
         key = str(p.resolve())
-        _icd_snapshots[key] = "def f(a):\n    return a\n"
+        _icd_snapshots()[key] = "def f(a):\n    return a\n"
         p.write_text("def f(a):\n    return a * 2\n")
         result = _builtin_icd_post("edit_file", {"path": str(p)}, "ok")
         assert result is None
@@ -240,7 +240,7 @@ class TestIcdPost:
     def test_error_result_skipped(self, tmp_path):
         p = _py(tmp_path, "sample.py", "def f(a): pass\n")
         key = str(p.resolve())
-        _icd_snapshots[key] = "def f(a): pass\n"
+        _icd_snapshots()[key] = "def f(a): pass\n"
         p.write_text("def f(a, b): pass\n")
         result = _builtin_icd_post("edit_file", {"path": str(p)}, "Error: something failed")
         assert result is None
@@ -253,7 +253,7 @@ class TestIcdPost:
     def test_non_write_tool_returns_none(self, tmp_path):
         p = _py(tmp_path, "sample.py", "def f(): pass\n")
         key = str(p.resolve())
-        _icd_snapshots[key] = "def f(a): pass\n"
+        _icd_snapshots()[key] = "def f(a): pass\n"
         result = _builtin_icd_post("read_file", {"path": str(p)}, "ok")
         assert result is None
 
@@ -261,7 +261,7 @@ class TestIcdPost:
         p = _py(tmp_path, "sample.py",
                 "class Agent:\n    def run(self, msg):\n        pass\n")
         key = str(p.resolve())
-        _icd_snapshots[key] = "class Agent:\n    def run(self, msg):\n        pass\n"
+        _icd_snapshots()[key] = "class Agent:\n    def run(self, msg):\n        pass\n"
         p.write_text("class Agent:\n    def run(self, msg, stream=False):\n        pass\n")
         result = _builtin_icd_post("edit_file", {"path": str(p)}, "ok")
         assert result is not None
@@ -271,7 +271,7 @@ class TestIcdPost:
     def test_shows_before_and_after(self, tmp_path):
         p = _py(tmp_path, "sample.py", "def f(a): pass\n")
         key = str(p.resolve())
-        _icd_snapshots[key] = "def f(a): pass\n"
+        _icd_snapshots()[key] = "def f(a): pass\n"
         p.write_text("def f(a, b): pass\n")
         result = _builtin_icd_post("edit_file", {"path": str(p)}, "ok")
         assert "Antes:" in result
@@ -283,7 +283,7 @@ class TestIcdPost:
         p = _py(tmp_path, "sample.py", before)
         p.write_text(after)
         key = str(p.resolve())
-        _icd_snapshots[key] = before
+        _icd_snapshots()[key] = before
         result = _builtin_icd_post("edit_file", {"path": str(p)}, "ok")
         assert result is not None
         assert "alpha" in result
@@ -309,7 +309,7 @@ class TestIcdRegistration:
         assert callable(pre_fn) and callable(post_fn)
 
     def test_total_builtins_now_15(self):
-        assert len(_BUILTINS) == 19
+        assert len(_BUILTINS) == 22  # 19 anteriores + dead_code_detection + deadlock_detection + performance_profiling
 
     def test_not_active_by_default(self):
         from config import DEFAULT_CONFIG
@@ -389,7 +389,7 @@ class TestDocstringMonitor:
         p = _py(tmp_path, "core.py", before)
         p.write_text(after)
         key = str(p.resolve())
-        _icd_snapshots[key] = before
+        _icd_snapshots()[key] = before
         result = _builtin_icd_post("edit_file", {"path": str(p)}, "ok")
         assert result is not None
         assert "Docstring posiblemente desactualizado" in result
@@ -401,7 +401,7 @@ class TestDocstringMonitor:
         p = _py(tmp_path, "core.py", before)
         p.write_text(after)
         key = str(p.resolve())
-        _icd_snapshots[key] = before
+        _icd_snapshots()[key] = before
         result = _builtin_icd_post("edit_file", {"path": str(p)}, "ok")
         assert result is not None
         assert "Docstring posiblemente desactualizado" not in result
@@ -413,7 +413,7 @@ class TestDocstringMonitor:
         p = _py(tmp_path, "core.py", before)
         p.write_text(after)
         key = str(p.resolve())
-        _icd_snapshots[key] = before
+        _icd_snapshots()[key] = before
         result = _builtin_icd_post("edit_file", {"path": str(p)}, "ok")
         # Sig change still reported, but no docstring warning
         assert result is not None
@@ -425,7 +425,7 @@ class TestDocstringMonitor:
         p = _py(tmp_path, "core.py", before)
         p.write_text(after)
         key = str(p.resolve())
-        _icd_snapshots[key] = before
+        _icd_snapshots()[key] = before
         result = _builtin_icd_post("edit_file", {"path": str(p)}, "ok")
         assert result is not None
         assert "Docstring modificado" in result
@@ -437,7 +437,7 @@ class TestDocstringMonitor:
         p = _py(tmp_path, "core.py", before)
         p.write_text(after)
         key = str(p.resolve())
-        _icd_snapshots[key] = before
+        _icd_snapshots()[key] = before
         result = _builtin_icd_post("edit_file", {"path": str(p)}, "ok")
         # Should NOT report a signature change
         assert result is not None
@@ -449,7 +449,7 @@ class TestDocstringMonitor:
         p = _py(tmp_path, "core.py", before)
         p.write_text(after)
         key = str(p.resolve())
-        _icd_snapshots[key] = before
+        _icd_snapshots()[key] = before
         result = _builtin_icd_post("edit_file", {"path": str(p)}, "ok")
         assert result is not None
         assert "Docstring" in result
@@ -459,7 +459,7 @@ class TestDocstringMonitor:
         p = _py(tmp_path, "core.py", code)
         p.write_text(code)
         key = str(p.resolve())
-        _icd_snapshots[key] = code
+        _icd_snapshots()[key] = code
         result = _builtin_icd_post("edit_file", {"path": str(p)}, "ok")
         assert result is None
 
@@ -478,7 +478,7 @@ class TestDeletedSymbols:
         p = _py(tmp_path, "core.py", before)
         p.write_text(after)
         key = str(p.resolve())
-        _icd_snapshots[key] = before
+        _icd_snapshots()[key] = before
         result = _builtin_icd_post("edit_file", {"path": str(p)}, "ok")
         assert result is not None
         assert "Símbolo eliminado" in result
@@ -490,7 +490,7 @@ class TestDeletedSymbols:
         p = _py(tmp_path, "engine.py", before)
         p.write_text(after)
         key = str(p.resolve())
-        _icd_snapshots[key] = before
+        _icd_snapshots()[key] = before
         result = _builtin_icd_post("edit_file", {"path": str(p)}, "ok")
         assert result is not None
         assert "Símbolo eliminado" in result
@@ -502,7 +502,7 @@ class TestDeletedSymbols:
         p = _py(tmp_path, "mod.py", before)
         p.write_text(after)
         key = str(p.resolve())
-        _icd_snapshots[key] = before
+        _icd_snapshots()[key] = before
         result = _builtin_icd_post("edit_file", {"path": str(p)}, "ok")
         # _internal is private — must not be reported
         assert result is None or "Símbolo eliminado" not in result
@@ -513,7 +513,7 @@ class TestDeletedSymbols:
         p = _py(tmp_path, "api.py", before)
         p.write_text(after)
         key = str(p.resolve())
-        _icd_snapshots[key] = before
+        _icd_snapshots()[key] = before
         result = _builtin_icd_post("edit_file", {"path": str(p)}, "ok")
         assert result is not None
         assert "Era:" in result
@@ -525,7 +525,7 @@ class TestDeletedSymbols:
         p = _py(tmp_path, "mod.py", before)
         p.write_text(after)
         key = str(p.resolve())
-        _icd_snapshots[key] = before
+        _icd_snapshots()[key] = before
         result = _builtin_icd_post("edit_file", {"path": str(p)}, "ok")
         assert result is not None
         assert "alpha" in result
@@ -536,7 +536,7 @@ class TestDeletedSymbols:
         p = _py(tmp_path, "core.py", code)
         p.write_text(code)
         key = str(p.resolve())
-        _icd_snapshots[key] = code
+        _icd_snapshots()[key] = code
         result = _builtin_icd_post("edit_file", {"path": str(p)}, "ok")
         assert result is None
 
@@ -577,6 +577,6 @@ class TestActiveBuiltinNames:
 class TestResetIcdSnapshots:
     def test_clears_snapshots(self, tmp_path):
         p = _py(tmp_path, "f.py", "def f(): pass\n")
-        _icd_snapshots[str(p.resolve())] = "content"
+        _icd_snapshots()[str(p.resolve())] = "content"
         reset_icd_snapshots()
-        assert len(_icd_snapshots) == 0
+        assert len(_icd_snapshots()) == 0

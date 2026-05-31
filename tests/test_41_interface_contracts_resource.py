@@ -122,8 +122,8 @@ class TestInterfaceContractsContent:
 class TestNewResetsSnapshots:
     def test_new_calls_reset_icd_snapshots(self):
         from tools.hooks import _icd_snapshots, reset_icd_snapshots
-        _icd_snapshots["fake_path"] = "fake_content"
-        assert len(_icd_snapshots) > 0
+        _icd_snapshots()["fake_path"] = "fake_content"
+        assert len(_icd_snapshots()) > 0
 
         from ui.commands import _cmd_new
         mock_loop = MagicMock()
@@ -132,7 +132,7 @@ class TestNewResetsSnapshots:
         with patch("ui.commands.console"):
             _cmd_new(mock_loop)
 
-        assert len(_icd_snapshots) == 0
+        assert len(_icd_snapshots()) == 0
 
     def test_new_calls_reset_suite_snapshot(self):
         import tools.hooks as _hmod

@@ -4,7 +4,7 @@ Todos los comandos empiezan con `/`. Son case-insensitive. Los argumentos van se
 
 ## Sesión y contexto
 
-### `/new` `/reset`
+### `/new`
 Finaliza la sesión actual (la guarda en disco), limpia el historial y abre una sesión nueva.
 
 ### `/session [id]`
@@ -31,220 +31,195 @@ Compacta el historial cuando supera el umbral de contexto:
 - Sin `fast`: usa el LLM para generar un resumen de los mensajes eliminados
 - Con `fast`: elimina mensajes sin generar resumen (más rápido)
 
-### `/resume`
-Resume el contexto actual con el LLM y limpia el historial, manteniendo solo el resumen como memoria de la sesión.
-
 ### `/checkpoint`
 Guarda un checkpoint manual del contexto actual en el log diario del workspace.
-
-### `/branch [subcmd]`
-Gestión de ramas de conversación (snapshots):
-```
-/branch save <nombre>   # guarda el estado actual de la conversación
-/branch load <nombre>   # restaura un snapshot guardado
-/branch list            # lista todas las ramas disponibles
-/branch rm <nombre>     # elimina una rama
-```
 
 ### `/clear`
 Borra el historial de conversación manteniendo el resumen acumulado.
 
-### `/usage [modo]`
-Controla la visualización del uso de tokens:
-- `off` — no muestra uso
-- `tokens` — muestra tokens de entrada/salida por turno (defecto)
-- `full` — muestra también totales de sesión y porcentaje de contexto
-
 ### `/copy [n]`
-Copia la última respuesta del asistente al portapapeles. Con `n`, copia la enésima respuesta anterior. Usa `wl-copy` (Wayland), `xclip`, `xsel`, `pbcopy` (macOS) o `pyperclip` como fallback.
+Copia la última respuesta del asistente al portapapeles. Con `n`, copia la enésima respuesta anterior.
 
 ### `/btw <pregunta>`
-Realiza una pregunta rápida sin interrumpir el contexto principal. El contexto actual se guarda, se abre un contexto nuevo para la pregunta, y al terminar se restaura el original.
-
----
-
-## Memoria
-
-### `/mem list`
-Lista todas las memorias guardadas con nombre, fecha y tamaño.
-
-### `/mem search <query>`
-Búsqueda semántica en las memorias usando embeddings. Devuelve los fragmentos más relevantes.
-
-### `/mem show <nombre>`
-Muestra el contenido completo de una memoria específica.
-
-### `/mem save <nombre>`
-Guarda el siguiente mensaje del usuario como una memoria con ese nombre.
-
-### `/mem rm <nombre>`
-Elimina una memoria permanentemente (pide confirmación).
-
-### `/mem rebuild`
-Recalcula los embeddings de todas las memorias (útil tras cambiar el modelo de embeddings).
-
-### `/mem clear`
-Elimina TODAS las memorias (pide confirmación explícita).
-
----
-
-## Tareas y planificación
-
-### `/tasks [subcmd]`
-```
-/tasks                         # lista todas las tareas
-/tasks list [todo|wip|done]    # filtra por estado
-/tasks add <título>            # nueva tarea en estado "todo"
-/tasks wip <id>                # marca como "en progreso"
-/tasks done <id>               # marca como completada
-/tasks rm <id>                 # elimina la tarea
-/tasks clear                   # elimina todas las "done"
-```
-
-Estados: `○ todo` → `◐ wip` → `● done`
-
-Los IDs son los primeros 8 caracteres del UUID. Se puede usar un prefijo único.
-
-### `/schedule [subcmd]`
-```
-/schedule                         # lista jobs
-/schedule add <min> <comando>     # nuevo job cada N minutos
-/schedule run <id>                # ejecuta un job manualmente
-/schedule toggle <id>             # activa/desactiva
-/schedule rm <id>                 # elimina
-```
-
-Los jobs se ejecutan con `bash` cuando el usuario interactúa y ha pasado el intervalo.
-
----
-
-## Extensiones
-
-### `/skills [subcmd]`
-```
-/skills                      # lista skills (nombre, estado, herramientas)
-/skills list
-/skills create <nombre>      # crea plantilla en ~/.oocode/skills/
-/skills enable <nombre>      # activa y guarda en oocode.json
-/skills disable <nombre>     # desactiva y guarda en oocode.json
-```
-
-Ver `doc/08_skills.md` para detalles de desarrollo.
-
-### `/plugins [subcmd]`
-```
-/plugins                     # lista plugins
-/plugins list
-/plugins create <nombre>     # crea plantilla en ~/.oocode/plugins/
-/plugins enable <nombre>     # activa, carga herramientas, guarda en oocode.json
-/plugins disable <nombre>    # desactiva y guarda en oocode.json
-/plugins reload              # recarga todos los plugins activos
-```
-
-Ver `doc/07_plugins.md` para detalles de desarrollo.
-
-### `/add-dir [ruta]`
-```
-/add-dir                     # lista directorios adicionales activos
-/add-dir /ruta/al/proyecto   # añade directorio al contexto de trabajo
-/add-dir rm /ruta            # elimina directorio
-```
-
-Los directorios adicionales se inyectan en el system prompt para que el agente los tenga en cuenta.
-
----
-
-## Modos de respuesta
-
-### `/think <nivel>`
-Ajusta la profundidad de razonamiento:
-- `off` — respuesta directa (defecto)
-- `minimal` — conciso y directo
-- `low` — paso a paso
-- `medium` — considera múltiples enfoques
-- `high` — razonamiento exhaustivo con casos extremos
-
-### `/reasoning <on|off>`
-Activa/desactiva la cadena de razonamiento explícita (chain-of-thought).
-
-### `/fast <on|off>`
-Modo rápido: cambia temporalmente a un modelo más ligero definido en la configuración.
-
-### `/verbose <on|off>`
-Muestra los argumentos completos y resultados de cada llamada a herramienta.
-
-### `/trace <on|off>`
-Muestra información del system prompt y estadísticas de contexto en cada turno.
-
----
-
-## Color y temas
-
-### `/color`
-Sin argumentos: aplica un color **aleatorio** del repertorio disponible.
-
-### `/color list`
-Lista todos los temas disponibles: predefinidos (builtin) y guardados por el usuario.
-
-### `/color <nombre>`
-Aplica un tema predefinido o guardado por nombre:
-- `neon` (cyan), `forest` (green), `ocean` (blue), `sakura` (magenta)
-- `sand` (yellow), `sunset` (red), `snow` (white)
-
-También acepta colores base directamente: `cyan`, `green`, `blue`, `magenta`, `yellow`, `red`, `white`.
-
-### `/color save <nombre>`
-Guarda el esquema de color actual con un nombre en `~/.oocode/themes.json`.
-
-### `/color rm <nombre>`
-Elimina un tema guardado por el usuario (los predefinidos no se pueden eliminar).
-
----
-
-## Permisos y activación
-
-### `/elevated [modo]`
-Nivel de permisos global:
-- `off` — solo lectura (bash, write_file, edit_file denegados)
-- `on` — permisos estándar con confirmación
-- `ask` — todo requiere confirmación (defecto)
-- `full` — todo automático sin confirmación
-
-### `/activation <modo>`
-- `always` — el agente responde a todo (defecto)
-- `mention` — solo responde si el mensaje empieza con el nombre del agente
+Realiza una pregunta rápida sin interrumpir el contexto principal.
 
 ---
 
 ## Agentes y modelos
+
+### `/switch <agent_id>`
+Cambia el agente activo en caliente (sin reiniciar). Carga el workspace, la memoria y la identidad del agente seleccionado.
+
+```
+/switch coding        # cambiar al agente de programación
+/switch home_office   # cambiar al agente de ofimática
+/switch reasoning     # cambiar al agente de razonamiento
+/switch webcrawler    # cambiar al agente de búsqueda web
+/switch main          # volver al agente principal
+```
+
+### `/agents`
+Lista todos los agentes configurados con su ID, nombre, emoji, modelo y workspace.
 
 ### `/model [nombre]`
 Sin argumento: muestra el modelo activo.  
 Con nombre: cambia el modelo y lo guarda en `oocode.json`.
 
 ### `/models`
-Lista todos los modelos disponibles en el servidor Ollama con tamaño y detalles. Permite seleccionar uno interactivamente.
-
-### `/workspace [ruta]`
-Sin argumento: muestra el workspace activo.  
-Con ruta: cambia el workspace del agente.
+Lista todos los modelos disponibles en el servidor Ollama. Permite seleccionar uno interactivamente.
 
 ### `/spawn <id> <tarea>`
-Lanza un subagente con el ID especificado para ejecutar una tarea en un contexto aislado (workspace propio, historial independiente).
+Lanza un subagente con el ID especificado para ejecutar una tarea en contexto aislado.
 
-**Restricción de VRAM:** el sub-agente siempre usa el mismo modelo de inferencia y el mismo modelo de embeddings que el agente principal. Esto garantiza que solo un LLM esté cargado en GPU a la vez (junto con el modelo de embeddings nomic). El sub-agente comparte el `EmbeddingClient` del padre; no abre conexiones adicionales.
+```
+/spawn coding "analiza src/main.py y sugiere refactorizaciones"
+/spawn home_office "crea un informe de estado del proyecto en DOCX"
+```
 
-La ejecución es **síncrona**: el agente principal espera el resultado del sub-agente antes de continuar. No hay paralelismo de modelos.
+### `/subagents`
+Lista subagentes activos y recientes (últimos 30 minutos):
+
+```
+/subagents                          # listar todos
+/subagents status [id]              # estado detallado
+/subagents steer <id> <instrucción> # inyectar nueva instrucción
+/subagents kill <id>                # detener subagente
+/subagents kill all                 # detener todos
+/subagents output <id>              # mostrar resultado completo
+```
 
 ---
 
-## Sistema
+## MCP, LSP y RAG
 
-### `/status`
-Estado general del agente: ID, modelo, contexto, flags activos, sesión.
+### `/mcp`
+Estado de todos los servidores MCP conectados: nombre, herramientas activas, prompts y recursos.
 
-### `/gateway-status`
-Estado del servidor Ollama: conectividad, modelos disponibles, modelo de embeddings.
+```
+/mcp                    # estado de todos los servidores
+/mcp reload <nombre>    # recargar servidor
+/mcp restart <nombre>   # reiniciar servidor
+```
+
+### `/lsp [subcmd]`
+Gestión de servidores LSP por extensión de fichero:
+
+```
+/lsp                    # estado de todos los servidores LSP activos
+/lsp start <ext>        # arrancar servidor LSP para extensión (ej: .py, .ts)
+/lsp stop <ext>         # parar servidor LSP
+/lsp restart <ext>      # reiniciar servidor LSP
+/lsp status             # diagnóstico completo de servidores LSP
+```
+
+### `/rag [subcmd]`
+Control del índice RAG (búsqueda semántica en el workspace):
+
+```
+/rag                    # estado del índice y configuración
+/rag enable             # activar RAG
+/rag disable            # desactivar RAG
+/rag reindex            # re-indexar workspace con progreso
+```
+
+---
+
+## Hooks
+
+### `/hooks`
+Muestra los hooks activos en el sistema (built-in y de OOCODE.md).
+
+### `/hooks list`
+Lista completa de todos los hooks built-in disponibles con descripción.
+
+### `/hooks builtin <nombre>`
+Activa o desactiva un hook built-in (toggle):
+
+```
+/hooks builtin lint_after_write
+/hooks builtin backup_before_write
+/hooks builtin test_after_write
+/hooks builtin interface_change_detector
+/hooks builtin git_push_guard
+/hooks builtin security_audit_log
+```
+
+---
+
+## Herramientas de código
+
+### `/diff [fichero]`
+Historial de diffs visuales de la sesión actual:
+
+```
+/diff              # lista ficheros editados con +añadidas/-eliminadas
+/diff parser.py    # diff completo de ficheros con ese nombre
+```
+
+### `/symbols [arg]`
+Navegación de símbolos del proyecto:
+
+```
+/symbols                # genera/actualiza índice del workspace
+/symbols main.py        # lista funciones/clases del fichero
+/symbols NombreClase    # busca símbolo por nombre
+```
+
+### `/lint [ruta]`
+Linting manual (el linting automático ocurre tras cada edición con el hook `lint_after_write`):
+
+```
+/lint              # linting del workspace completo
+/lint src/main.py  # linting de un fichero concreto
+```
+
+### `/todo [subcmd]`
+Gestión de TODOs y FIXMEs del código:
+
+```
+/todo              # muestra todos los TODOs del proyecto
+/todo add <texto>  # añade nuevo TODO
+/todo done <id>    # marca TODO como resuelto
+/todo sync         # sincroniza con el código fuente
+```
+
+### `/clip <texto>`
+Copia texto al portapapeles del sistema.
+
+---
+
+## WebUI y servidor
+
+### `/webserver start|stop|restart|status`
+Control del daemon WebUI (Flask + SSE en puerto 4000):
+
+```
+/webserver start    # arrancar WebUI en background
+/webserver stop     # parar WebUI
+/webserver restart  # reiniciar WebUI
+/webserver status   # estado del daemon
+```
+
+---
+
+## Sistema y diagnóstico
+
+### `/doctor`
+Diagnóstico completo del sistema:
+- Conectividad con Ollama y versión
+- Disponibilidad del modelo configurado y el de embeddings
+- SearXNG (si configurado)
+- Ficheros de configuración y workspaces
+- Plugins y skills cargados
+- Dependencias Python instaladas
+- LSP servers y agentes disponibles
+- Hooks activos
+
+### `/init [ruta]`
+Genera un fichero `OOCODE.md` en el workspace o en la ruta especificada, analizando el proyecto con el LLM.
+
+### `/steer`
+Inyecta instrucciones al agente en el turno actual, redirigiendo su comportamiento sin perder el contexto.
 
 ### `/config`
 Muestra la configuración completa en tablas por sección.
@@ -252,53 +227,111 @@ Muestra la configuración completa en tablas por sección.
 ### `/config edit`
 Panel interactivo para editar la configuración sección por sección. Los cambios se guardan en `oocode.json`.
 
-### `/doctor`
-Diagnóstico completo del sistema:
-- Conectividad con Ollama
-- Disponibilidad del modelo configurado y el de embeddings
-- Conectividad con SearXNG (si configurado)
-- Ficheros de configuración
-- Plugins y skills cargados
-- Dependencias Python instaladas
-
 ### `/logs [n]`
-Muestra las últimas `n` líneas del fichero de log (defecto: 40). Las líneas se colorean por nivel: rojo para errores, amarillo para warnings, gris para debug.
+Muestra las últimas `n` líneas del fichero de log (defecto: 40).
 
-### `/init [ruta]`
-Genera un fichero `OOCODE.md` en el workspace o en la ruta especificada, analizando el proyecto con el LLM.
+---
 
-### `/diff [fichero]`
-Historial de diffs visuales de la sesión actual. Los diffs se generan automáticamente tras cada `edit_file`/`write_file` vía el builtin hook `diff_after_write`.
+## Memoria
+
+### `/mem list`
+Lista todas las memorias guardadas.
+
+### `/mem search <query>`
+Búsqueda semántica en las memorias usando embeddings.
+
+### `/mem show <nombre>`
+Muestra el contenido completo de una memoria específica.
+
+### `/mem save <nombre>`
+Guarda el siguiente mensaje del usuario como una memoria.
+
+### `/mem rm <nombre>`
+Elimina una memoria permanentemente.
+
+### `/mem rebuild`
+Recalcula los embeddings de todas las memorias.
+
+---
+
+## Extensiones (plugins y skills)
+
+### `/plugins [subcmd]`
+
 ```
-/diff            # lista ficheros editados con +añadidas/-eliminadas
-/diff parser.py  # diff completo de ficheros cuyo nombre contenga "parser.py"
+/plugins                     # lista plugins
+/plugins enable <nombre>     # activa y carga herramientas
+/plugins disable <nombre>    # desactiva
+/plugins reload              # recarga todos los plugins activos
+/plugins create <nombre>     # crea plantilla de plugin nuevo
 ```
 
-### `/symbols [arg]`
-Navegación de símbolos usando universal-ctags (indexación automática vía `ctags_after_write`):
-```
-/symbols                # genera/actualiza índice del workspace
-/symbols mi_fichero.py  # lista funciones/clases/métodos del fichero
-/symbols NombreClase    # busca símbolo por nombre en el proyecto
-```
+### `/skills [subcmd]`
 
-### `/lint [ruta]`
-Linting manual sobre un fichero o directorio (el linting automático ya ocurre tras cada edición):
 ```
-/lint              # linting del workspace completo (ruff, mypy, shellcheck)
-/lint src/main.py  # linting de un fichero concreto
+/skills                      # lista skills
+/skills enable <nombre>      # activa
+/skills disable <nombre>     # desactiva
+/skills create <nombre>      # crea plantilla de skill nuevo
 ```
 
-Las herramientas git completas (`git_status`, `git_diff`, `git_log`, `git_add`, `git_commit`, `git_push`, `git_pull`, `git_branch`, `git_stash`, `git_patch`, `git_clone`, `git_worktree`) están disponibles directamente como tools del agente vía MCP. Ver `doc/13_git_plugin.md`.
+---
 
-### `/review`
-Ejecuta `git diff` y pide al agente que revise los cambios actuales.
+## Color y apariencia
 
-### `/help`
-Muestra la ayuda completa con todos los comandos agrupados por categoría.
+### `/color [nombre|list|save|rm]`
 
-### `/commands`
-Lista compacta de todos los comandos sin descripciones.
+```
+/color              # aplica un color aleatorio
+/color list         # lista temas disponibles
+/color cyan         # aplica color base directamente
+/color neon         # tema predefinido (neon=cyan, forest=green, ocean=blue…)
+/color save <nombre># guarda el esquema actual
+/color rm <nombre>  # elimina un tema guardado
+```
 
-### `/exit` `/quit` `/q`
-Sale de OOCode guardando la sesión actual.
+---
+
+## Resumen de todos los comandos
+
+| Comando | Descripción |
+|---------|-------------|
+| `/new` | Nueva sesión |
+| `/switch <id>` | Cambiar agente |
+| `/agents` | Listar agentes |
+| `/session [id]` | Sesión activa / restaurar |
+| `/sessions` | Historial de sesiones |
+| `/context` | Estado del contexto |
+| `/ctx [mini|full]` | Modo de contexto |
+| `/compact` | Compactar contexto |
+| `/checkpoint` | Guardar checkpoint |
+| `/clear` | Limpiar historial |
+| `/copy [n]` | Copiar respuesta |
+| `/model [nombre]` | Ver / cambiar modelo |
+| `/models` | Seleccionar modelo |
+| `/spawn <id> <tarea>` | Lanzar subagente |
+| `/subagents` | Control de subagentes |
+| `/mcp` | Estado de servidores MCP |
+| `/lsp [subcmd]` | Gestión LSP |
+| `/rag [subcmd]` | Control RAG |
+| `/hooks` | Hooks activos |
+| `/hooks list` | Lista de hooks |
+| `/hooks builtin <nombre>` | Activar/desactivar hook |
+| `/diff [fichero]` | Historial de diffs |
+| `/symbols [arg]` | Símbolos del proyecto |
+| `/lint [ruta]` | Linting manual |
+| `/todo [subcmd]` | Gestión de TODOs |
+| `/clip <texto>` | Copiar al portapapeles |
+| `/webserver start|stop|status` | Control WebUI |
+| `/doctor` | Diagnóstico del sistema |
+| `/init [ruta]` | Generar OOCODE.md |
+| `/steer` | Inyectar instrucciones |
+| `/config [edit]` | Ver / editar config |
+| `/logs [n]` | Últimas líneas del log |
+| `/mem [subcmd]` | Gestión de memorias |
+| `/plugins [subcmd]` | Gestión de plugins |
+| `/skills [subcmd]` | Gestión de skills |
+| `/color [subcmd]` | Tema de color |
+| `/btw <pregunta>` | Pregunta rápida |
+| `/help` | Ayuda completa |
+| `/exit` | Salir de OOCode |

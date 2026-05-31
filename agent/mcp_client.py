@@ -11,6 +11,7 @@ Soporte de reconexión automática si el servidor muere durante una llamada.
 import json
 import os
 import queue
+import signal
 import subprocess
 import threading
 import time
@@ -18,8 +19,28 @@ from typing import Any, Optional
 
 import agent.logger as log
 
-_PROTOCOL_VERSION = "2024-11-05"
-_DEFAULT_TIMEOUT  = 15.0
+_PROTOCOL_VERSION  = "2024-11-05"
+_DEFAULT_TIMEOUT   = 15.0
+_STDERR_HINT_MAX   = 200   # chars de stderr mostrados en el error de inicialización MCP
+
+
+def _kill_proc_group(proc: subprocess.Popen, sig: int) -> None:
+    """Envía señal al process group completo creado con start_new_session=True.
+
+    Usar killpg en lugar de terminate()/kill() evita procesos huérfanos cuando
+    el servidor MCP lanza hijos propios (p.ej. shells, linters, compiladores).
+    Si getpgid/killpg falla (proceso ya muerto, sin permisos), señaliza solo
+    el padre como fallback.
+    """
+    try:
+        pgid = os.getpgid(proc.pid)
+        os.killpg(pgid, sig)
+    except (ProcessLookupError, PermissionError, OSError):
+        # Proceso ya muerto o sin acceso al pgid — señal directa al padre
+        try:
+            proc.send_signal(sig)
+        except (ProcessLookupError, OSError):
+            pass
 
 
 class McpError(Exception):
@@ -92,14 +113,15 @@ class McpClient:
         self._started = False
         self._dead    = True
         self._msg_queue.put(None)   # desbloquear _request en espera
+        proc = self._proc
         try:
-            self._proc.terminate()
-            self._proc.wait(timeout=3)
-        except Exception:
-            try:
-                self._proc.kill()
-            except Exception:
-                pass
+            _kill_proc_group(proc, signal.SIGTERM)
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            log.debug("mcp_sigterm_timeout", server=self.name)
+            _kill_proc_group(proc, signal.SIGKILL)
+        except Exception as e:
+            log.debug("mcp_terminate_error", server=self.name, error=str(e))
         log.debug("mcp_stopped", server=self.name)
 
     @property
@@ -137,8 +159,8 @@ class McpClient:
                     ).start()
                     continue
                 self._msg_queue.put(msg)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("mcp_reader_error", server=self.name, error=str(e))
         finally:
             # Solo marcar dead si somos el reader de la generación actual
             if self._gen == my_gen:
@@ -213,7 +235,7 @@ class McpClient:
                     # read1 lee lo disponible sin bloquear (buffered IO)
                     chunk = self._proc.stderr.read1(2048)  # type: ignore[attr-defined]
                     if chunk:
-                        stderr_hint = chunk.decode(errors="replace")[:200].strip()
+                        stderr_hint = chunk.decode(errors="replace")[:_STDERR_HINT_MAX].strip()
                 except (AttributeError, Exception):
                     pass
             self._error = f"no respondió al initialize{': ' + stderr_hint if stderr_hint else ''}"
@@ -262,8 +284,8 @@ class McpClient:
         """Re-solicita tools/list al servidor. Devuelve el nuevo conteo."""
         try:
             self._tools = self._list_tools()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("mcp_reload_tools_error", server=self.name, error=str(e))
         return len(self._tools)
 
     def _try_restart(self) -> bool:
@@ -275,13 +297,13 @@ class McpClient:
         self._msg_queue.put(None)   # desbloquear cualquier _request en espera
         if old_proc is not None:
             try:
-                old_proc.terminate()
+                _kill_proc_group(old_proc, signal.SIGTERM)
                 old_proc.wait(timeout=3)
-            except Exception:
-                try:
-                    old_proc.kill()
-                except Exception:
-                    pass
+            except subprocess.TimeoutExpired:
+                log.debug("mcp_restart_sigterm_timeout", server=self.name)
+                _kill_proc_group(old_proc, signal.SIGKILL)
+            except Exception as e:
+                log.debug("mcp_restart_terminate_error", server=self.name, error=str(e))
         self._dead      = False
         self._error     = ""
         self._msg_queue = queue.Queue()
@@ -443,8 +465,8 @@ class McpPool:
             # Muerto → reemplazar
             try:
                 c.stop()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("mcp_stop_dead_error", server=name, error=str(e))
 
         client = McpClient(name, cmd, env=env, cwd=cwd,
                            request_timeout=self._timeout,
@@ -485,8 +507,8 @@ class McpPool:
         cwd = client._cwd
         try:
             client.stop()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("mcp_stop_before_restart_error", server=name, error=str(e))
         del self._clients[name]
         return self.start_server(name, cmd, env=env, cwd=cwd)
 
@@ -650,8 +672,8 @@ class McpPool:
         for client in self._clients.values():
             try:
                 client.stop()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("mcp_stop_all_error", server=client.name, error=str(e))
         self._clients.clear()
 
     def status(self) -> list[dict]:

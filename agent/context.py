@@ -4,72 +4,19 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-# Configuración de prompt caching
-from config import DEFAULT_CONFIG as CONFIG
+import agent.logger as log
 
-# Cargar desde configuración con valores por defecto
-_CHARS_PER_TOKEN = CONFIG.get("chars_per_token", 3.0)
-_PROMPT_CACHE_DIR = CONFIG.get("cache_dir", "~/.oocode/cache")
-_CACHE_TTL = CONFIG.get("cache_ttl", 300)
-_PROMPT_CACHE_ENABLED = CONFIG.get("prompt_cache_enabled", True)
-_CONTEXT_WINDOW_CONFIGURABLE = CONFIG.get("context_window_configurable", True)
-_CONTEXT_WINDOW_DEFAULT = CONFIG.get("context_window_default", 262144)
-_CONTEXT_WINDOW_MIN = CONFIG.get("context_window_min", 8192)
-_CONTEXT_WINDOW_MAX = CONFIG.get("context_window_max", 262144)
-
-
-def _cache_key(msg: dict) -> str:
-    """Genera una clave única para un prompt."""
-    content = msg.get("content", "")
-    return f"{msg.get('role', '')}:{content[:100]}..."[:200]
-
-
-def _load_cached_prompt(key: str, msg: dict) -> Optional[str]:
-    """Carga un prompt cacheado."""
-    try:
-        import hashlib
-        from pathlib import Path
-        
-        content = msg.get("content", "")
-        cache_dir = Path(_PROMPT_CACHE_DIR)
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Hash del contenido para evitar colisiones
-        content_hash = hashlib.md5(content.encode()).hexdigest()[:16]
-        path = cache_dir / f"{key}_{content_hash}.txt"
-        
-        if path.exists():
-            mtime = path.stat().st_mtime
-            now = time.time()
-            if now - mtime < _CACHE_TTL:
-                return path.read_text()
-    except Exception:
-        pass
-    return None
-
-
-def _save_cached_prompt(key: str, content: str) -> None:
-    """Guarda un prompt en caché."""
-    try:
-        import hashlib
-        from pathlib import Path
-        
-        cache_dir = Path(_PROMPT_CACHE_DIR)
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        
-        content_hash = hashlib.md5(content.encode()).hexdigest()[:16]
-        path = cache_dir / f"{key}_{content_hash}.txt"
-        path.write_text(content)
-    except Exception:
-        pass
+_CHARS_PER_TOKEN = 3.0  # estimación conservadora: ~3 chars/token para Llama/Qwen
 
 
 @dataclass
 class ConversationContext:
     max_tokens:        int   = 8000
-    min_keep:          int   = 12     # mensajes mínimos a conservar (aumentado de 6)
-    compact_threshold: float = 0.80   # fracción del límite para auto-compact (bajado de 0.85)
-    max_summary_chars: int   = 4000   # chars máximos del resumen acumulado (aumentado de 2100)
+    min_keep:          int   = 6
+    compact_threshold: float = 0.85   # fracción de max_tokens para auto-compact; siempre sobreescrito por config.compact_threshold
+    max_summary_chars: int   = 2100
+    high_water:        float = 0.70   # fracción para truncar tool results en 2ª pasada
+    tool_max_chars:    int   = 3000   # chars máx. por tool result en 2ª pasada
 
     messages: list[dict] = field(default_factory=list)
     summary:  str        = ""        # resumen de msgs compactados, inyectado en el prompt
@@ -184,17 +131,16 @@ class ConversationContext:
                             + "\n…[resumen intermedio omitido]…\n"
                             + self.summary[-half:]
                         )
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("context_compact_error", error=str(e))
 
-        # Segunda pasada: si el contexto sigue muy lleno (>70%) tras soltar los mensajes antiguos,
-        # truncar resultados de tools muy largos en los mensajes conservados. Esto libera espacio
-        # cuando los ficheros leídos/escritos más recientes dominan el contexto.
-        _high_water = int(self.max_tokens * 0.70)
+        # Segunda pasada: si el contexto sigue muy lleno (>high_water) tras soltar mensajes,
+        # truncar resultados de tools largos en los mensajes conservados.
+        _high_water = int(self.max_tokens * self.high_water)
         if self.token_estimate() > _high_water:
-            _MAX_TOOL_CHARS = 3000   # conservar los primeros 2500 + marcador + últimos 300
-            _KEEP_HEAD = 2500
-            _KEEP_TAIL = 300
+            _MAX_TOOL_CHARS = self.tool_max_chars
+            _KEEP_HEAD = max(0, _MAX_TOOL_CHARS - 500)
+            _KEEP_TAIL = min(300, _MAX_TOOL_CHARS // 10)
             for msg in self.messages:
                 if msg.get("role") != "tool":
                     continue
@@ -210,14 +156,6 @@ class ConversationContext:
             self._invalidate_token_cache()
 
         return dropped
-
-    def maybe_compact(
-        self, summarize_fn: Optional[Callable[[list[dict]], str]] = None
-    ) -> list[dict]:
-        """Compacta si se supera el umbral. Devuelve mensajes eliminados."""
-        if self.should_compact():
-            return self.compact(summarize_fn)
-        return []
 
     def get_messages(self, system: Optional[str] = None) -> list[dict]:
         result: list[dict] = []

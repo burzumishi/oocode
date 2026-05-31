@@ -6017,6 +6017,63 @@ _PROMPTS = {
             {"name": "lang",   "description": "Idioma del mensaje: 'es' | 'en' (default: en)",                     "required": False},
         ],
     },
+    # ── Ejecución multi-agente ────────────────────────────────────────────────
+    "multi_agent_plan": {
+        "description": (
+            "Diseña la estrategia óptima para ejecutar múltiples tareas: plan secuencial con plan_create+task_done, "
+            "subagentes paralelos con spawn_subagent, exploración previa con explore, o una combinación de las tres. "
+            "Analiza dependencias, independencia y complejidad para recomendar la estrategia más eficiente."
+        ),
+        "arguments": [
+            {"name": "tasks",    "description": "Lista de tareas a ejecutar (texto libre o JSON array)",           "required": True},
+            {"name": "context",  "description": "Contexto del proyecto, restricciones de recursos o plazos",      "required": False},
+            {"name": "mode",     "description": "Preferencia: sequential | parallel | team | auto (default: auto)", "required": False},
+            {"name": "agents",   "description": "IDs de agentes disponibles para subagentes (comma-separated)",   "required": False},
+        ],
+    },
+    "parallel_tasks": {
+        "description": (
+            "Estrategia para ejecutar tareas independientes en paralelo con spawn_subagent. "
+            "Identifica qué tareas no tienen dependencias entre sí, las lanza como subagentes concurrentes "
+            "y recoge sus resultados. Respeta el límite de subagents_max_concurrent (default: 4)."
+        ),
+        "arguments": [
+            {"name": "tasks",           "description": "Tareas independientes a ejecutar en paralelo (JSON array o texto)", "required": True},
+            {"name": "agent_id",        "description": "ID del agente para todos los subagentes (default: agente actual)",  "required": False},
+            {"name": "max_concurrent",  "description": "Máx. subagentes simultáneos permitidos (default: 4)",               "required": False},
+            {"name": "on_error",        "description": "Comportamiento al fallar un subagente: continue | abort | retry",   "required": False},
+        ],
+    },
+    "task_queue_strategy": {
+        "description": (
+            "Analiza una lista de tareas y define la estrategia de cola óptima: "
+            "cuáles son estrictamente secuenciales (plan_create), cuáles son independientes (spawn_subagent paralelo), "
+            "cuáles requieren exploración previa (explore antes de editar) y cuáles tienen prioridad alta. "
+            "Produce un plan ejecutable con dependencias y orden de ejecución."
+        ),
+        "arguments": [
+            {"name": "tasks",             "description": "Lista de tareas con descripción",                                      "required": True},
+            {"name": "dependencies",      "description": "Dependencias conocidas entre tareas (JSON o texto libre)",             "required": False},
+            {"name": "priority_criteria", "description": "Criterios de prioridad: urgency | impact | complexity | dependencies", "required": False},
+            {"name": "context",           "description": "Contexto del proyecto para estimar complejidad",                       "required": False},
+        ],
+    },
+    "spawn_agent_team": {
+        "description": (
+            "Diseña y lanza un equipo de subagentes especializados para un proyecto complejo. "
+            "Descompone el trabajo por dominios (análisis, implementación, tests, revisión, docs), "
+            "asigna un agente específico a cada dominio y define el protocolo de coordinación. "
+            "Usa spawn_subagent secuencialmente cuando hay dependencias entre fases, "
+            "o en paralelo cuando los dominios son independientes."
+        ),
+        "arguments": [
+            {"name": "project",       "description": "Descripción completa del proyecto a ejecutar en equipo",     "required": True},
+            {"name": "team_size",     "description": "Número de agentes en el equipo (default: 3, max: 5)",        "required": False},
+            {"name": "agents",        "description": "IDs de agentes disponibles (default: todos los configurados)","required": False},
+            {"name": "coordination",  "description": "Modelo: pipeline (secuencial) | parallel (simultáneo) | master_worker", "required": False},
+            {"name": "context",       "description": "Código, documentos o recursos disponibles para el equipo",   "required": False},
+        ],
+    },
 }
 
 
@@ -7074,6 +7131,197 @@ def _get_prompt(name: str, arguments: dict) -> list[dict]:
             "```\n<asunto>\n\n<cuerpo opcional: qué cambia y por qué, no el cómo>\n```\n\n"
             "Si hay cambios en múltiples áreas, usa el scope del componente principal. "
             "No incluyas números de issue salvo que el historial del proyecto lo haga siempre."
+        )}}]
+
+    # ── Ejecución multi-agente ────────────────────────────────────────────────
+
+    elif name == "multi_agent_plan":
+        tasks   = arguments.get("tasks", "")
+        context = arguments.get("context", "")
+        mode    = arguments.get("mode", "auto")
+        agents  = arguments.get("agents", "")
+        ctx_str = f"\n\nCONTEXTO DEL PROYECTO:\n{context}" if context else ""
+        agents_str = f"\nAgentes disponibles: {agents}" if agents else ""
+        return [{"role": "user", "content": {"type": "text", "text": (
+            f"Analiza las siguientes tareas y diseña la estrategia de ejecución óptima.{agents_str}{ctx_str}\n\n"
+            f"TAREAS A EJECUTAR:\n{tasks}\n\n"
+            "## ÁRBOL DE DECISIÓN — elige la estrategia:\n\n"
+            "### 1. `plan_create` + `task_done` — plan secuencial (1 agente)\n"
+            "  CUÁNDO: tareas con dependencias estrictas, orden importa, mismo contexto, ≥3 pasos.\n"
+            "  CÓMO: `plan_create(tasks=[...])` → ejecutar cada tarea → `task_done()` tras cada una.\n"
+            "  LÍMITE: 1 hilo, sin paralelismo. Ideal para: refactorizaciones, migraciones, bugs.\n\n"
+            "### 2. `spawn_subagent` en paralelo — subagentes concurrentes (N agentes)\n"
+            "  CUÁNDO: tareas completamente independientes (no comparten estado, no se bloquean).\n"
+            "  CÓMO: lanzar `spawn_subagent(agent_id, task)` para cada tarea. Recoger resultados.\n"
+            "  LÍMITE: subagents_max_concurrent=4. Cada subagente tiene contexto aislado.\n"
+            "  Ideal para: generar documentos independientes, analizar módulos separados, tests.\n\n"
+            "### 3. `explore` + plan secuencial — exploración previa\n"
+            "  CUÁNDO: tareas de modificación en código desconocido. NO si ya leíste los ficheros.\n"
+            "  CÓMO: `explore(task='mapea arquitectura X')` → analizar resultado → `plan_create` → implementar.\n"
+            "  Ideal para: bugs en código no familiar, refactors amplios, proyectos nuevos.\n\n"
+            "### 4. Pipeline multi-agente — equipo con fases\n"
+            "  CUÁNDO: proyecto grande con fases independientes (análisis → impl → tests → docs).\n"
+            "  CÓMO: spawn_subagent secuencial por fase, pasando el output de cada fase como input.\n"
+            "  Ideal para: features completas, proyectos con múltiples dominios especializados.\n\n"
+            "## TU ANÁLISIS:\n\n"
+            "Para cada tarea identifica:\n"
+            "- **Dependencias**: ¿requiere output de otra tarea? ¿modifica los mismos ficheros?\n"
+            "- **Aislamiento**: ¿puede ejecutarse en contexto independiente?\n"
+            "- **Complejidad**: ¿es exploratoria o de implementación directa?\n"
+            "- **Prioridad**: ¿hay alguna tarea que desbloquea a las demás?\n\n"
+            f"## ESTRATEGIA RECOMENDADA{' (modo: ' + mode + ')' if mode != 'auto' else ''}:\n\n"
+            "Devuelve:\n"
+            "1. La estrategia elegida y justificación\n"
+            "2. El orden/agrupación exacta de las tareas\n"
+            "3. Las llamadas a tools en pseudocódigo listo para ejecutar\n"
+            "4. Estimación de tiempo relativo (paralelo vs secuencial)"
+        )}}]
+
+    elif name == "parallel_tasks":
+        tasks          = arguments.get("tasks", "")
+        agent_id       = arguments.get("agent_id", "agente configurado")
+        max_concurrent = arguments.get("max_concurrent", "4")
+        on_error       = arguments.get("on_error", "continue")
+        return [{"role": "user", "content": {"type": "text", "text": (
+            f"Ejecuta las siguientes tareas en paralelo usando subagentes concurrentes.\n\n"
+            f"TAREAS:\n{tasks}\n\n"
+            f"CONFIGURACIÓN:\n"
+            f"- Agente: {agent_id}\n"
+            f"- Máx. concurrentes: {max_concurrent}\n"
+            f"- En caso de error: {on_error}\n\n"
+            "## PROTOCOLO DE EJECUCIÓN PARALELA:\n\n"
+            "### PASO 1 — Validación de independencia\n"
+            "Antes de lanzar en paralelo, confirma que las tareas:\n"
+            "✓ NO leen/escriben los mismos ficheros\n"
+            "✓ NO dependen del output de otra tarea del lote\n"
+            "✓ NO modifican estado compartido (base de datos, config global)\n"
+            "Si hay dependencias, reordena: primero las dependencias, luego las dependientes en paralelo.\n\n"
+            "### PASO 2 — Lanzamiento por lotes\n"
+            f"Agrupa en lotes de ≤{max_concurrent} tareas. Para cada lote:\n"
+            "```\n"
+            "spawn_subagent(agent_id='<id>', task='<tarea completa y autocontenida>')\n"
+            "# Cada tarea debe incluir TODO el contexto necesario en su descripción\n"
+            "# El subagente no tiene acceso al historial del agente padre\n"
+            "```\n\n"
+            "### PASO 3 — Recolección de resultados\n"
+            "- Registra el output de cada subagente\n"
+            "- Si un subagente falla: decide según on_error=" + on_error + "\n"
+            "  - `continue`: sigue con las demás, reporta el fallo al final\n"
+            "  - `abort`: detén todo y reporta\n"
+            "  - `retry`: relanza una vez con contexto adicional de diagnóstico\n\n"
+            "### PASO 4 — Síntesis\n"
+            "Consolida los resultados de todos los subagentes y presenta un resumen de:\n"
+            "- Tareas completadas ✅ / fallidas ❌\n"
+            "- Output relevante de cada una\n"
+            "- Tiempo total vs estimado en secuencial\n\n"
+            "Comienza ahora lanzando el primer lote de subagentes."
+        )}}]
+
+    elif name == "task_queue_strategy":
+        tasks             = arguments.get("tasks", "")
+        dependencies      = arguments.get("dependencies", "")
+        priority_criteria = arguments.get("priority_criteria", "dependencies")
+        context           = arguments.get("context", "")
+        deps_str    = f"\n\nDEPENDENCIAS CONOCIDAS:\n{dependencies}" if dependencies else ""
+        context_str = f"\n\nCONTEXTO:\n{context}" if context else ""
+        return [{"role": "user", "content": {"type": "text", "text": (
+            f"Analiza la siguiente lista de tareas y diseña la estrategia de cola óptima.{deps_str}{context_str}\n\n"
+            f"TAREAS:\n{tasks}\n\n"
+            f"CRITERIO DE PRIORIDAD: {priority_criteria}\n\n"
+            "## ANÁLISIS REQUERIDO:\n\n"
+            "### 1. Grafo de dependencias\n"
+            "Para cada tarea identifica:\n"
+            "- **Predecesoras**: tareas que deben completarse antes\n"
+            "- **Sucesoras**: tareas que se desbloquean al completarla\n"
+            "- **Independientes**: tareas sin relación con las demás\n\n"
+            "### 2. Clasificación por estrategia de ejecución\n"
+            "```\n"
+            "GRUPO A — PARALELO (spawn_subagent simultáneo):\n"
+            "  [tareas sin dependencias entre sí]\n\n"
+            "GRUPO B — SECUENCIAL (plan_create + task_done):\n"
+            "  [cadenas de dependencia estricta]\n\n"
+            "GRUPO C — EXPLORACIÓN PREVIA (explore → plan_create):\n"
+            "  [tareas en código desconocido o arquitectura no leída]\n\n"
+            "GRUPO D — BLOQUEADAS (esperan a A+B+C):\n"
+            "  [tareas que dependen de los grupos anteriores]\n"
+            "```\n\n"
+            "### 3. Priorización dentro de cada grupo\n"
+            f"Criterio principal: **{priority_criteria}**\n"
+            "- `urgency`: las críticas/bloqueantes primero\n"
+            "- `impact`: las de mayor valor/riesgo primero\n"
+            "- `complexity`: las más simples primero (para liberar velocidad)\n"
+            "- `dependencies`: las que desbloquean más tareas primero\n\n"
+            "### 4. Plan de ejecución final\n"
+            "Devuelve un plan ordenado con:\n"
+            "```\n"
+            "FASE 1 (paralelo): spawn_subagent × N\n"
+            "  - Tarea X [agente: Y] [prioridad: Z]\n"
+            "  ...\n"
+            "FASE 2 (secuencial): plan_create\n"
+            "  1. Tarea A [depende de: X]\n"
+            "  2. Tarea B [depende de: A]\n"
+            "  ...\n"
+            "FASE 3 (paralelo desbloqueado): ...\n"
+            "```\n"
+            "Incluye el tiempo estimado total y las tools a invocar en cada fase."
+        )}}]
+
+    elif name == "spawn_agent_team":
+        project      = arguments.get("project", "")
+        team_size    = arguments.get("team_size", "3")
+        agents       = arguments.get("agents", "")
+        coordination = arguments.get("coordination", "pipeline")
+        context      = arguments.get("context", "")
+        agents_str  = f"\nAgentes disponibles: {agents}" if agents else ""
+        context_str = f"\n\nRECURSOS DISPONIBLES:\n{context}" if context else ""
+        coord_map = {
+            "pipeline":      "pipeline secuencial — cada agente pasa su output al siguiente",
+            "parallel":      "paralelo — todos trabajan simultáneamente en dominios independientes",
+            "master_worker": "master-worker — el agente principal coordina y delega, recoge y sintetiza",
+        }
+        coord_desc = coord_map.get(coordination, coord_map["pipeline"])
+        return [{"role": "user", "content": {"type": "text", "text": (
+            f"Diseña y ejecuta un equipo de {team_size} subagentes especializados para el siguiente proyecto.{agents_str}{context_str}\n\n"
+            f"PROYECTO:\n{project}\n\n"
+            f"MODELO DE COORDINACIÓN: {coord_desc}\n\n"
+            "## DISEÑO DEL EQUIPO:\n\n"
+            "### PASO 1 — Descomposición del proyecto\n"
+            "Divide el proyecto en dominios independientes asignables a agentes especializados:\n"
+            "- Análisis/Exploración (explore o agente reasoning)\n"
+            "- Implementación/Código (agente coding)\n"
+            "- Tests/Validación (agente coding con foco en tests)\n"
+            "- Documentación/Informes (agente home_office)\n"
+            "- Revisión/Integración (agente principal)\n\n"
+            "### PASO 2 — Asignación de agentes\n"
+            "Para cada dominio selecciona el agente más adecuado y define:\n"
+            "- **Tarea concreta**: descripción autocontenida con TODO el contexto necesario\n"
+            "- **Input**: qué información recibe (output de fase anterior o contexto compartido)\n"
+            "- **Output esperado**: qué debe entregar al final\n"
+            "- **Criterio de éxito**: cómo saber que completó correctamente\n\n"
+            f"### PASO 3 — Protocolo de coordinación ({coordination})\n"
+            + (
+                "**Pipeline**: lanza los agentes en secuencia.\n"
+                "  Agente 1 → output → contexto de Agente 2 → output → contexto de Agente 3...\n"
+                "  Cada spawn_subagent incluye el output del anterior en la descripción de tarea.\n"
+                if coordination == "pipeline" else
+                "**Paralelo**: lanza todos los agentes simultáneamente.\n"
+                "  Verifica que sus tareas no compartan ficheros o estado.\n"
+                "  Recoge todos los outputs antes de la síntesis final.\n"
+                if coordination == "parallel" else
+                "**Master-Worker**: el agente principal coordina.\n"
+                "  Lanza workers con spawn_subagent, espera resultados, sintetiza y decide siguientes pasos.\n"
+                "  El master puede lanzar nuevos workers según los resultados intermedios.\n"
+            ) + "\n\n"
+            "### PASO 4 — Lanzamiento\n"
+            "Muestra el plan completo del equipo y luego inicia la ejecución con el primer spawn_subagent.\n"
+            "Tras recoger cada resultado, reporta el estado y procede con la siguiente fase.\n\n"
+            "### CONSIDERACIONES:\n"
+            "- Cada subagente tiene contexto AISLADO — incluye TODO lo necesario en la tarea\n"
+            "- Los subagentes NO tienen acceso a la conversación del padre ni entre sí\n"
+            "- Máx. concurrentes: 4 (configurable en subagents_max_concurrent)\n"
+            "- Máx. equipo: 5 agentes (subagents_max_team_size)\n"
+            "- Si un subagente falla, el padre puede relanzarlo con contexto adicional\n\n"
+            "Comienza ahora con el diseño del equipo y el primer spawn."
         )}}]
 
     return []

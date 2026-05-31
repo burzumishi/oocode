@@ -1,0 +1,222 @@
+*oocode.txt*  OOCode VIM Plugin — Wrapper completo del TUI OOCode (v3.0)
+
+==============================================================================
+CONTENIDO                                                      *oocode-contents*
+
+  1. Introducción ............. |oocode-intro|
+  2. Instalación .............. |oocode-install|
+  3. Configuración ............ |oocode-config|
+  4. Comandos ................. |oocode-commands|
+  5. Mapeos ................... |oocode-mappings|
+  6. Streaming SSE ............ |oocode-streaming|
+  7. Statusline ............... |oocode-statusline|
+  8. Slash commands ........... |oocode-slash|
+
+==============================================================================
+1. INTRODUCCIÓN                                                   *oocode-intro*
+
+OOCode VIM Plugin es un wrapper completo del TUI de OOCode. Se conecta al
+WebUI daemon via HTTP y ofrece streaming SSE en tiempo real con tools, plan y
+texto del agente apareciendo en el panel de VIM mientras se generan.
+
+  • Streaming SSE en tiempo real — tool_start/done, text, plan, done en vivo.
+  • Detección automática del servidor — escanea puertos 4000, 7788, 3000, 5000
+    y lee ~/.oocode/webui_state.json para obtener el puerto activo.
+  • Panel de respuestas integrado — split con historial, tools y plan.
+  • TUI completo embebido — :OOCodeTUI abre el TUI nativo en el terminal de VIM.
+  • Todos los slash commands disponibles via :OOCodeCmd con autocompletado.
+  • Integración de contexto — envía fichero, selección visual, posición cursor.
+
+==============================================================================
+2. INSTALACIÓN                                                  *oocode-install*
+
+Con vim-plug: >
+  Plug 'burzumishi/oocode', { 'rtp': 'extensions/vim' }
+<
+Manual: >
+  cp -r extensions/vim/* ~/.vim/
+<
+Requiere el WebUI activo: >
+  oocode --webserver start   " o /webserver start desde el TUI
+<
+
+==============================================================================
+3. CONFIGURACIÓN                                                 *oocode-config*
+
+Pon en tu .vimrc / init.vim: >
+
+  " URL del WebUI (se auto-detecta desde webui_state.json)
+  let g:oocode_host      = 'http://localhost:4000'
+
+  " Agente activo
+  let g:oocode_agent     = 'main'
+
+  " Tipo de split: 'vertical' | 'horizontal' | 'tab'
+  let g:oocode_split     = 'vertical'
+
+  " Ancho del split vertical (columnas)
+  let g:oocode_width     = 52
+
+  " Alto del split horizontal (filas)
+  let g:oocode_height    = 15
+
+  " Abrir el panel automáticamente al arrancar VIM
+  let g:oocode_auto_open = 0
+
+  " Arrancar stream SSE automáticamente si el servidor está activo
+  let g:oocode_auto_sse  = 1
+
+  " Desactivar todos los mapeos por defecto
+  let g:oocode_no_mappings = 0
+
+  " Mostrar mensajes de depuración en la detección
+  let g:oocode_verbose   = 0
+<
+
+==============================================================================
+4. COMANDOS                                                    *oocode-commands*
+
+*:OOCode* {mensaje}
+  Envía {mensaje} al agente. La respuesta llega en streaming en tiempo real
+  al panel. En VIM sin soporte de jobs usa send_sync bloqueante como fallback.
+
+*:OOCodeAsk*
+  Abre un prompt interactivo para escribir el mensaje.
+
+*:OOCodeContext*
+  Envía el fichero actual completo (con posición del cursor) y pide pregunta.
+
+*:[range]OOCodeSelection*
+  Envía la selección visual con una pregunta.
+
+*:[range]OOCodeExplain*
+  Pide al agente que explique el código bajo el cursor o selección.
+
+*:[range]OOCodeReview*
+  Pide revisión de bugs, mejoras y seguridad sobre la selección.
+
+*:OOCodeTUI*
+  Abre el TUI completo de OOCode en el terminal embebido de VIM/Neovim.
+  Acceso completo a todos los slash commands, streaming nativo, herramientas,
+  memoria, RAG, hooks y subagentes. Es el wrapper más completo.
+
+*:OOCodeOpen* / *:OOCodeClose* / *:OOCodeToggle*
+  Gestiona el panel de respuestas.
+
+*:OOCodeStatus*
+  Estado: agente, modelo, ctx%, hooks, plugins. Fuerza re-detección.
+
+*:OOCodeConnect*
+  Fuerza re-detección del servidor (escanea puertos) y arranca el stream SSE.
+  Útil cuando el WebUI se inicia después de que VIM ya estaba abierto.
+
+*:OOCodeWebUI*
+  Abre el WebUI en el navegador.
+
+*:OOCodeWebServer* {cmd}
+  Controla el daemon: start, stop, restart, status.
+
+*:OOCodeNew*
+  Nueva sesión: resetea el contexto del agente y limpia el panel.
+
+*:OOCodeSwitch* {agent_id}
+  Cambia al agente indicado (main, coding, reasoning, home_office…).
+
+*:OOCodeAgents*
+  Subagentes activos y recientes con estado y resultado de tarea.
+
+*:OOCodeSessions*
+  Historial de sesiones del agente actual.
+
+*:OOCodeDoctor*
+  Diagnóstico del sistema (abre en TUI si hay terminal, sino muestra URL).
+
+*:OOCodeCmd* {slash_cmd}
+  Envía cualquier slash command al agente con autocompletado.
+
+==============================================================================
+5. MAPEOS POR DEFECTO                                          *oocode-mappings*
+
+  <Leader>oa   — :OOCodeAsk       Pregunta al agente (prompt)
+  <Leader>oc   — :OOCodeContext   Envía fichero actual como contexto
+  <Leader>os   — :OOCodeSelection Envía selección visual
+  <Leader>ox   — :OOCodeExplain   Explica código bajo cursor / selección
+  <Leader>or   — :OOCodeReview    Revisión de la selección (modo visual)
+  <Leader>ot   — :OOCodeToggle    Toggle del panel de respuestas
+  <Leader>ow   — :OOCodeWebUI     Abre el WebUI en el navegador
+  <Leader>ou   — :OOCodeTUI       TUI completo embebido
+  <Leader>on   — :OOCodeNew       Nueva sesión
+  <Leader>ok   — :OOCodeConnect   Re-detectar servidor
+
+Desactiva los mapeos con: >
+  let g:oocode_no_mappings = 1
+<
+
+==============================================================================
+6. STREAMING SSE                                              *oocode-streaming*
+
+El plugin usa `curl -sN --no-buffer` en un job de fondo para mantener una
+conexión SSE persistente con /api/chat/stream.
+
+Cuando envías un mensaje, el POST a /api/chat/send dispara los eventos que
+fluyen por el stream SSE ya abierto:
+
+  connected    → confirmación de conexión al panel
+  thinking     → "  ● Pensando…" (se elimina al llegar texto/tool)
+  tool_start   → "  ◐ tool_name …" (actualizado in-place al recibir done)
+  tool_done    → "  ⎿ tool_name  ▸ N líneas"
+  plan         → "  ◈  Plan de ejecución [1/N]" con tareas
+  stream_chunk → texto acumulado (flush completo en evento done)
+  done         → flush de texto + separador de turno
+  error        → mensaje de error
+
+El stream reconecta automáticamente si se desconecta (timeout o red).
+
+En VIM sin soporte de jobs (compilado sin +job), el plugin cae a modo
+`send_sync` que bloquea hasta que el agente termina y muestra el resultado.
+
+==============================================================================
+7. STATUSLINE                                                *oocode-statusline*
+
+Añade a tu statusline: >
+  set statusline+=%{OOCodeStatusLine()}
+<
+Con lightline: >
+  let g:lightline = {'active': {'right': [['oocode']]}}
+  let g:lightline.component_function = {'oocode': 'OOCodeStatusLine'}
+<
+Muestra:  🤖 main  45%  ◐
+  • emoji + nombre del agente activo
+  • contexto usado en %
+  • ◐ cuando el agente está procesando
+
+La comprobación del servidor es no bloqueante: lee el PID del state file
+con `kill -0` en lugar de hacer un curl en cada redraw.
+
+==============================================================================
+8. SLASH COMMANDS                                               *oocode-slash*
+
+Todos los slash commands del TUI son accesibles via :OOCodeCmd: >
+
+  :OOCodeCmd /new              " Nueva sesión
+  :OOCodeCmd /switch coding    " Cambiar a agente coding
+  :OOCodeCmd /compact          " Compactar contexto
+  :OOCodeCmd /hooks list       " Ver hooks activos
+  :OOCodeCmd /doctor           " Diagnóstico
+  :OOCodeCmd /rag reindex      " Re-indexar RAG
+  :OOCodeCmd /model qwen3      " Cambiar modelo
+  :OOCodeCmd /steer <instr>    " Inyectar instrucción al agente
+  :OOCodeCmd /diff             " Ver diff de última edición
+  :OOCodeCmd /todo             " TODOs del workspace
+<
+
+Atajos directos: >
+  :OOCodeNew                   " /new
+  :OOCodeSwitch coding         " /switch coding
+  :OOCodeDoctor                " /doctor
+  :OOCodeAgents                " /subagents
+  :OOCodeSessions              " /sessions
+<
+
+==============================================================================
+vim:ft=help:ts=8:sw=2:et:norl:

@@ -62,6 +62,7 @@ class AgentTeam:
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         self.subtasks.append(subtask)
+        self._save()
         return subtask
     
     def complete_subtask(self, subtask_id: str, result: str) -> None:
@@ -72,6 +73,7 @@ class AgentTeam:
                 subtask["completed_at"] = datetime.now(timezone.utc).isoformat()
                 self.results[subtask_id] = result
                 break
+        self._save()
     
     def get_pending_subtasks(self) -> list[dict]:
         """Devuelve las subtasks pendientes."""
@@ -81,10 +83,66 @@ class AgentTeam:
         """Verifica si todas las subtasks están completadas."""
         return all(s["status"] == "completed" for s in self.subtasks)
     
+    def fail_subtask(self, subtask_id: str, error: str) -> None:
+        """Marca una subtask como fallida y persiste."""
+        for subtask in self.subtasks:
+            if subtask["id"] == subtask_id:
+                subtask["status"] = "failed"
+                subtask["completed_at"] = datetime.now(timezone.utc).isoformat()
+                self.results[subtask_id] = f"[error] {error}"
+                break
+        self._save()
+
+    def execute(self, runner) -> dict[str, str]:
+        """Ejecuta todas las subtasks pendientes en paralelo vía SubAgentRunner.
+
+        Cada subtask se asigna al agente indicado en `assign_to`.
+        Espera a que terminen todas y persiste los resultados.
+        Retorna dict subtask_id -> resultado.
+        """
+        import threading
+
+        pending = self.get_pending_subtasks()
+        if not pending:
+            return dict(self.results)
+
+        self.status = "active"
+        self._save()
+
+        collected: dict[str, str] = {}
+        lock = threading.Lock()
+
+        def _run_subtask(subtask: dict) -> None:
+            try:
+                result = runner.run(subtask["assign_to"], subtask["description"], silent=True)
+                with lock:
+                    collected[subtask["id"]] = result or ""
+                self.complete_subtask(subtask["id"], result or "")
+            except Exception as exc:
+                err = str(exc)
+                with lock:
+                    collected[subtask["id"]] = f"[error] {err}"
+                self.fail_subtask(subtask["id"], err)
+
+        threads = [
+            threading.Thread(target=_run_subtask, args=(st,), daemon=True)
+            for st in pending
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        if self.is_all_completed():
+            self.mark_completed()
+
+        return collected
+
     def mark_completed(self) -> None:
         """Marca el equipo como completado."""
         self.status = "completed"
         self.completed_at = datetime.now(timezone.utc).isoformat()
+        self._save()
     
     def to_dict(self) -> dict:
         """Serializa el equipo a dict."""
@@ -175,47 +233,50 @@ def _now() -> str:
 
 
 def create_team(team_id: str, lead_agent_id: str, members: Optional[list[str]]) -> dict:
-    """Crea un nuevo equipo de agentes."""
+    """Crea un nuevo equipo de agentes y lo persiste en disco."""
     team = AgentTeam(team_id, lead_agent_id, members)
+    team._save()
     return team.to_dict()
 
 
-def load_team(team_id: str) -> Optional[dict]:
-    """Carga un equipo existente desde su archivo JSON."""
+def _load_team_obj(team_id: str) -> Optional["AgentTeam"]:
+    """Carga un equipo y devuelve el objeto AgentTeam (no un dict)."""
     team_file = CONFIG_DIR / f"teams/{team_id}.json"
-    if team_file.exists():
-        try:
-            data = json.loads(team_file.read_text())
-            team = AgentTeam(data["team_id"], data["lead_agent_id"], data.get("members"), str(team_file))
-            return team.to_dict()
-        except Exception:
-            return None
-    return None
+    if not team_file.exists():
+        return None
+    try:
+        data = json.loads(team_file.read_text())
+        return AgentTeam(data["team_id"], data["lead_agent_id"], data.get("members"), str(team_file))
+    except Exception:
+        return None
+
+
+def load_team(team_id: str) -> Optional[dict]:
+    """Carga un equipo existente desde su archivo JSON y devuelve dict."""
+    team = _load_team_obj(team_id)
+    return team.to_dict() if team else None
 
 
 def add_subtask(team_id: str, description: str, assign_to: str) -> dict:
     """Añade una subtask a un equipo existente."""
-    team = load_team(team_id)
+    team = _load_team_obj(team_id)
     if not team:
         return {"error": f"Equipo '{team_id}' no encontrado"}
-    subtask = team.add_subtask(description, assign_to)
-    team._save()
-    return subtask
+    return team.add_subtask(description, assign_to)
 
 
 def complete_subtask(team_id: str, subtask_id: str, result: str) -> dict:
     """Marca una subtask como completada."""
-    team = load_team(team_id)
+    team = _load_team_obj(team_id)
     if not team:
         return {"error": f"Equipo '{team_id}' no encontrado"}
     team.complete_subtask(subtask_id, result)
-    team._save()
     return {"status": "completed", "subtask_id": subtask_id, "result": result}
 
 
 def get_pending_subtasks(team_id: str) -> list[dict]:
     """Devuelve las subtasks pendientes de un equipo."""
-    team = load_team(team_id)
+    team = _load_team_obj(team_id)
     if not team:
         return []
     return team.get_pending_subtasks()
@@ -223,15 +284,47 @@ def get_pending_subtasks(team_id: str) -> list[dict]:
 
 def is_team_completed(team_id: str) -> bool:
     """Verifica si un equipo está completado."""
-    team = load_team(team_id)
+    team = _load_team_obj(team_id)
     if not team:
         return False
     return team.is_all_completed() and team.status == "completed"
 
 
+def list_teams() -> list[dict]:
+    """Lista todos los equipos persistidos en disco."""
+    teams_dir = CONFIG_DIR / "teams"
+    if not teams_dir.exists():
+        return []
+    result = []
+    for f in sorted(teams_dir.glob("*.json")):
+        try:
+            data = json.loads(f.read_text())
+            result.append({
+                "team_id":    data.get("team_id", f.stem),
+                "lead":       data.get("lead_agent_id", "?"),
+                "members":    data.get("members", []),
+                "status":     data.get("status", "?"),
+                "subtasks":   len(data.get("subtasks", [])),
+                "pending":    sum(1 for s in data.get("subtasks", []) if s.get("status") == "pending"),
+                "created_at": data.get("created_at", ""),
+            })
+        except Exception:
+            pass
+    return result
+
+
+def delete_team(team_id: str) -> bool:
+    """Elimina un equipo del disco."""
+    team_file = CONFIG_DIR / f"teams/{team_id}.json"
+    if team_file.exists():
+        team_file.unlink()
+        return True
+    return False
+
+
 def get_team_status(team_id: str) -> dict:
     """Devuelve el estado de un equipo."""
-    team = load_team(team_id)
+    team = _load_team_obj(team_id)
     if not team:
         return {"error": f"Equipo '{team_id}' no encontrado"}
     return {
@@ -241,5 +334,5 @@ def get_team_status(team_id: str) -> dict:
         "pending_subtasks": len(team.get_pending_subtasks()),
         "completed_subtasks": len([s for s in team.subtasks if s["status"] == "completed"]),
         "created_at": team.created_at,
-        "completed_at": team.completed_at,
+        "completed_at": getattr(team, "completed_at", None),
     }

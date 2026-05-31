@@ -354,5 +354,74 @@ class TestPlanTasksInit(unittest.TestCase):
             self.assertIn(k, tasks[0])
 
 
+# ── Tests: _print_plan_panel_update se llama al transicionar tarea ────────────
+
+class TestAdvancePlanPrintsPanel(unittest.TestCase):
+    """Verifica que _advance_plan_task() NO llama a _print_plan_panel_update()
+    — el panel se actualiza en la status window automáticamente."""
+
+    def _loop_with_tasks(self, n=4, capture=False):
+        loop = _make_loop()
+        loop.capture_output = capture
+        loop._plan_tasks = _make_tasks([f"Tarea {i+1}: trabajo" for i in range(n)])
+        loop._plan_tasks[0]["status"] = "active"
+        loop._plan_tasks[0]["start_ts"] = 1.0
+        loop._print_panel_calls = 0
+
+        def _fake_print_plan(compact=False):
+            loop._print_panel_calls += 1
+        loop._print_plan_panel_update = _fake_print_plan
+        return loop
+
+    def test_capa2_no_print_even_on_task_change(self):
+        """Capa 2 avanza la tarea pero no imprime panel estático."""
+        loop = self._loop_with_tasks(4)
+        loop._advance_plan_task("Tarea 2: anuncio explícito")
+        self.assertEqual(loop._print_panel_calls, 0)
+
+    def test_capa2_no_print_if_same_task(self):
+        loop = self._loop_with_tasks(4)
+        # Tarea 1 ya es activa → anunciar "Tarea 1" no cambia nada
+        loop._advance_plan_task("Tarea 1: misma tarea activa")
+        self.assertEqual(loop._print_panel_calls, 0)
+
+    def test_capa3_no_print_even_on_advance(self):
+        """Capa 3 avanza la tarea pero no imprime panel estático."""
+        loop = self._loop_with_tasks(4)
+        loop._auto_continue_count = 2
+        loop._advance_plan_task("texto sin anuncio, autocontinúa iteración 2")
+        self.assertEqual(loop._print_panel_calls, 0)
+
+    def test_capa3_no_print_if_no_advance(self):
+        loop = self._loop_with_tasks(4)
+        loop._auto_continue_count = 0
+        # target = min(0, 3) = 0 → no cambia desde 0
+        loop._advance_plan_task("sin avance")
+        self.assertEqual(loop._print_panel_calls, 0)
+
+    def test_capture_output_suppresses_print(self):
+        loop = self._loop_with_tasks(4, capture=True)
+        loop._auto_continue_count = 2
+        loop._advance_plan_task("Tarea 3: anuncio en subagente")
+        self.assertEqual(loop._print_panel_calls, 0)
+
+    def test_capa1_done_signal_no_print(self):
+        """Capa 1 marca done pero no imprime panel — la status window lo muestra."""
+        loop = self._loop_with_tasks(3)
+        # Hacer que no sea prematura: sin pending
+        for t in loop._plan_tasks:
+            t["status"] = "done"
+        loop._plan_tasks[2]["status"] = "active"  # la última sigue active
+        # Señal de completado global → _mark_all_plan_tasks_done
+        loop._advance_plan_task("He completado todas las tareas.")
+        self.assertEqual(loop._print_panel_calls, 0)
+
+    def test_capa1_premature_no_print(self):
+        loop = self._loop_with_tasks(4)
+        # Hay 3 pending → señal prematura → no marca todas done → activa sigue igual
+        loop._advance_plan_task("He completado todas las tareas.")
+        self.assertEqual(loop._print_panel_calls, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

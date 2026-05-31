@@ -9,7 +9,7 @@ El servidor se registra en `~/.oocode/oocode.json` bajo `mcp.servers`:
 ```json
 {
   "name": "system-assistant",
-  "cmd": ["python", "~/oocode/mcp_servers/system_assistant.py"],
+  "cmd": ["python", "/path/to/oocode/mcp_servers/system_assistant.py"],
   "enabled": true,
   "description": "Administración del sistema: paquetes, servicios, red, disco, firewall"
 }
@@ -104,7 +104,7 @@ net_dns   host="github.com"  type="A"
 | `lsblk_info` | Dispositivos de bloque y particiones | auto |
 
 ```
-dir_size  path="~/Documents"
+dir_size  path="/home/user/myproject"
 ```
 
 ### Usuarios y grupos
@@ -117,7 +117,7 @@ dir_size  path="~/Documents"
 | `who_logged` | Usuarios con sesión activa (`who / w`) | auto |
 
 ```
-user_info  username="user"
+user_info  username="myuser"
 ```
 
 ### Procesos y recursos

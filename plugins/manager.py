@@ -66,6 +66,7 @@ class PluginManager:
         else:
             self._enabled = _load_set(ENABLED_FILE)
         self._loaded: dict[str, object] = {}
+        self._hot_reload: bool = False  # Soporte para hot-reload de plugins
 
     # ── Gestión ───────────────────────────────────────────────────────────────
 

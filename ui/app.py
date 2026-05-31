@@ -3,17 +3,21 @@
 Layout (de arriba abajo):
   ┌─────────────────────────────────────────┐  ← salida del agente (scrollable)
   │ texto del agente, herramientas, etc.    │
-  ├─────────────────────────────────────────┤  ← spinner / stats (1 línea)
-  ├─────────────────────────────────────────┤  ← separador superior ────── (1 línea)
+  ├─────────────────────────────────────────┤  ← spinner / plan-tasks / tip (3 líneas)
+  ├─────────────────────────────────────────┤  ← separador superior ──────── (1 línea)
   │  oocode  main · proj  ❯ _               │  ← input del usuario (1 línea)
-  ├─────────────────────────────────────────┤  ← separador inferior ────── (1 línea)
-  │ F1 keys  F2 status … │ ████ 45% │ model │  ← toolbar                  (1 línea)
+  ├─────────────────────────────────────────┤  ← separador inferior ──────── (1 línea)
+  │ ⏵⏵ subagentes · main ● · ◯ id tarea    │  ← panel subagentes (dinámico, 0 si vacío)
+  │ · 🤖 main · ◎ ask · mcp:N · ctx · mod  │  ← toolbar línea 1: indicadores
+  │ · ✐ py js ts go cpp sh ...             │  ← toolbar línea 2: LSP
+  │ · F1 keys · F2 status · F3 compact ·   │  ← toolbar línea 3: keybindings
   └─────────────────────────────────────────┘
 
 Permisos: cuando el agente necesita permiso, el input area cambia de modo
 y el usuario responde [s/n/siempre] en la misma barra de entrada.
 El agente bloquea su hilo hasta recibir la respuesta.
 """
+import html
 import io
 import os
 import re
@@ -31,7 +35,7 @@ from prompt_toolkit.auto_suggest import AutoSuggestFromHistory, ConditionalAutoS
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.data_structures import Point
-from prompt_toolkit.formatted_text import ANSI, FormattedText
+from prompt_toolkit.formatted_text import ANSI, FormattedText, to_formatted_text
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Layout, HSplit, VSplit, Window, Float, FloatContainer
@@ -79,11 +83,12 @@ def _parse_status_line(text: str, default_cls: str) -> list[tuple[str, str]]:
 _LIVE_PULSE_COLORS = [
     "\x1b[1;32m",   # bold green
     "\x1b[1;36m",   # bold cyan
-    "\x1b[1;33m",   # bold yellow
-    "\x1b[1;35m",   # bold magenta
-    "\x1b[1;31m",   # bold red
-    "\x1b[1;93m",   # bold bright yellow
     "\x1b[1;96m",   # bold bright cyan
+    "\x1b[1;36m",   # bold cyan (repeat → transición suave)
+    "\x1b[1;32m",   # bold green
+    "\x1b[0;32m",   # normal green (dim-down)
+    "\x1b[1;32m",   # bold green (dim-up)
+    "\x1b[1;36m",   # bold cyan
 ]
 _LIVE_RESET = "\x1b[0m"
 
@@ -297,10 +302,16 @@ class OOCodeApp:
 
         # Live block — zona dinámica al final del output (● pulsante + ⎿ live)
         self._live_block_active: bool = False
-        self._live_block_bullet: str = ""      # texto tras ●
-        self._live_block_body: list[str] = []  # output acumulado (list para O(1) append)
-        self._live_block_tool_n: int = 0       # contador de tools completadas
-        self._live_pulse_idx: int = 0          # índice de color para animación
+        self._live_block_bullet: str = ""        # texto del agente tras ●
+        self._live_block_action: str = ""        # acción de tool (sobreescribe ● mientras ejecuta)
+        self._live_block_body: list[str] = []         # output acumulado (list para O(1) append)
+        self._live_block_plan_header: list[str] = [] # plan creado en este turno — se renderiza ANTES del ●
+        self._live_block_plan_mode: bool = False     # True mientras plan_create imprime sus líneas
+        self._live_block_tool_n: int = 0         # contador de tools completadas
+        self._live_block_current_tool: str = ""  # nombre de tool en '|  ◐ tool:'
+        self._live_block_preview: list[str] = [] # args/contexto (1-4 líneas) visibles solo mientras corre
+        self._live_block_completed_tools: list[str] = []  # historial de tools completadas (máx 4)
+        self._live_pulse_idx: int = 0            # índice de color para animación
 
         # Caché partida: partes estáticas vs live block — evita re-parsear 80KB en cada blink
         self._output_static_key: int = 0          # se incrementa solo cuando _output_parts cambia
@@ -311,14 +322,23 @@ class OOCodeApp:
         self._kb_manager = KeybindingManager()
         agent_loop._kb_manager = self._kb_manager
 
+        # Imágenes pendientes adjuntas (via Ctrl+P o /attach) para el próximo mensaje
+        self._pending_images: list[str] = []
+        agent_loop._pending_images = self._pending_images  # referencia compartida para toolbar
+
         # Status callback → hilo del agente actualiza el spinner en la fila 3
         agent_loop._status_text = ""
         agent_loop._status_cb   = self._set_status
 
         # Live block callbacks para el agente
-        agent_loop._start_live_block_cb  = self._start_live_block
-        agent_loop._update_live_tools_cb = self._update_live_tools
-        agent_loop._flush_live_block_cb  = self._flush_live_block
+        agent_loop._start_live_block_cb          = self._start_live_block
+        agent_loop._update_live_tools_cb         = self._update_live_tools
+        agent_loop._update_live_current_tool_cb  = self._update_live_current_tool
+        agent_loop._update_live_preview_cb       = self._update_live_preview
+        agent_loop._update_live_tool_start_cb    = self._update_live_tool_start
+        agent_loop._update_live_bullet_cb        = self._update_live_bullet
+        agent_loop._flush_live_block_cb          = self._flush_live_block
+        agent_loop._set_plan_header_mode_cb      = self._set_plan_header_mode
 
         # Compact-reset callback → vacía el área de conversación antes del reset visual
         agent_loop._clear_output_cb = self._clear_output_for_compact
@@ -359,7 +379,11 @@ class OOCodeApp:
         with self._lock:
             if self._live_block_active:
                 # Durante live block: O(1) append en lista (evita O(n²) string concat)
-                self._live_block_body.append(text)
+                if self._live_block_plan_mode:
+                    # plan_create imprimiendo: va al header (encima del ●)
+                    self._live_block_plan_header.append(text)
+                else:
+                    self._live_block_body.append(text)
             else:
                 self._output_parts.append(text)
                 self._output_chars += len(text)
@@ -386,7 +410,12 @@ class OOCodeApp:
             self._live_block_active = False
             self._live_block_bullet = ""
             self._live_block_body = []
+            self._live_block_plan_header = []
+            self._live_block_plan_mode = False
             self._live_block_tool_n = 0
+            self._live_block_current_tool = ""
+            self._live_block_preview = []
+            self._live_block_completed_tools = []
             self._output_static_key += 1
             self._output_cache_key += 1
         try:
@@ -394,75 +423,122 @@ class OOCodeApp:
         except Exception:
             pass
 
+    def _set_plan_header_mode(self, active: bool) -> None:
+        """Activa/desactiva la captura del plan en el header del live block."""
+        with self._lock:
+            self._live_block_plan_mode = active
+
     def _build_live_block_ansi(self) -> str:
         """Construye el ANSI del live block con ● pulsante y ⎿ actualizable."""
         pulse = self._live_pulse_idx
         color = _LIVE_PULSE_COLORS[pulse % len(_LIVE_PULSE_COLORS)]
-        lines: list[str] = [f"\n  {color}●{_LIVE_RESET} {self._live_block_bullet}"]
-        body = "".join(self._live_block_body)   # join lista → string
-        if body.strip():
+        # Mostrar acción actual en ● si hay tool ejecutando, si no el texto del agente
+        display_bullet = self._live_block_action if self._live_block_action else self._live_block_bullet
+        lines: list[str] = [f"\n  {color}●{_LIVE_RESET} {display_bullet}"]
+        body = "".join(self._live_block_body)
+        if self._live_block_current_tool:
+            lines.append(f"  \x1b[2m│\x1b[0m \x1b[2m◐ {self._live_block_current_tool}\x1b[0m")
+            if body.strip():
+                for _bl in body.rstrip('\n').splitlines()[:5]:
+                    lines.append(f"  \x1b[2m│    {_bl}\x1b[0m")
+            elif self._live_block_preview:
+                for _pl in self._live_block_preview[:4]:
+                    lines.append(f"  \x1b[2m│    {_pl}\x1b[0m")
+        elif body.strip():
             lines.append(body.rstrip('\n'))
         n = self._live_block_tool_n
         if n > 0:
             unit = "tool" if n == 1 else "tools"
-            lines.append(f"  \x1b[2m⎿  Used {n} {unit}  (ctrl+o to expand)\x1b[0m")
-        else:
-            circ_color = _CIRC_PULSE_COLORS[pulse % len(_CIRC_PULSE_COLORS)]
-            lines.append(f"  \x1b[2m⎿  {circ_color}◐\x1b[0m\x1b[2m ejecutando…\x1b[0m")
+            lines.append(f"  \x1b[2m⎿ Used {n} {unit} (ctrl+o to expand)\x1b[0m")
         return "\n".join(lines) + "\n"
 
     def _get_output_text(self):
         # ── 1. Snapshot bajo lock (solo ops baratas — sin join ni scan) ───────
         with self._lock:
-            full_key = self._output_cache_key
+            full_key   = self._output_cache_key
+            static_key = self._output_static_key
 
-            # Fast path: nada cambió
+            # Fast path: nada cambió en absoluto
             if (self._output_cache_val is not None
                     and full_key == getattr(self, "_output_cache_rendered_key", -1)):
                 self._last_rendered_line_count = self._output_cache_line_count
                 return self._output_cache_val
 
             # Copia shallow de refs (O(n_parts), no copia strings)
-            parts_snap  = list(self._output_parts)
-            live_active = self._live_block_active
-            live_bullet = self._live_block_bullet if live_active else ""
-            live_body   = "".join(self._live_block_body) if live_active else ""
-            live_tool_n = self._live_block_tool_n if live_active else 0
-            live_pulse  = self._live_pulse_idx
-            out_lines   = self._output_line_count  # contador incremental
+            parts_snap        = list(self._output_parts)
+            live_active       = self._live_block_active
+            live_bullet       = self._live_block_bullet if live_active else ""
+            live_action       = self._live_block_action if live_active else ""
+            live_body         = "".join(self._live_block_body) if live_active else ""
+            live_plan_hdr     = "".join(self._live_block_plan_header) if live_active else ""
+            live_tool_n       = self._live_block_tool_n if live_active else 0
+            live_current_tool      = self._live_block_current_tool if live_active else ""
+            live_preview           = list(self._live_block_preview) if live_active else []
+            live_completed_tools   = list(self._live_block_completed_tools) if live_active else []
+            live_pulse             = self._live_pulse_idx
+            out_lines         = self._output_line_count  # contador incremental
 
-        # ── 2. Operaciones pesadas fuera del lock ─────────────────────────────
-        combined = "".join(parts_snap)  # join de refs (puede ser hasta 80 KB)
+        # ── 2. Parte estática: re-parsear ANSI solo cuando cambia (no en cada blink) ──
+        # _output_static_key solo sube cuando _output_parts cambia (flush/append).
+        # El blink sube _output_cache_key pero NO _output_static_key → cache hit aquí.
+        if static_key != getattr(self, "_static_ansi_rendered_key", -1):
+            static_combined = "".join(parts_snap)
+            if static_combined:
+                try:
+                    self._static_ansi_cache = list(to_formatted_text(ANSI(static_combined)))
+                except Exception:
+                    plain = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', static_combined)
+                    self._static_ansi_cache = [("", plain)]
+            else:
+                self._static_ansi_cache = []
+            self._static_ansi_rendered_key = static_key
 
+        static_frags: list = getattr(self, "_static_ansi_cache", [])
+
+        # ── 3. Live block: solo ~6 líneas, barato de re-parsear en cada blink ─
         if live_active:
             color = _LIVE_PULSE_COLORS[live_pulse % len(_LIVE_PULSE_COLORS)]
-            lb: list[str] = [f"\n  {color}●{_LIVE_RESET} {live_bullet}"]
-            if live_body.strip():
-                lb.append(live_body.rstrip('\n'))
+            # ● muestra siempre el mensaje original; live_action solo se usa si no hay
+            # tool individual activa (caso paralelo: bullet pulsante como resumen).
+            display_bullet = live_bullet if live_current_tool else (live_action or live_bullet)
+            lb: list[str] = []
+            if live_plan_hdr.strip():
+                lb.append(live_plan_hdr.rstrip('\n'))
+            lb.append(f"\n  {color}●{_LIVE_RESET} {display_bullet}")
+            # Tools completadas anteriores (hasta 3, greyed)
+            for _ct in live_completed_tools[-3:]:
+                lb.append(f"  \x1b[2m│\x1b[0m \x1b[2m◐ {_ct}\x1b[0m")
+            # Tool activa: live_action en la misma línea si está disponible, si no, preview aparte
+            if live_current_tool:
+                _tl = f"◐ {live_current_tool}"
+                if live_action:
+                    _tl += f" {live_action}"
+                lb.append(f"  \x1b[2m│\x1b[0m \x1b[2m{_tl}\x1b[0m")
+                if not live_action and live_preview:
+                    for _pl in live_preview[:3]:
+                        lb.append(f"  \x1b[2m│    {_pl}\x1b[0m")
+            # live_body (texto del mensaje) NO se muestra en la zona live — se preserva
+            # en _live_block_body para que aparezca correctamente tras el flush.
             if live_tool_n > 0:
                 unit = "tool" if live_tool_n == 1 else "tools"
-                lb.append(f"  \x1b[2m⎿  Used {live_tool_n} {unit}  (ctrl+o to expand)\x1b[0m")
-            else:
-                circ_color = _CIRC_PULSE_COLORS[live_pulse % len(_CIRC_PULSE_COLORS)]
-                lb.append(f"  \x1b[2m⎿  {circ_color}◐\x1b[0m\x1b[2m ejecutando…\x1b[0m")
+                lb.append(f"  \x1b[2m⎿ Used {live_tool_n} {unit} (ctrl+o to expand)\x1b[0m")
             live_text = "\n".join(lb) + "\n"
-            combined  += live_text
-            # Solo contar \n en el live block (~4-6 líneas) — no en los 80 KB estáticos
             line_count = out_lines + live_text.count('\n')
+            try:
+                live_frags = list(to_formatted_text(ANSI(live_text)))
+            except Exception:
+                plain = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', live_text)
+                live_frags = [("", plain)]
+            rendered = FormattedText(static_frags + live_frags)
         else:
             line_count = out_lines
+            rendered   = FormattedText(static_frags) if static_frags else FormattedText([])
 
-        if not combined:
+        if not static_frags and not live_active:
             rendered   = FormattedText([])
             line_count = 0
-        else:
-            try:
-                rendered = ANSI(combined)   # preserva todos los colores/estilos ANSI
-            except Exception:
-                plain    = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', combined)
-                rendered = FormattedText([("", plain)])
 
-        # ── 3. Guardar caché bajo lock (solo stores baratos) ──────────────────
+        # ── 4. Guardar caché bajo lock (solo stores baratos) ──────────────────
         with self._lock:
             self._output_cache_val          = rendered
             self._output_cache_rendered_key = full_key
@@ -492,8 +568,14 @@ class OOCodeApp:
         with self._lock:
             self._live_block_active = True
             self._live_block_bullet = bullet
+            self._live_block_action = ""
             self._live_block_body = []
+            self._live_block_plan_header = []
+            self._live_block_plan_mode = False
             self._live_block_tool_n = 0
+            self._live_block_current_tool = ""
+            self._live_block_preview = []
+            self._live_block_completed_tools = []
             self._output_cache_key += 1
         try:
             self._app.invalidate()
@@ -503,12 +585,44 @@ class OOCodeApp:
     def _update_live_tools(self, count: int) -> None:
         """Actualiza el contador de tools en la línea ⎿."""
         with self._lock:
+            if self._live_block_current_tool:
+                self._live_block_completed_tools.append(self._live_block_current_tool)
+                if len(self._live_block_completed_tools) > 4:
+                    self._live_block_completed_tools.pop(0)
             self._live_block_tool_n = count
+            self._live_block_current_tool = ""
+            self._live_block_preview = []
+            self._live_block_action = ""
             self._output_cache_key += 1
-        try:
-            self._app.invalidate()
-        except Exception:
-            pass
+        # Sin invalidate() aquí — el blink timer de 350ms recoge el cambio.
+        # Las invalidaciones inmediatas desde callbacks intermedios acumulan
+        # repaints innecesarios en prompt_toolkit cuando corren múltiples tools.
+
+    def _update_live_current_tool(self, tool_label: str) -> None:
+        """Muestra el nombre de la tool ejecutando en '|  ◐ tool:' (sin preview). Prefer _update_live_tool_start."""
+        with self._lock:
+            self._live_block_current_tool = tool_label
+            self._live_block_preview = []
+            self._output_cache_key += 1
+
+    def _update_live_preview(self, lines: list) -> None:
+        """Establece las líneas de preview visibles bajo '|  ◐ tool:'. Prefer _update_live_tool_start."""
+        with self._lock:
+            self._live_block_preview = [str(l) for l in lines[:4]]
+            self._output_cache_key += 1
+
+    def _update_live_tool_start(self, tool_label: str, preview: list) -> None:
+        """Actualiza herramienta actual + preview en una sola operación atómica (evita double-flash)."""
+        with self._lock:
+            self._live_block_current_tool = tool_label
+            self._live_block_preview = [str(l) for l in preview[:4]]
+            self._output_cache_key += 1
+
+    def _update_live_bullet(self, action: str) -> None:
+        """Actualiza el texto del ● con la acción actual (restaurado al completar)."""
+        with self._lock:
+            self._live_block_action = action
+            self._output_cache_key += 1
 
     def _flush_live_block(self, summary: str = "") -> None:
         """Cierra el live block y lo mueve al buffer estático con ● de color fijo."""
@@ -528,27 +642,34 @@ class OOCodeApp:
             except Exception:
                 bullet_color = "\x1b[1;36m"
 
-            # Construir bloque final (sin pulso)
-            body_str = "".join(self._live_block_body)  # join lista → string
-            lines: list[str] = [
-                f"\n  {bullet_color}●{_LIVE_RESET} {self._live_block_bullet}"
-            ]
+            # Construir bloque final (sin pulso) — plan header encima del ●
+            plan_hdr_str = "".join(self._live_block_plan_header)
+            body_str = "".join(self._live_block_body)
+            lines: list[str] = []
+            if plan_hdr_str.strip():
+                lines.append(plan_hdr_str.rstrip('\n'))
+            lines.append(f"\n  {bullet_color}●{_LIVE_RESET} {self._live_block_bullet}")
             if body_str.strip():
                 lines.append(body_str.rstrip('\n'))
             if summary:
-                lines.append(f"  \x1b[2m⎿  {summary}\x1b[0m")
+                lines.append(f"  \x1b[2m⎿ {summary}\x1b[0m")
             elif self._live_block_tool_n > 0:
                 n = self._live_block_tool_n
                 unit = "tool" if n == 1 else "tools"
-                lines.append(f"  \x1b[2m⎿  Used {n} {unit}  (ctrl+o to expand)\x1b[0m")
-            # Sin trailing \n: el console.print() antes de cada nuevo ● ya aporta
-            # el salto de línea separador. Con trailing \n habría 2 líneas en blanco.
-            final = "\n".join(lines)
+                lines.append(f"  \x1b[2m⎿ Used {n} {unit} (ctrl+o to expand)\x1b[0m")
+            # Trailing \n: el console.print() antes de ● ya fue eliminado del loop.
+            # Separación: ⎿\n\n◈Plan (1 blank) y plan-end\n\next-●-leading-\n (1 blank).
+            final = "\n".join(lines) + "\n"
 
             self._live_block_active = False
             self._live_block_bullet = ""
+            self._live_block_action = ""
             self._live_block_body = []
+            self._live_block_plan_header = []
+            self._live_block_plan_mode = False
             self._live_block_tool_n = 0
+            self._live_block_current_tool = ""
+            self._live_block_preview = []
             self._output_parts.append(final)
             self._output_chars += len(final)
             self._output_line_count += final.count('\n')
@@ -586,11 +707,117 @@ class OOCodeApp:
         visible = min(len(tasks), 5)
         return min(1 + visible + 1, 8)
 
+    # ── Panel de subagentes ──────────────────────────────────────────────────
+
+    def _subagent_panel_height(self) -> int:
+        """Altura del panel de subagentes.
+
+        Devuelve 0 cuando no hay subagentes activos, lo que elimina el panel del
+        layout sin necesidad de un ConditionalContainer. El mínimo cuando hay
+        subagentes es 2 (header + main agent) + N líneas de subagente (max 5).
+        """
+        try:
+            from agent.subagent import list_running as _lr, list_recent as _lrec
+            # Mostrar también subagentes recientes (terminados en los últimos 10s)
+            subs = _lr()
+            if not subs:
+                subs = _lrec(ttl=10.0)[:3]   # máx 3 recientes brevemente
+            n = len(subs)
+            if n == 0:
+                return 0
+            # header(1) + N subagentes (máx 8 visibles)
+            return 1 + min(n, 8)
+        except Exception:
+            return 0
+
+    def _get_subagent_panel_text(self):
+        """Contenido del panel de subagentes (estilo Claude Code).
+
+        Formato cuando hay subagentes activos:
+          ⏵⏵  subagentes activos · ^C interrumpir · /subagents gestionar   N% ctx
+          ●  main (agent_name)                            ↑/↓ · /kill · /steer
+          ◯  emoji id  tarea...                                    Ns · ↓ running
+          ◯  emoji id  tarea...                                   Ns · ✓ done
+        """
+        try:
+            from agent.subagent import list_running as _lr, list_recent as _lrec
+            subs = _lr()
+            if not subs:
+                subs = _lrec(ttl=10.0)[:3]
+            if not subs:
+                return [("", "")]
+        except Exception:
+            return [("", "")]
+
+        # Porcentaje de contexto para la línea de header
+        try:
+            cs      = self._agent_loop.context.stats()
+            ctx_pct = int(cs["tokens_estimate"] / max(cs["max_tokens"], 1) * 100)
+            ctx_str = f" · {ctx_pct}% ctx ·"
+        except Exception:
+            ctx_str = " ·"
+
+        result: list[tuple[str, str]] = []
+
+        # Nombre e icono del agente principal
+        agent_name  = html.escape(
+            (getattr(self._agent_loop.config, "agent_name", None) or "main")[:20]
+        )
+        agent_emoji = html.escape(
+            getattr(self._agent_loop.config, "agent_emoji", "🤖") or "🤖"
+        )
+
+        # ── Línea header — todos los controles en una sola línea + ctx% · ───
+        header_l = (
+            "    ⏵⏵ Subagentes Activos"
+            " · ^C interrumpir · /subagents gestionar"
+            " · /kill · /steer"
+        )
+        result.append(("class:sub-header", header_l))
+        result.append(("class:sub-dim", ctx_str))
+        result.append(("class:sub-dim", "\n"))
+
+        # ── Líneas de subagentes: ParentName [emoji id]: tarea ─────────────
+        for sub in subs[:8]:
+            secs = sub.elapsed()
+            if secs < 60:
+                elapsed_str = f"{int(secs)}s"
+            else:
+                m, s = divmod(int(secs), 60)
+                elapsed_str = f"{m}m{s:02d}s"
+
+            if sub.status == "running":
+                icon_style = "class:sub-running"
+                st_str     = f"  {elapsed_str} ↓"
+                st_style   = "class:sub-dim"
+            elif sub.status == "done":
+                icon_style = "class:sub-done"
+                st_str     = f"  {elapsed_str} ✓"
+                st_style   = "class:sub-done"
+            else:
+                icon_style = "class:sub-dim"
+                st_str     = f"  {elapsed_str} ✗"
+                st_style   = "class:sub-dim"
+
+            # ctx% del subagente (0 si no disponible)
+            sub_ctx = f" · {sub.ctx_pct}% ctx" if sub.ctx_pct > 0 else ""
+
+            sub_label  = html.escape(f"{sub.agent_emoji} {sub.agent_id[:12]}")
+            task_short = html.escape(sub.task)
+
+            result.append(("class:sub-dim",  "  "))
+            result.append((icon_style,       f"{agent_emoji} "))
+            result.append(("class:sub-name", f"{agent_name} 💬 {sub_label}: "))
+            result.append(("class:sub-dim",  task_short))
+            result.append(("class:sub-dim",  st_str + sub_ctx))
+            result.append((st_style,         ""))
+            result.append(("class:sub-dim",  "\n"))
+
+        return result
+
     def _get_status_text(self):
         if self._perm_mode:
             desc = self._perm_description or self._perm_tool
-            if len(desc) > 72:
-                desc = desc[:72] + "…"
             return [
                 ("class:spinner", f"  ◈  {desc}"),
                 ("", "\n"),
@@ -625,7 +852,7 @@ class OOCodeApp:
             result.append(("", "\n"))
             if not tasks and line2_raw:
                 # Sin plan activo: mostrar barra de ctx/tokens en línea 2 con colores
-                result += _parse_status_line(f"  {line2_raw}", "class:dim")
+                result += _parse_status_line(f"   {line2_raw}", "class:dim")
                 result.append(("", "\n"))
             elif not tasks:
                 result.append(("", " \n"))
@@ -663,9 +890,7 @@ class OOCodeApp:
                 style  = ("class:task-done"   if status == "done"
                           else "class:task-active" if status == "active"
                           else "class:dim")
-                label  = task["text"][:52]
-                if len(task["text"]) > 52:
-                    label += "…"
+                label  = task["text"]
                 if i == 0:
                     # Primera fila visible: ⎿ connector
                     result.append(("class:dim", "  ⎿  "))
@@ -858,7 +1083,7 @@ class OOCodeApp:
             avail = max(8, tw - (prompt_w if i == 0 else 0))
             rows += max(1, (len(line) + avail - 1) // avail)
 
-        return max(1, min(8, rows))
+        return max(1, min(80, rows))
 
     # ── Historial de entrada ─────────────────────────────────────────────────
 
@@ -975,9 +1200,18 @@ class OOCodeApp:
             wrap_lines=True,
         )
 
+        # Panel de subagentes: aparece entre el separador inferior y la toolbar
+        # cuando hay subagentes o equipos activos. Altura dinámica (0 = invisible).
+        subagent_panel_window = Window(
+            content=FormattedTextControl(self._get_subagent_panel_text),
+            height=self._subagent_panel_height,
+            style="",
+        )
+
+        # Toolbar: ahora 3 líneas (indicadores / LSP / keybindings)
         toolbar_window = Window(
             content=FormattedTextControl(self._get_toolbar),
-            height=2,
+            height=3,
             style="class:bottom-toolbar",
         )
 
@@ -989,6 +1223,7 @@ class OOCodeApp:
                     sep_top,
                     input_window,
                     sep_bot,
+                    subagent_panel_window,   # panel dinámico (0 height cuando vacío)
                     toolbar_window,
                 ]),
                 floats=[
@@ -1069,6 +1304,10 @@ class OOCodeApp:
         def _(event):
             if self._perm_mode:
                 return
+            # Agente activo: ↑ desplaza el output hacia arriba (scroll)
+            if self._agent_thread and self._agent_thread.is_alive():
+                self._do_scroll_up(lines=3)
+                return
             buf = self._input_buf
             if buf.document.cursor_position_row == 0:
                 buf.history_backward()
@@ -1080,6 +1319,10 @@ class OOCodeApp:
         @kb.add("down")
         def _(event):
             if self._perm_mode:
+                return
+            # Agente activo: ↓ desplaza el output hacia abajo (scroll)
+            if self._agent_thread and self._agent_thread.is_alive():
+                self._do_scroll_down(lines=3)
                 return
             buf = self._input_buf
             doc = buf.document
@@ -1204,7 +1447,8 @@ class OOCodeApp:
             loop = self._agent_loop
             # Mostrar lint completo si el último análisis tuvo errores (siempre)
             try:
-                from tools.hooks import _last_lint_output as lint_out
+                from tools.hooks import get_last_lint_output
+                lint_out = get_last_lint_output()
                 if lint_out and "✗" in lint_out:
                     _out("  ── lint (detalle completo) ────────────────────────────\n")
                     for _ln in lint_out.splitlines():
@@ -1310,6 +1554,68 @@ class OOCodeApp:
             console.print()
             print_ctx_status(
                 self._agent_loop.context, self._config, self._agent_loop.rt,
+            )
+
+        # ── Ctrl+P — Pegar imagen del portapapeles ────────────────────────────
+        @kb.add("c-p")
+        def _(event):
+            """Pegar imagen del portapapeles (requiere xclip o wl-paste)."""
+            if self._perm_mode or self._input_mode:
+                return
+            if not (self._config.vision_enabled
+                    and self._agent_loop._model_supports_images()):
+                _out(
+                    "\n  ⚠  Visión no disponible: el modelo activo no soporta imágenes.\n"
+                    "  Cambia de modelo con /model o activa visión en oocode.json.\n\n"
+                )
+                return
+            import subprocess, tempfile
+            # ── X11: xclip ──────────────────────────────────────────────────
+            for mime, ext in [("image/png", "png"), ("image/jpeg", "jpg")]:
+                try:
+                    res = subprocess.run(
+                        ["xclip", "-selection", "clipboard", "-target", mime, "-o"],
+                        capture_output=True, timeout=5,
+                    )
+                    if res.returncode == 0 and len(res.stdout) > 100:
+                        tmp = tempfile.NamedTemporaryFile(
+                            suffix=f".{ext}", delete=False, dir="/tmp"
+                        )
+                        tmp.write(res.stdout)
+                        tmp.close()
+                        self._pending_images.append(tmp.name)
+                        _out(
+                            f"\n  🖼  Imagen pegada del portapapeles ({ext.upper()})  →  {tmp.name}\n"
+                            f"  Escribe tu mensaje y pulsa Enter para enviarla.\n\n"
+                        )
+                        return
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    pass
+            # ── Wayland: wl-paste ───────────────────────────────────────────
+            for mime, ext in [("image/png", "png"), ("image/jpeg", "jpg")]:
+                try:
+                    res = subprocess.run(
+                        ["wl-paste", "--type", mime],
+                        capture_output=True, timeout=5,
+                    )
+                    if res.returncode == 0 and len(res.stdout) > 100:
+                        tmp = tempfile.NamedTemporaryFile(
+                            suffix=f".{ext}", delete=False, dir="/tmp"
+                        )
+                        tmp.write(res.stdout)
+                        tmp.close()
+                        self._pending_images.append(tmp.name)
+                        _out(
+                            f"\n  🖼  Imagen pegada del portapapeles ({ext.upper()})  →  {tmp.name}\n"
+                            f"  Escribe tu mensaje y pulsa Enter para enviarla.\n\n"
+                        )
+                        return
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    pass
+            _out(
+                "\n  No hay imagen en el portapapeles o la herramienta no está disponible.\n"
+                "  Instala:  apt install xclip  (X11)  o  apt install wl-clipboard  (Wayland)\n"
+                "  También puedes adjuntar con:  /attach /ruta/imagen.png\n\n"
             )
 
         # ── Ctrl+Y — Copiar ──────────────────────────────────────────────────
@@ -1428,6 +1734,37 @@ class OOCodeApp:
 
         lower = text.lower()
 
+        # /attach <ruta> — adjuntar imagen al siguiente mensaje
+        if lower.startswith("/attach"):
+            rest = text[7:].strip()
+            if not rest:
+                sys.stdout.write(
+                    "  Uso: /attach <ruta>  — adjunta imagen al siguiente mensaje\n"
+                    "  Ctrl+P                — pegar imagen del portapapeles\n\n"
+                )
+                sys.stdout.flush()
+                return
+            path = os.path.expanduser(rest)
+            if not os.path.isfile(path):
+                sys.stdout.write(f"  ✗  Archivo no encontrado: {path}\n\n")
+                sys.stdout.flush()
+                return
+            _, ext = os.path.splitext(path.lower())
+            if ext not in _IMG_EXTS:
+                sys.stdout.write(
+                    f"  ✗  Formato no soportado: {ext}\n"
+                    f"  Formatos válidos: {', '.join(sorted(_IMG_EXTS))}\n\n"
+                )
+                sys.stdout.flush()
+                return
+            self._pending_images.append(path)
+            sys.stdout.write(
+                f"  🖼  Imagen adjunta: {path}\n"
+                f"  Escribe tu mensaje y pulsa Enter para enviar.\n\n"
+            )
+            sys.stdout.flush()
+            return
+
         # /kill — sin esperar al agente
         if lower in ("/kill", "/kill all"):
             if self._agent_thread and self._agent_thread.is_alive():
@@ -1485,7 +1822,6 @@ class OOCodeApp:
         if self._config.vision_enabled and self._agent_loop._model_supports_images():
             img_matches = _IMG_PATH_RE.findall(text)
             if img_matches:
-                images = []
                 for m in img_matches:
                     p = m.strip()
                     if not os.path.isabs(p) and not p.startswith("~"):
@@ -1495,10 +1831,20 @@ class OOCodeApp:
                 clean_text = _IMG_PATH_RE.sub("", text).strip()
                 if not clean_text:
                     clean_text = "Analiza la imagen."
+            # Incluir imágenes pendientes (adjuntadas con /attach o Ctrl+P)
+            if self._pending_images:
+                images.extend(self._pending_images)
+                self._pending_images.clear()
+            if images:
                 console.print(
                     f"  [dim cyan]🖼[/dim cyan]  "
-                    f"[dim]{len(images)} imagen(es) detectada(s)[/dim]"
+                    f"[dim]{len(images)} imagen(es) adjunta(s)[/dim]"
                 )
+        elif self._pending_images:
+            # Modelo sin visión pero hay imágenes pendientes — limpiar y avisar
+            self._pending_images.clear()
+            sys.stdout.write("  ⚠  El modelo activo no soporta imágenes. Imágenes descartadas.\n")
+            sys.stdout.flush()
 
         self._agent_thread = threading.Thread(
             target=self._run_agent,
@@ -1555,14 +1901,20 @@ class OOCodeApp:
 
         def _loop():
             while not stop.wait(0.35):
+                needs_redraw = False
                 with app._lock:
                     if app._live_block_active:
                         app._live_pulse_idx += 1
-                        app._output_cache_key += 1   # fuerza re-render con nuevo color
-                try:
-                    app._app.invalidate()
-                except Exception:
-                    pass
+                        app._output_cache_key += 1
+                        needs_redraw = True
+                # También invalidar cuando hay status activo (spinner del agente)
+                if not needs_redraw:
+                    needs_redraw = bool(getattr(app._agent_loop, "_status_text", ""))
+                if needs_redraw:
+                    try:
+                        app._app.invalidate()
+                    except Exception:
+                        pass
 
         threading.Thread(target=_loop, daemon=True, name="oocode-blink").start()
 

@@ -26,9 +26,9 @@ def main():
     ]
     pytest_args.extend(args)
 
-    print(f"\n{'='*64}")
+    print(f"\n{'='*60}")
     print("  OOCode Test Suite — sin tokens LLM")
-    print(f"{'='*64}\n")
+    print(f"{'='*60}\n")
 
     result = subprocess.run(pytest_args, cwd=str(ROOT))
     sys.exit(result.returncode)

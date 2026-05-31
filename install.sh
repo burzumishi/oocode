@@ -80,8 +80,35 @@ fi
 # ── Directorios de configuración ──────────────────────────────────────────────
 _info "Creando estructura de directorios en ${CONFIG_DIR}…"
 mkdir -p "${CONFIG_DIR}/plugins" "${CONFIG_DIR}/skills" "${CONFIG_DIR}/memory"
-mkdir -p "${CONFIG_DIR}/workspace/main" "${CONFIG_DIR}/workspace/coding" "${CONFIG_DIR}/workspace/reasoning"
+mkdir -p "${CONFIG_DIR}/workspace/main" "${CONFIG_DIR}/workspace/main/memory" "${CONFIG_DIR}/sessions"
 _ok "Directorios creados"
+
+# ── Workspace del agente principal ─────────────────────────────────────────────
+# Solo copia las plantillas a workspace/main; los demás agentes los inicializa oocode al arrancar.
+_info "Inicializando workspace del agente principal…"
+ws_src="${REPO_DIR}/workspace/templates"
+ws_dst="${CONFIG_DIR}/workspace/main"
+copied_w=0; skipped_w=0
+if [ -d "${ws_src}" ]; then
+    for src in "${ws_src}"/*.md; do
+        [ -f "${src}" ] || continue
+        name="$(basename "${src}")"
+        dst="${ws_dst}/${name}"
+        if [ ! -f "${dst}" ]; then
+            cp "${src}" "${dst}"
+            copied_w=$((copied_w + 1))
+        else
+            skipped_w=$((skipped_w + 1))
+        fi
+    done
+    if [ "${copied_w}" -gt 0 ] || [ "${skipped_w}" -gt 0 ]; then
+        _ok "${copied_w} fichero(s) copiado(s) a ${ws_dst}, ${skipped_w} ya existían"
+    else
+        _warn "No se encontraron ficheros .md en workspace/templates"
+    fi
+else
+    _warn "workspace/templates no encontrado — oocode inicializará el workspace al arrancar"
+fi
 
 # ── Plugins ───────────────────────────────────────────────────────────────────
 _info "Sincronizando plugins…"

@@ -359,7 +359,7 @@ class TestNewBuiltinsRegistration:
         assert "size_check_after_write" in available
 
     def test_total_builtins_count(self):
-        assert len(_BUILTINS) == 19  # 9 originales + todo_scan + test_after_write + size_check + verify_after_edit + test_suite_delta + interface_change_detector
+        assert len(_BUILTINS) == 22  # 19 anteriores + dead_code_detection + deadlock_detection + performance_profiling
 
     def test_register_todo_scan(self):
         hm = HookManager()

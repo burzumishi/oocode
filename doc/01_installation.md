@@ -18,7 +18,7 @@ curl -fsSL https://ollama.com/install.sh | sh
 # Arrancar el servidor
 ollama serve
 
-# Servidor en otra máquina de la red (sin autenticación)
+# Servidor disponible en toda la red local
 OLLAMA_HOST=0.0.0.0 ollama serve
 ```
 
@@ -35,7 +35,7 @@ ollama pull qwen3.5:4b
 # Razonamiento extendido
 ollama pull deepseek-r1:8b
 
-# Modelo de embeddings (para memoria semántica — necesario para /mem)
+# Modelo de embeddings (memoria semántica y RAG — necesario para /mem y /rag)
 ollama pull nomic-embed-text-v2-moe
 ```
 
@@ -49,7 +49,7 @@ ollama show qwen3.5:9b | grep -i tool
 ### Opción 1 — Instalador (recomendada)
 
 ```bash
-git clone https://github.com/tu-usuario/oocode
+git clone https://github.com/burzumishi/oocode
 cd oocode
 ./install.sh
 ```
@@ -63,13 +63,13 @@ El instalador hace todo lo necesario:
 Como es una **instalación editable**, `git pull` actualiza OOCode inmediatamente:
 
 ```bash
-cd /ruta/a/oocode && git pull   # actualiza el código
-# oocode ya usa la nueva versión — sin reinstalar
+cd /ruta/a/oocode && git pull   # actualiza el código sin reinstalar
 ```
 
 ### Opción 2 — pip manual
 
 ```bash
+pip install -r requirements.txt
 pip install --user -e /ruta/a/oocode
 ```
 
@@ -93,7 +93,7 @@ python /ruta/a/oocode/oocode.py
 
 ## Dependencias Python
 
-Gestionadas automáticamente por `pip install -e .`:
+Gestionadas automáticamente por `pip install -r requirements.txt`:
 
 ```
 ollama>=0.4.0          # SDK oficial de Ollama
@@ -105,14 +105,50 @@ ddgs>=9.0.0            # DuckDuckGo sin API key
 pydantic>=2.0.0        # Validación de configuración
 pydantic-settings>=2.0.0
 pyperclip>=1.8.0       # Portapapeles (/copy)
+flask                  # WebUI (puerto 4000)
 ```
 
-Dependencias opcionales (para plugins específicos):
+### Dependencias opcionales — Office (home-office-assistant MCP)
 
 ```bash
-pip install cryptography   # plugin 'vault' (credenciales cifradas)
-pip install tree-sitter    # plugin 'tree_sitter' (análisis AST)
-pip install ruff           # plugin 'linter' (Python)
+pip install python-docx>=1.0 python-pptx>=1.0 openpyxl>=3.1 matplotlib pillow docxtpl
+
+# Verificar:
+python -c "import docx, openpyxl, pptx, matplotlib, docxtpl; print('OK')"
+```
+
+### Dependencias opcionales — Vault cifrado
+
+```bash
+pip install cryptography   # vault de credenciales SSH/Git/API (AES-Fernet + PBKDF2)
+```
+
+### Dependencias opcionales — LSP servers
+
+Instala los servidores LSP según los lenguajes que uses:
+
+```bash
+# Python
+pip install python-lsp-server[all]       # pylsp
+
+# JavaScript / TypeScript
+npm install -g typescript-language-server typescript
+
+# Rust
+rustup component add rust-analyzer
+
+# Go
+go install golang.org/x/tools/gopls@latest
+
+# C/C++
+apt install clangd      # o brew install llvm
+
+# Lua
+# Descargar lua-language-server desde https://github.com/LuaLS/lua-language-server
+
+# YAML / JSON / TOML
+npm install -g yaml-language-server
+npm install -g vscode-langservers-extracted   # JSON
 ```
 
 ## Primer arranque
@@ -122,7 +158,7 @@ pip install ruff           # plugin 'linter' (Python)
 oocode
 
 # Apuntar a Ollama en red local
-oocode --host http://192.168.1.33:11434
+oocode --host http://192.168.1.100:11434
 
 # Con modelo predefinido, sin selector
 oocode --model qwen3.5:9b
@@ -132,6 +168,9 @@ oocode --model qwen3.5:9b /home/user/mi-proyecto
 
 # Agente específico
 oocode --agent coding
+
+# Diagnóstico del sistema
+oocode --doctor
 ```
 
 Al primer arranque se crea automáticamente `~/.oocode/oocode.json` con la configuración por defecto.
@@ -145,12 +184,13 @@ Desde el REPL de OOCode:
 
 El comando `/doctor` comprueba:
 - Conectividad con Ollama y versión
-- Disponibilidad del modelo configurado
-- Modelo de embeddings
+- Disponibilidad del modelo configurado y el de embeddings
 - SearXNG (si está configurado)
-- Dependencias Python
-- Herramientas externas (git, docker, ctags, ruff, etc.)
-- Ficheros de configuración
+- Dependencias Python instaladas
+- Herramientas externas: git, docker, ruff, ctags, ripgrep, etc.
+- LSP servers instalados
+- Servidores MCP bundled activos
+- Ficheros de configuración y workspaces
 
 ## Actualización
 
@@ -158,32 +198,79 @@ El comando `/doctor` comprueba:
 cd /ruta/a/oocode
 git pull
 # Con pip install -e . no hay que reinstalar — los cambios son inmediatos.
-# Si se añadieron nuevas dependencias en requirements.txt:
-pip install --user -r requirements.txt --upgrade
+# Si se añadieron nuevas dependencias:
+pip install -r requirements.txt --upgrade
 ```
 
 Los ficheros en `~/.oocode/` (configuración, memoria, sesiones) se conservan entre versiones.
 
-## Configuración de modelos al primer arranque
+## Despliegue de SearXNG (búsqueda web privada, opcional)
 
-OOCode muestra un selector interactivo si no hay modelo configurado. Para saltar el selector, configura el modelo en `~/.oocode/oocode.json` bajo `agents.list[].model` o `agents.defaults.model`.
+SearXNG elimina la dependencia de DuckDuckGo y permite búsquedas sin rate-limits ni tracking.
 
-Ver `doc/02_configuration.md` para ejemplos completos por hardware (16 GB, 8 GB VRAM).
+```yaml
+# docker-compose.searxng.yml
+version: "3.8"
+services:
+  searxng:
+    image: searxng/searxng:latest
+    ports:
+      - "8888:8080"
+    volumes:
+      - searxng-config:/etc/searxng
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8888/
+      - SEARXNG_SECRET_KEY=cambiar-por-clave-aleatoria
+    restart: unless-stopped
+volumes:
+  searxng-config:
+```
+
+```bash
+docker compose -f docker-compose.searxng.yml up -d
+```
+
+Configura en `~/.oocode/oocode.json`:
+```json
+{
+  "searxng": {
+    "url": "http://localhost:8888",
+    "enabled": true,
+    "maxResults": 8
+  }
+}
+```
 
 ## Estructura de directorios tras la instalación
 
 ```
 ~/.oocode/
-├── oocode.json           # configuración principal
-├── oocode.json.bak       # backup automático
-├── history               # historial del REPL
-├── plugins/              # plugins activos (sincronizados desde el repo)
-├── skills/               # skills activos (sincronizados desde el repo)
-├── memory/<agent_id>/    # memoria semántica persistente por agente
-│   ├── MEMORY.md         # índice de memorias
-│   ├── *.md              # ficheros de memoria individual
-│   └── *.emb.json        # vectores de embedding
-├── workspace/<agent_id>/ # contexto de workspace por agente
-├── sessions/<agent_id>/  # historial de sesiones (JSONL)
-└── logs/oocode.log       # log rotativo de actividad
+├── oocode.json               # configuración principal
+├── oocode.json.bak           # backup automático
+├── history                   # historial del REPL
+│
+├── workspace/
+│   └── <agent_id>/           # workspace por agente
+│       ├── IDENTITY.md       # quién es el agente
+│       ├── SOUL.md           # cómo actúa
+│       ├── USER.md           # información sobre el usuario
+│       ├── AGENTS.md         # guía del workspace y arranque
+│       ├── HEARTBEAT.md      # tareas periódicas del agente
+│       ├── TOOLS.md          # entorno local y herramientas
+│       ├── MEMORY.md         # memoria a largo plazo editable
+│       └── memory/           # logs diarios (YYYY-MM-DD.md)
+│
+├── sessions/
+│   └── <agent_id>/           # historial de sesiones (JSONL)
+│
+├── memory/
+│   └── <agent_id>/           # memoria semántica por agente
+│       ├── MEMORY.md         # índice de memorias
+│       ├── *.md              # ficheros de memoria individual
+│       └── *.emb.json        # vectores de embedding
+│
+└── logs/
+    ├── oocode.log            # log rotativo de actividad
+    ├── tool_calls.jsonl      # registro de tool calls (si hook activo)
+    └── security_audit.log    # auditoría de tools de seguridad
 ```

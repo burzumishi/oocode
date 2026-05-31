@@ -582,7 +582,7 @@ class TestCounts:
 
     def test_total_prompts_count(self):
         from mcp_servers.oocode_assistant import _PROMPTS
-        assert len(_PROMPTS) == 45, f"Se esperaban 45 prompts, hay {len(_PROMPTS)}"
+        assert len(_PROMPTS) == 49, f"Se esperaban 49 prompts, hay {len(_PROMPTS)}"
 
     def test_total_resources_count(self):
         from mcp_servers.oocode_assistant import _RESOURCES

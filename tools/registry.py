@@ -1,5 +1,6 @@
-import hashlib
+import inspect
 import json
+from collections import OrderedDict
 from typing import Any, Callable, Optional
 
 from tools.hooks import HookManager
@@ -36,6 +37,8 @@ _NO_CACHE_BASE: frozenset[str] = frozenset({
 })
 _NO_CACHE_SUFFIXES: frozenset[str] = frozenset(f"_{n}" for n in _NO_CACHE_BASE)
 
+_DEFAULT_CACHE_MAX_SIZE: int = 200  # entradas máx por defecto; anulable via config.tool_cache_max_size
+
 
 def _is_no_cache(name: str) -> bool:
     """True si la tool tiene side-effects y no debe cachearse (incluyendo MCP prefijadas)."""
@@ -48,24 +51,34 @@ def _is_no_cache(name: str) -> bool:
 _NO_CACHE = _NO_CACHE_BASE
 
 
-def _args_hash(args: dict) -> str:
-    return hashlib.md5(
-        json.dumps(args, sort_keys=True, ensure_ascii=False).encode()
-    ).hexdigest()[:12]
+def _args_key(args: dict) -> str:
+    """Clave canónica determinista para el caché LRU.  Sin hashing: el caché es
+    intra-turno (≤200 entradas) y los args de tools cacheables son pequeños;
+    la serialización exacta elimina cualquier riesgo de colisión silenciosa."""
+    return json.dumps(args, sort_keys=True, ensure_ascii=False)
 
 
 class ToolRegistry:
     def __init__(self):
         self._tools: dict[str, tuple[Callable, dict]] = {}
-        self._cache: dict[str, str] = {}   # "(name):(args_hash)" → result
+        self._cache: OrderedDict[str, str] = OrderedDict()  # LRU: más reciente al final
+        # Parámetros válidos por tool, calculados una vez en register().
+        # None → la función acepta **kwargs, no hay que filtrar.
+        self._valid_params: dict[str, Optional[frozenset[str]]] = {}
         self.hooks = HookManager()
         self._cache_enabled:  bool = True
-        self._cache_max_size: int  = 200
+        self._cache_max_size: int  = _DEFAULT_CACHE_MAX_SIZE
         self._cache_hits:     int  = 0
         self._cache_misses:   int  = 0
 
     def register(self, name: str, fn: Callable, schema: dict) -> None:
         self._tools[name] = (fn, schema)
+        sig = inspect.signature(fn)
+        accepts_var_kw = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in sig.parameters.values()
+        )
+        self._valid_params[name] = None if accepts_var_kw else frozenset(sig.parameters.keys())
 
     def has(self, name: str) -> bool:
         return name in self._tools
@@ -124,14 +137,20 @@ class ToolRegistry:
 
         # ── Caché intra-turno ──────────────────────────────────────────────
         if cacheable:
-            cache_key = f"{name}:{_args_hash(arguments)}"
+            cache_key = f"{name}:{_args_key(arguments)}"
             if cache_key in self._cache:
+                self._cache.move_to_end(cache_key)  # LRU: marcar como reciente
                 self._cache_hits += 1
                 return self._cache[cache_key]
             self._cache_misses += 1
 
         # ── Ejecución ──────────────────────────────────────────────────────
         try:
+            # Filtrar kwargs que la función no acepta (el LLM a veces inventa parámetros).
+            # _valid_params[name] fue calculado una vez en register(); None = acepta **kwargs.
+            valid = self._valid_params.get(name)
+            if valid is not None:
+                arguments = {k: v for k, v in arguments.items() if k in valid}
             result = fn(**arguments)
         except Exception as e:
             result = f"Error ejecutando '{name}': {e}"
@@ -141,11 +160,10 @@ class ToolRegistry:
         # ── Post-hooks ─────────────────────────────────────────────────────
         result = self.hooks.run_post(name, arguments, result)
 
-        # ── Guardar en caché ───────────────────────────────────────────────
+        # ── Guardar en caché (LRU) ─────────────────────────────────────────
         if cacheable:
-            # Evicción simple si se supera el límite
             if len(self._cache) >= self._cache_max_size:
-                self._cache.clear()
+                self._cache.popitem(last=False)  # desaloja la entrada menos reciente
             self._cache[cache_key] = result
 
         return result

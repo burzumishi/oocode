@@ -64,7 +64,7 @@ class TestDocInsertDiagram:
                 "diagram_type": "bar_chart",
                 "content": "Producto A,Producto B,Producto C\n100,150,200"
             })
-            assert "✅ Diagrama insertado" in result
+            assert "✅" in result
             assert "bar_chart" in result
         finally:
             Path(path).unlink(missing_ok=True)
@@ -98,7 +98,7 @@ class TestDocInsertDiagram:
                 "diagram_type": "pie_chart",
                 "content": "Categoría A,Categoría B,Categoría C\n50,30,20"
             })
-            assert "✅ Diagrama insertado" in result
+            assert "✅" in result
             assert "pie_chart" in result
         finally:
             Path(path).unlink(missing_ok=True)

@@ -46,7 +46,7 @@ Edita `~/.oocode/oocode.json` o usa `/config edit`:
 
 ```json
 "searxng": {
-  "url":        "http://192.168.1.33:8888",
+  "url":        "http://192.168.1.100:8888",
   "enabled":    false,
   "maxResults": 5,
   "categories": "general",
@@ -128,7 +128,7 @@ buscar_searxng(query="python asyncio tutorial", categories="it,science", max_res
 
 Cuando el plugin está activo con URL configurada, inyecta en el system prompt:
 ```
-Motor de búsqueda web activo: SearXNG en http://192.168.1.33:8888.
+Motor de búsqueda web activo: SearXNG en http://192.168.1.100:8888.
 Categorías disponibles: general, news, science, it, images, videos.
 ```
 

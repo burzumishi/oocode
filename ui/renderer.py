@@ -9,6 +9,7 @@ from rich.columns import Columns
 from rich import box
 from config import APP_NAME, APP_SUBTITLE, VERSION
 from ui.console import console
+from agent.loop_helpers import _fmt_tokens, _ctx_bar
 
 # Paleta de colores
 C_BRAND   = "bold white"
@@ -320,8 +321,7 @@ def print_spawn_header(agent_name: str, agent_emoji: str, task: str) -> None:
         f"[bold cyan]↳ Subagente {agent_emoji} {agent_name}[/bold cyan]",
         style="cyan dim",
     )
-    task_preview = task[:80] + "…" if len(task) > 80 else task
-    console.print(f"  [dim]Tarea:[/dim] {task_preview}")
+    console.print(f"  [dim]Tarea:[/dim] {task}")
     console.print()
 
 
@@ -331,23 +331,6 @@ def print_spawn_footer(agent_name: str) -> None:
 
 
 # ── Sesiones ───────────────────────────────────────────────────────────────────
-
-def _fmt_tokens(n: int) -> str:
-    if n >= 1_000_000:
-        return f"{n/1_000_000:.1f}M"
-    if n >= 1_000:
-        return f"{n/1_000:.1f}K"
-    return str(n)
-
-
-def _progress_bar(used: int, total: int, width: int = 20) -> str:
-    if total <= 0:
-        return "─" * width
-    pct = min(used / total, 1.0)
-    filled = int(pct * width)
-    bar = "█" * filled + "░" * (width - filled)
-    color = "green" if pct < 0.6 else "yellow" if pct < 0.85 else "red"
-    return f"[{color}]{bar}[/{color}]"
 
 
 def print_context(context, config, session) -> None:
@@ -384,7 +367,7 @@ def print_context(context, config, session) -> None:
     )
     t.add_row(
         "Progreso",
-        _progress_bar(est_tokens, max_tokens) + f"  [dim]{int(min(est_tokens/max_tokens,1)*100)}%[/dim]",
+        _ctx_bar(est_tokens, max_tokens, width=20) + f"  [dim]{int(min(est_tokens/max_tokens,1)*100)}%[/dim]",
     )
     t.add_row("Compactaciones", str(stats["compactions"]) if stats["compactions"] else "[dim]ninguna[/dim]")
     console.print(t)
@@ -578,7 +561,7 @@ def print_ctx_status(context, config, runtime) -> None:
     """Estado detallado del contexto: tokens, modo, resumen acumulado."""
     stats = context.stats()
     pct = int(stats["tokens_estimate"] / max(stats["max_tokens"], 1) * 100)
-    bar = _progress_bar(stats["tokens_estimate"], stats["max_tokens"])
+    bar = _ctx_bar(stats["tokens_estimate"], stats["max_tokens"], width=20)
 
     console.print()
     console.rule("[bold cyan]Contexto[/bold cyan]", style="blue")
@@ -921,17 +904,12 @@ def print_config_full(config) -> None:
             ("maxSizeMb",   str(config.log_max_size)),
             ("maxFiles",    str(config.log_max_files)),
         ]),
-        ("Opciones del modelo", [
+        ("Defaults globales de modelos", [
             (k, str(v)) for k, v in [
-                ("temperature",    config.model_temperature),
-                ("top_p",          config.model_top_p),
-                ("top_k",          config.model_top_k),
-                ("num_ctx",        config.model_num_ctx),
-                ("num_predict",    config.model_num_predict),
                 ("repeat_penalty", config.model_repeat_penalty),
                 ("seed",           config.model_seed),
             ] if v is not None
-        ] or [("—", "[dim](usando defaults del modelo)[/dim]")]),
+        ] or [("—", "[dim](sin defaults globales)[/dim]")]),
         ("Permisos de herramientas", [
             (tool, f"[green]{mode}[/green]" if mode == "auto" else
                    f"[yellow]{mode}[/yellow]" if mode == "ask" else

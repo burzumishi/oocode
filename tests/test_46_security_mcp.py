@@ -377,7 +377,9 @@ class TestSecretScan:
         with tempfile.TemporaryDirectory() as d:
             (Path(d) / "config.py").write_text("password = 'mysupersecretpassword123'\n")
             result = _tool_secret_scan({"path": d})
-        assert "password" in result.lower() or "secret" in result.lower() or "sin secrets" in result.lower()
+        # gitleaks may not match this pattern; accept its "no leaks" output too
+        assert ("password" in result.lower() or "secret" in result.lower()
+                or "sin secrets" in result.lower() or "no leaks" in result.lower())
 
     def test_scan_dir_clean(self):
         with tempfile.TemporaryDirectory() as d:
@@ -396,7 +398,8 @@ class TestSecretScan:
         with tempfile.TemporaryDirectory() as d:
             (Path(d) / "key.pem").write_text("-----BEGIN RSA PRIVATE KEY-----\nMIIEo...\n")
             result = _tool_secret_scan({"path": d})
-        assert "Private Key" in result or "sin secrets" in result.lower()
+        # gitleaks may not match truncated/test keys; accept its "no leaks" output too
+        assert "Private Key" in result or "sin secrets" in result.lower() or "no leaks" in result.lower()
 
     def test_missing_path(self):
         result = _tool_secret_scan({"path": "/tmp/nonexistent_oocode_xyz123"})

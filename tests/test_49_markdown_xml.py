@@ -465,7 +465,7 @@ class TestTotals:
 
     def test_prompt_count_45(self):
         from mcp_servers.oocode_assistant import _PROMPTS
-        assert len(_PROMPTS) == 45
+        assert len(_PROMPTS) == 49
 
     def test_permissions_for_new_tools(self):
         from config import DEFAULT_CONFIG

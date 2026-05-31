@@ -108,7 +108,7 @@ class TestSubagentIntegration:
     def test_subagent_queue_management(self, mock_config, mock_build_registry):
         """Test gestión de cola de subagentes."""
         from agent.subagent import _enqueue, _dequeue, _subagent_queue
-        import time
+        import threading
         
         # Crear subagentes mock
         sub1 = MagicMock()
@@ -121,15 +121,15 @@ class TestSubagentIntegration:
         _enqueue(sub2)
         
         # Verificar orden en cola (mayor prioridad primero)
-        with _subagent_queue.__class__._queue_lock:
-            queue_copy = list(_subagent_queue)
+        # Nota: _subagent_queue es una lista, no tiene lock
+        queue_copy = list(_subagent_queue)
         
         # El de mayor prioridad debe estar primero
         assert queue_copy[0][1] >= queue_copy[1][1]
     
     def test_subagent_termination(self, mock_config, mock_build_registry):
         """Test terminación de subagentes."""
-        from agent.subagent import SubAgentRunner, kill
+        from agent.subagent import SubAgentRunner
         
         runner = SubAgentRunner(
             config=mock_config,
@@ -192,7 +192,24 @@ class TestSubagentIntegration:
 
 class TestSubagentIntegrationWithAgent:
     """Tests de integración de subagentes con agente principal."""
-    
+
+    @pytest.fixture
+    def mock_config(self):
+        config = MagicMock()
+        config.agents = [
+            MagicMock(id="main", name="main", emoji="🤖"),
+            MagicMock(id="coding", name="coding", emoji="💻"),
+            MagicMock(id="reasoning", name="reasoning", emoji="🧠"),
+            MagicMock(id="home_office", name="home_office", emoji="📋"),
+        ]
+        return config
+
+    @pytest.fixture
+    def mock_build_registry(self, mock_config):
+        def build_registry(workspace, config):
+            return {}
+        return build_registry
+
     @pytest.fixture
     def mock_agent_loop(self):
         """Mock de AgentLoop."""

@@ -1,5 +1,20 @@
 # 11 — Arquitectura interna
 
+## Visión general
+
+OOCode es un agente LLM local que combina un TUI interactivo (prompt_toolkit + Rich), un bucle de inferencia con Ollama y un ecosistema de herramientas via MCP.
+
+```
+oocode.py  →  agent/runtime.py  →  agent/loop.py  →  Ollama API
+                                        │
+                              tool dispatch (MCP + nativos)
+                                        │
+                    tools/           mcp_servers/        agent/lsp_client.py
+                    registry.py      (stdio JSON-RPC)    (Language Servers)
+                                        │
+                    WebUI (Flask + SSE)     extensiones (VIM / VSCode)
+```
+
 ## Estructura de módulos
 
 ```
@@ -15,9 +30,11 @@ oocode/
 │   ├── session.py         # SessionManager: persistencia JSONL de sesiones
 │   ├── runtime.py         # RuntimeSettings: estado en memoria (think, color, dirs…)
 │   ├── branches.py        # BranchManager: snapshots de conversación
-│   ├── tasks.py           # TaskManager: lista todo/wip/done persistente
+│   ├── tasks.py           # TaskManager: lista todo/wip/done persistente + AgentTeam
 │   ├── scheduler.py       # Scheduler: jobs periódicos
 │   ├── subagent.py        # SubAgentRunner: lanza AgentLoop aislado para spawning
+│   ├── mcp_client.py      # MCPClient: cliente stdio JSON-RPC 2.0 para servidores MCP
+│   ├── lsp_client.py      # LSP client: Language Server Protocol sobre stdio/socket
 │   └── logger.py          # Logger: RotatingFileHandler + funciones info/debug/error
 │
 ├── tools/
@@ -25,20 +42,34 @@ oocode/
 │   ├── permissions.py     # PermissionManager: modos auto/ask/deny por herramienta
 │   ├── filesystem.py      # read_file, write_file, edit_file, edit_files, list_dir
 │   ├── bash.py            # bash_execute + factory build_bash_schema
-│   ├── search.py          # web_search (DuckDuckGo), web_fetch + factories
-│   ├── code_search.py     # code_search via ripgrep — streaming con Popen + select
-│   ├── progress.py        # Thread-local progress callbacks: set_progress_callback / report_progress
-│   ├── hooks.py           # HookManager: 8 built-in hooks (diff, ctags, lint, lsp, autoformat, backup, secrets, log)
-│   ├── diff_renderer.py   # Visual diff rendering con colores Rich
-│   └── ctags_index.py     # Symbol indexing via universal-ctags
+│   ├── search.py          # web_search (DuckDuckGo/SearXNG), web_fetch
+│   ├── code_search.py     # code_search via ripgrep — streaming con Popen
+│   ├── hooks.py           # HookManager: 18 hooks built-in
+│   ├── progress.py        # Thread-local progress callbacks
+│   └── diff_renderer.py   # Visual diff rendering con colores Rich
 │
 ├── ui/
 │   ├── repl.py            # REPL: prompt_toolkit input, routing /slash vs agente
 │   ├── renderer.py        # Rich: markdown, tablas, spinners, status, config
-│   └── commands.py        # Registro + handlers de /slash commands
+│   ├── commands.py        # Registro + handlers de /slash commands
+│   └── console.py         # Shared Rich Console (todos los módulos usan éste)
+│
+├── mcp_servers/           # Servidores MCP bundled (proceso stdio independiente)
+│   ├── oocode_assistant.py    # ~35 tools: git, docker, fs, grep, symbols, utils
+│   ├── system_assistant.py    # systemctl, journalctl, red, disco, procesos
+│   ├── home_office_assistant.py # 77+ tools: Office, email, calendario
+│   ├── security_assistant.py  # 24 tools: nmap, web, crypto, CTF
+│   └── iot_assistant.py       # 25 tools: TAPO, Alexa, HA, MQTT, ESPHome
+│
+├── webui/
+│   └── app.py             # Flask + SSE: WebUI completa con chat, config, agentes
+│
+├── extensions/
+│   ├── vim/               # Plugin VIM v3.0.0: comandos, mappings, SSE streaming
+│   └── vscode/            # Extensión VSCode
 │
 ├── plugins/
-│   └── manager.py         # PluginManager: carga dinámica, hooks, herramientas, comandos
+│   └── manager.py         # PluginManager: carga dinámica, hooks, herramientas
 │
 ├── skills/
 │   └── manager.py         # SkillManager: carga dinámica de herramientas Python
@@ -55,28 +86,25 @@ python oocode.py [args]
   ├── OOConfig.load(agent_id)           # carga oocode.json
   ├── log.init(...)                      # inicializa logger rotativo
   ├── print_banner(config)
-  ├── WorkspaceManager.init()           # crea OOCODE.md si no existe
+  ├── WorkspaceManager.init()           # crea OOCODE.md y workspace files si no existen
   ├── select_model_interactive()        # si no hay modelo configurado
   │
   ├── PermissionManager(permissions)
   ├── EmbeddingClient(host, embed_model)  # una sola instancia — compartida
   ├── MemorySystem(embed_client, ...)
-  ├── build_registry(workspace, config) # registra todas las herramientas
+  ├── build_registry(workspace, config) # registra todas las herramientas nativas
+  ├── MCPClient(config) → spawn MCP servers (stdio JSON-RPC)
   ├── SubAgentRunner(config, ..., embed_client)  # recibe el mismo embed_client
   │     └── registry.register("spawn_subagent", ...)
   │
   ├── SessionManager.start()
-  ├── AgentLoop(config, registry, ...)   # no crea EmbeddingClient propio
-  │
+  ├── AgentLoop(config, registry, ...)
   ├── BranchManager / TaskManager / Scheduler
   │
   ├── SkillManager(enabled_override=config.skills_enabled)
-  │     └── load_tools() → registry.register(...)
-  │
   ├── PluginManager(enabled_override=config.plugins_enabled)
-  │     ├── load_all(config)   → on_start(config) por plugin
-  │     └── get_tools() → registry.register(...) [sobreescribe]
   │
+  ├── (si --webserver) → run_webserver_standalone()
   └── run_repl(agent, config)           # bucle REPL
 ```
 
@@ -92,119 +120,157 @@ run_repl()
         │
         ├── context.add("user", mensaje)
         ├── session.log_message("user", ...)
-        ├── log.debug("user_message")
+        ├── inject RAG snippets si rag.enabled
         │
         └── while True:
               │
               ├── context.should_compact() → _do_compact()
               ├── messages = context.get_messages(system=_system_prompt())
-              ├── _stream_response(messages, tools)  → Ollama.chat(stream=False)
-              │
-              ├── si error → log.error("llm_error") → return error str
+              ├── _stream_response(messages, tools)  → Ollama.chat()
               │
               ├── si text → Markdown render + session.log_message("assistant")
               │
               └── para cada tool_call:
-                    ├── _show_tool_call(name, args)
+                    ├── _show_tool_call(name, args)   # spinner ◐
                     ├── permissions.check(name)
                     │     ├── auto → ejecuta
                     │     ├── ask  → pide confirmación al usuario
                     │     └── deny → "Operación denegada"
                     ├── registry.call(name, args)
-                    ├── log.debug("tool_call", ...)
+                    │     ├── busca en tools nativos
+                    │     └── si no encuentra → MCPClient.call(name, args)
+                    ├── hooks.post_tool(name, args, result)
                     ├── _truncate_tool_result(result)
                     └── context.add_tool_result(...)
               │
+              ├── auto-continue si respuesta vacía y autoContinueMax > 0
               └── si no hay tool_calls → break
 ```
 
 ## Componentes clave
 
-### `OOConfig` (Pydantic BaseModel)
+### `AgentLoop` (agent/loop.py)
 
-Carga de `oocode.json` con validación. Los campos son atributos Python tipados. `config.save()` serializa de vuelta a JSON. Cada componente recibe exactamente los campos que necesita (no el objeto completo) excepto en `on_start(config)` de plugins.
+El corazón de OOCode. Implementa:
+- Streaming de respuestas del LLM
+- Dispatch de tool calls (nativas + MCP)
+- TUI: live block con preview de herramientas, auto-split bullet, spinner ◐ pulsante, display compacto (`⎿`), plan tracker (`◈`)
+- Auto-continuación en tareas largas
+- Compactación de contexto
+- Checkpoint de tarea en auto-continúas
 
-### `ToolRegistry`
+El indicador visual durante tools (modo TUI):
+```
+  ● Texto del agente (pulsante en verde/cyan)
+  |  ◐ Bash:
+  |     $ grep -rn "gethostname" src/    ← preview de args, desaparece al terminar
+  ⎿ Used 2 tools (ctrl+o to expand)
+```
 
-Diccionario `nombre → (función, schema)`. El método `ollama_schemas()` devuelve la lista de schemas en formato Ollama para pasarla a `chat()`. El método `call(nombre, args)` invoca la función con `**args` y captura excepciones.
+El auto-split separa planning text largo de las ediciones concretas:
+```
+  ● Voy a refactorizar el módulo completo corrigiendo todos los warnings...
 
-### `ConversationContext`
+  ● Updating act_comm.c:         ← auto-generado cuando el texto no menciona el fichero
+  |  ◐ Update:
+  |     act_comm.c
+  ⎿ Updated act_comm.c (ctrl+o to expand)
+```
 
-Lista de mensajes + resumen acumulado. El método `get_messages(system=...)` antepone el system prompt. `should_compact()` compara tokens estimados con el umbral. `compact(summarize_fn)` elimina mensajes y llama opcionalmente al summarizador.
+Ver `doc/24_tui_display.md` para la documentación completa del live block.
 
-### `AgentLoop`
+### `MCPClient` (agent/mcp_client.py)
 
-El corazón de OOCode. Mantiene el cliente Ollama, el contexto, la memoria y todos los managers. El método `run(mensaje)` ejecuta un turno completo. Los atributos `branches`, `tasks`, `scheduler`, `skills`, `plugins` se asignan desde `oocode.py` tras la construcción.
+Gestiona los servidores MCP bundled y externos:
+- Protocolo MCP 2024-11-05 sobre stdio (JSON-RPC 2.0)
+- Arranque de procesos independientes (`subprocess.Popen`)
+- Reconexión automática
+- Paginación de tools/resources
+- Reenvío transparente al `ToolRegistry`
 
-`AgentLoop` no crea ni posee ningún `EmbeddingClient`; toda la lógica de embeddings pasa por `MemorySystem`, que recibe el cliente compartido al construirse.
+### `ToolRegistry` (tools/registry.py)
 
-### `PluginManager` vs `SkillManager`
+Diccionario `nombre → (función, schema)`:
+- `ollama_schemas()` devuelve schemas en formato Ollama para `chat()`
+- `call(nombre, args)` invoca la función con `**args` y captura excepciones
+- Filtrado adaptativo: reduce ~4-6K tokens enviando solo schemas relevantes para el tipo de tarea
 
-| | PluginManager | SkillManager |
-|-|---------------|--------------|
-| Fuente de verdad enabled | `oocode.json` + `enabled.json` | `oocode.json` + `enabled.json` |
-| Hooks | on_start, on_message, etc. | No |
-| Comandos /slash | Sí | No |
-| Sobreescribir built-ins | Sí | No (usa `if not registry.has()`) |
-| Inyección system prompt | Sí | No |
+### `ConversationContext` (agent/context.py)
 
-### `RuntimeSettings` (dataclass)
+Lista de mensajes + resumen acumulado:
+- `should_compact()` compara tokens estimados con el umbral `compactThreshold`
+- `compact(summarize_fn)` elimina mensajes y llama opcionalmente al LLM
+- `get_messages(system=...)` antepone el system prompt
 
-Estado de sesión en memoria (no persiste). Controla think_level, fast_mode, verbose, accent_color, extra_dirs, etc. Se pasa a los command handlers para que puedan modificarlo.
+### `HookManager` (tools/hooks.py)
 
-## Patrones de diseño usados
+18 hooks built-in con sistema pre/post:
+- `pre_tool(name, args)` — ejecutado antes de la tool
+- `post_tool(name, args, result)` — ejecutado después de la tool
+- Hooks con par pre+post: `interface_change_detector`, `test_suite_delta`
+- Activación/desactivación dinámica con `/hooks builtin <nombre>`
+
+### `SubAgentRunner` (agent/subagent.py)
+
+Gestiona el lanzamiento de subagentes:
+- Los subagentes comparten el modelo de inferencia del padre (restricción VRAM)
+- Comparten el `EmbeddingClient` del padre (sin conexiones adicionales)
+- El historial y workspace son propios de cada subagente
+- Ejecución síncrona cuando los lanza el LLM via `spawn_subagent`
+- El host Ollama se asigna en **round-robin** entre `all_ollama_hosts` (función `_pick_subagent_host`) de forma thread-safe
+
+```python
+# Asignación de host en SubAgentRunner.run()
+sub_config.ollama_host = _pick_subagent_host(self.config)
+# → rota entre config.all_ollama_hosts = [host] + [h for h in extra_hosts if h]
+
+# Embeddings siempre al host dedicado (o principal si no hay)
+sub_config.embed_host = config.effective_embed_host
+# → config.ollama_embed_host or config.ollama_host
+```
+
+### WebUI (webui/app.py)
+
+Flask con SSE (Server-Sent Events):
+- `AgentLoop` completo integrado (mismo comportamiento que el TUI)
+- Streaming via SSE en `/api/chat/stream` y `/api/agents/stream`
+- Conversación persistente en el servidor (sobrevive cambios de pestaña)
+- Páginas: `/` (dashboard), `/chat`, `/config`, `/sessions`, `/agents`, `/doctor`, `/theme`
+- Puerto por defecto: 4000
+
+### Plugin VIM (extensions/vim/)
+
+Versión 3.0.0:
+- Comunicación via API REST y SSE del WebUI
+- Auto-detección del servidor WebUI al arrancar
+- Panel lateral con streaming en tiempo real
+- Inyección automática de fichero actual + línea + filetype
+
+## Patrones de diseño
 
 ### Factory functions para herramientas
 
-Las herramientas se construyen con factories que capturan los parámetros de config en closures:
+Las herramientas se construyen con factories que capturan configuración en closures:
 
 ```python
 def build_bash_schema(max_output_chars=20000, default_timeout=120) -> tuple:
     def _bash(command, timeout=default_timeout, workdir=None):
-        return bash_execute(command, timeout=timeout, workdir=workdir,
+        return bash_execute(command, timeout=timeout,
                             max_output_chars=max_output_chars)
     return "bash", _bash, schema
 ```
 
-Esto evita hardcodear valores y hace cada herramienta configurable sin pasar el config completo.
+### Gestión segura de procesos bash
 
-### Gestión de procesos en `bash`
-
-`tools/bash.py` usa `subprocess.Popen` con dos flags clave:
+`tools/bash.py` usa `subprocess.Popen` con:
 - `start_new_session=True` — crea un grupo de procesos separado
-- `stdin=subprocess.DEVNULL` — impide que procesos hijos queden bloqueados esperando stdin
+- `stdin=subprocess.DEVNULL` — impide que hijos queden bloqueados
+- Al timeout: `os.killpg(pgid, SIGKILL)` mata todo el árbol de procesos
 
-Al timeout, se mata todo el árbol con `os.killpg(pgid, SIGKILL)`, evitando procesos zombie a 100% CPU (problema habitual con `subprocess.run(shell=True)` que mata sólo el shell padre, no sus hijos).
+### Progreso en tiempo real
 
+Thread-local progress callbacks en `tools/progress.py`:
 ```python
-def _kill_group(proc):
-    pgid = os.getpgid(proc.pid)
-    os.killpg(pgid, signal.SIGKILL)  # mata shell + todos los hijos
-    proc.communicate(timeout=5)       # espera a que liberen recursos
-```
-
-### TUI display system y progreso en tiempo real
-
-`agent/loop.py` implementa dos modos de display según cómo se ejecutan las tools:
-
-**Ejecución secuencial (pre_shown=True):**
-- Antes de ejecutar: `  ◐ nombre_tool  [args]` — spinner ◐ parpadeante para **todas** las tools
-- Durante búsqueda: el status bar muestra `⎿ filename` actualizando en tiempo real mediante `_tool_current_file`
-- Después de ejecutar: `_show_inline_compact_result()` colapsa el resultado:
-  - Búsquedas: `  ⎿ N resultados en X ficheros`
-  - Lecturas: `  ⎿ filename  [N líneas]`
-  - Write/edit: muestra diff (no se colapsa)
-  - Error: `  ⎿ error: …` en rojo dim
-
-**Ejecución paralela (pre_shown=False):**
-- Los resultados se acumulan en `_turn_block[]`
-- Al terminar el batch, `_flush_turn_block()` los muestra como resumen compacto
-- `_make_compact_summary()` convierte el block en una línea
-
-**Progreso de búsqueda en tiempo real** (`tools/progress.py`):
-
-```python
-# Thread-local — cada thread de tool tiene su propio callback
 set_progress_callback(lambda f: setattr(self, "_tool_current_file", f))
 # En code_search.py (streaming con Popen):
 for line in rg_stdout:
@@ -212,98 +278,40 @@ for line in rg_stdout:
         report_progress(line["path"])  # → actualiza status bar
 ```
 
-Tools con progress: `code_search`, `grep_code`, `grep_file`, `multi_grep`, `symbol_lookup`, `semantic_search`.
+### Shared console
 
-**Palabras de progreso:**
-- `_THINKING_WORDS` (24 palabras) — durante inferencia LLM (Cavilando, Tokenizando…)
-- `_DONE_WORDS` (19 palabras) — al completar el turno (Neuroneado, Inferido…)
+Todos los módulos usan `from ui.console import console` — nunca `Console()` local. Esto evita conflictos con el TUI de prompt_toolkit.
 
-La barra de contexto en la status bar usa `_ctx_bar(plain=True)` para caracteres Unicode puros (`█░`) sin markup Rich, que prompt_toolkit no puede interpretar.
+### VRAM y subagentes — multi-servidor
 
-### Sub-agentes y restricción VRAM
-
-Los sub-agentes se lanzan como herramienta (`spawn_subagent`) dentro del bucle principal. Su ejecución es **estrictamente secuencial**: el agente padre espera el resultado antes de continuar, por lo que nunca hay dos llamadas a Ollama activas al mismo tiempo.
-
-**Restricción de modelos:** la GPU dispone de 16 GB de VRAM. Solo pueden estar cargados simultáneamente:
-- El modelo de inferencia activo (ej. `qwen2.5-coder:14b`)
-- El modelo de embeddings (ej. `nomic-embed-text-v2-moe`)
-
-Para evitar solapamientos, `SubAgentRunner.run()` fuerza antes de crear el sub-agente:
+Solo pueden estar cargados simultáneamente el LLM activo y el modelo de embeddings en cada servidor. Los subagentes fuerzan el modelo del padre pero pueden usar hosts distintos:
 
 ```python
-sub_config.model       = self.config.model        # mismo LLM que el padre
-sub_config.ollama_host = self.config.ollama_host  # mismo servidor
-sub_config.embed_model = self.config.embed_model  # mismo modelo embed
+sub_config.model       = self.config.model           # mismo LLM (restricción VRAM)
+sub_config.embed_model = self.config.embed_model     # mismo embed model
+sub_config.ollama_host = _pick_subagent_host(config) # host asignado por round-robin
 ```
 
-El sub-agente hereda también el `EmbeddingClient` del padre (instancia compartida), evitando conexiones duplicadas al servidor de embeddings. La diferencia entre agentes es únicamente el workspace y el contexto de conversación, nunca el modelo.
-
-```
-oocode.py
-  │
-  ├── EmbeddingClient ──────────────────────────────┐
-  ├── MemorySystem(embed_client)                    │ (compartido)
-  ├── SubAgentRunner(embed_client) ─────────────────┘
-  │
-  └── [turno agente padre]
-        └── spawn_subagent("coding", tarea)   ← tool call síncrono
-              │
-              ├── sub_config.model = padre.model    ← modelo forzado
-              ├── MemorySystem(embed compartido)
-              └── AgentLoop.run(tarea)              ← secuencial, mismo LLM
-```
-
-### Plugin TOOLS dinámico via on_start
-
-Los plugins reconstruyen su lista `TOOLS` en `on_start(config)`, lo que permite herramientas condicionales según la configuración (ej: SearXNG solo expone `web_search` si `enabled=True`).
-
-### Plugins incluidos (`~/.oocode/plugins/`)
-
-| Fichero | Activa con | Descripción |
-|---------|-----------|-------------|
-| `searxng.py` | `/plugins enable searxng` | Búsqueda SearXNG local; sobreescribe `web_search` si `enabled=true` |
-| `git.py` | `/plugins enable git` | 11 herramientas git nativas + comando `/git` |
-| `diff.py` | `/plugins enable diff` | Diffs con colores al editar ficheros; sobreescribe `write_file` y usa hook `on_tool_result` para `edit_file` |
-
-El nombre del fichero (sin `.py`) es la clave usada en `_enabled` y en `oocode.json`. Siempre debe coincidir con el argumento de `/plugins enable <nombre>`.
-
-### Overriding de herramientas built-in por plugins
-
-Los plugins se cargan **después** de las herramientas base (`build_registry()`). Al llamar `registry.register(name, fn, schema)`, si el nombre ya existe simplemente lo sobreescribe. Esto permite que, por ejemplo, `diff.py` reemplace `write_file` con una versión que captura el contenido anterior y muestra el diff automáticamente.
-
-El hook `on_tool_result(name, args, result)` complementa esto: se llama tras cada herramienta sin necesidad de sobrescribir su implementación, útil cuando el argumento (`old_string`) contiene la información necesaria para el diff.
-
-### Shadowing del builtin `list` en clases
-
-**Antipatrón a evitar:** no nombres métodos `list()` dentro de una clase si hay anotaciones `-> list[...]` en métodos posteriores. Python evalúa las anotaciones en el namespace de clase, donde `list` resuelve al método en lugar del builtin.
-
-```python
-# INCORRECTO
-class Foo:
-    def list(self) -> list[dict]: ...          # OK, list aún es builtin
-    def other(self) -> list[tuple]: ...        # FALLA: list = el método anterior
-
-# CORRECTO
-class Foo:
-    def all_items(self) -> list[dict]: ...     # nombre descriptivo
-    def load_tools(self) -> list[tuple]: ...   # OK
-```
+Con un solo servidor (`extraHosts=[]`) el comportamiento es idéntico al clásico. Con varios servidores, cada subagente en paralelo ejecuta en una GPU diferente, eliminando el cuello de botella de inferencia.
 
 ## Añadir una nueva funcionalidad
 
-### Nueva herramienta built-in
+### Nueva herramienta nativa
 1. Implementar en `tools/`
 2. Registrar en `build_registry()` de `oocode.py`
 3. Añadir permiso por defecto en `DEFAULT_CONFIG["permissions"]`
+
+### Nuevo servidor MCP bundled
+1. Crear `mcp_servers/mi_servidor.py` siguiendo el patrón `_TOOLS`, `_TOOL_FNS`, `_PROMPTS`, `_RESOURCES`
+2. Wiring en `oocode.py` similar a los servidores existentes
+3. Añadir flag de activación en `DEFAULT_CONFIG["mcp"]`
 
 ### Nuevo comando `/slash`
 1. Añadir entrada en `SLASH_HELP` en `ui/commands.py`
 2. Implementar `_cmd_nombre(args, ...)` en `ui/commands.py`
 3. Añadir `elif cmd == "/nombre":` en `handle_slash()`
 
-### Nueva sección de config
-1. Añadir a `DEFAULT_CONFIG` en `config.py`
-2. Añadir campos a `OOConfig`
-3. Añadir a `load()` y `save()`
-4. Añadir a `print_config_full()` en `renderer.py`
-5. Añadir al panel de `/config edit` en `commands.py`
+### Nuevo hook built-in
+1. Implementar `_hook_nombre_pre()` y/o `_hook_nombre_post()` en `tools/hooks.py`
+2. Registrar en `_BUILTIN_HOOKS` con nombre y descripción
+3. Añadir a `active_builtin_names()` para que aparezca en `/hooks list`

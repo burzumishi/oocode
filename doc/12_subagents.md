@@ -6,14 +6,24 @@ Un sub-agente es una instancia aislada de `AgentLoop` que el agente principal pu
 
 - Tareas que requieren un workspace diferente al actual (ej. revisar otro proyecto)
 - Separar una subtarea larga sin contaminar el contexto del agente principal
-- Agentes especializados por dominio con sus propios `OOCODE.md`
+- Agentes especializados por dominio: `coding` para programación, `home_office` para documentos, `reasoning` para análisis
+
+## Agentes disponibles por defecto
+
+| ID | Emoji | Especialidad |
+|----|-------|-------------|
+| `main` | 🤖 | Asistente general, coordina otros agentes |
+| `coding` | 💻 | IT, programación, refactorización, LSP |
+| `home_office` | 📋 | Documentación corporativa O365 (Word/Excel/PPT) |
+| `reasoning` | 🧠 | Razonamiento, coordinación de equipos de agentes |
+| `webcrawler` | 🕷️ | Búsqueda web con SearXNG, informes |
 
 ## Configurar agentes en `oocode.json`
 
 ```json
 "agents": {
   "defaults": {
-    "model": null,
+    "model": "qwen3.5:9b",
     "workspace": "~/.oocode/workspace/main"
   },
   "list": [
@@ -21,22 +31,36 @@ Un sub-agente es una instancia aislada de `AgentLoop` que el agente principal pu
       "id":        "main",
       "name":      "OOCode",
       "emoji":     "🤖",
-      "model":     null,
+      "model":     "qwen3.5:9b",
       "workspace": "~/.oocode/workspace/main"
     },
     {
       "id":        "coding",
-      "name":      "Coder",
-      "emoji":     "⚙️",
+      "name":      "OOCode Coder",
+      "emoji":     "💻",
       "model":     null,
-      "workspace": "/home/usuario/mi-proyecto"
+      "workspace": "~/.oocode/workspace/coding"
     },
     {
-      "id":        "review",
-      "name":      "Reviewer",
-      "emoji":     "🔍",
+      "id":        "home_office",
+      "name":      "OOCode Office",
+      "emoji":     "📋",
       "model":     null,
-      "workspace": "~/.oocode/workspace/review"
+      "workspace": "~/.oocode/workspace/home_office"
+    },
+    {
+      "id":        "reasoning",
+      "name":      "OOCode Reasoning",
+      "emoji":     "🧠",
+      "model":     null,
+      "workspace": "~/.oocode/workspace/reasoning"
+    },
+    {
+      "id":        "webcrawler",
+      "name":      "WebCrawler",
+      "emoji":     "🕷️",
+      "model":     null,
+      "workspace": "~/.oocode/workspace/webcrawler"
     }
   ]
 }
@@ -44,13 +68,24 @@ Un sub-agente es una instancia aislada de `AgentLoop` que el agente principal pu
 
 > **Nota:** el campo `model` de cada agente se ignora cuando se lanza como sub-agente. El sub-agente hereda siempre el modelo del agente padre para no descargar/recargar la GPU.
 
+## Cambiar de agente en caliente con `/switch`
+
+```
+/switch coding        # cambiar al agente coding sin reiniciar
+/switch home_office   # cambiar al agente home_office
+/switch main          # volver al agente principal
+```
+
+`/switch` carga el workspace, la memoria y la identidad del agente seleccionado manteniendo la sesión activa.
+
 ## Lanzar un sub-agente desde el REPL
 
 ```
 /spawn coding "analiza el fichero src/main.py y sugiere refactorizaciones"
+/spawn home_office "crea un informe de estado del proyecto"
 ```
 
-Equivale a `/subagents spawn coding <tarea>`.
+Equivale a `/subagents spawn <id> <tarea>`.
 
 El LLM también puede lanzar sub-agentes directamente usando la herramienta `spawn_subagent`:
 
@@ -62,7 +97,6 @@ spawn_subagent(agent_id="review", task="revisa el diff actual y lista los riesgo
 
 ```
 /subagents                          # lista sub-agentes activos y recientes (30 min)
-/subagents spawn <id> <tarea>       # lanza sub-agente
 /subagents status [id]              # estado detallado de uno o todos
 /subagents steer <id> <instrucción> # inyecta nueva instrucción al sub-agente en curso
 /subagents kill <id>                # detiene un sub-agente
@@ -72,23 +106,53 @@ spawn_subagent(agent_id="review", task="revisa el diff actual y lista los riesgo
 
 El `id` puede ser un prefijo de 4+ caracteres del `run_id` mostrado en `/subagents`.
 
-## Restricción de VRAM
+## Restricción de VRAM y modelo
 
-La GPU tiene VRAM limitada. Solo pueden estar cargados simultáneamente el LLM activo y el modelo de embeddings. `SubAgentRunner.run()` sobreescribe los campos de modelo en la config del sub-agente antes de crear su `AgentLoop`:
+El sub-agente hereda siempre el modelo LLM del padre para evitar cargar/descargar la GPU:
 
 ```python
 sub_config.model       = self.config.model        # mismo LLM
-sub_config.ollama_host = self.config.ollama_host  # mismo servidor
 sub_config.embed_model = self.config.embed_model  # mismo embed
 ```
 
-El `EmbeddingClient` se crea una sola vez y se comparte entre el agente principal y sus sub-agentes.
+El `EmbeddingClient` se crea una sola vez y se comparte entre el agente principal y sus sub-agentes (salvo que el sub-agente sea el primero que lo necesita y el padre aún no lo haya creado).
+
+## Multi-servidor Ollama para sub-agentes
+
+Con varios servidores Ollama configurados, OOCode distribuye los sub-agentes en **round-robin** entre todos los hosts disponibles. Esto permite paralelismo real cuando hay varias GPUs:
+
+```
+Agente principal    → host (localhost:11434)  — inferencia interactiva
+Sub-agente #1       → host[0] = localhost:11434
+Sub-agente #2       → host[1] = gpu2:11434
+Sub-agente #3       → host[2] = gpu3:11434
+Sub-agente #4       → host[0] = localhost:11434   ← vuelve al inicio
+```
+
+**Configuración en `oocode.json`:**
+
+```json
+{
+  "ollama": {
+    "host":            "http://localhost:11434",
+    "extraHosts":      ["http://gpu2:11434", "http://gpu3:11434"],
+    "embedHost":       "http://cpu-server:11434",
+    "subagentRouting": "round-robin"
+  }
+}
+```
+
+La función `_pick_subagent_host(config)` en `agent/subagent.py` gestiona la selección de host de forma thread-safe mediante un contador global y `threading.Lock`. Cada sub-agente recibe su host asignado en `sub_config.ollama_host` antes de arrancar el `AgentLoop`.
+
+Con `"subagentRouting": "primary-only"` todos los sub-agentes usan el host principal (comportamiento clásico de un solo servidor).
+
+Los embeddings del sub-agente usan `ollama_embed_host` si está configurado, o `ollama_host` como fallback — independientemente del host LLM asignado por el round-robin.
 
 ## Ejecución y output
 
-Los sub-agentes se ejecutan **de forma síncrona** cuando los lanza el LLM (via `spawn_subagent` tool): el padre espera a que el sub-agente termine y recibe el resultado como string. Los sub-agentes lanzados con `/subagents spawn` se ejecutan en un thread de background (el REPL sigue respondiendo mientras trabajan).
+Los sub-agentes se ejecutan **de forma síncrona** cuando los lanza el LLM (via `spawn_subagent` tool): el padre espera a que el sub-agente termine y recibe el resultado como string. Los sub-agentes lanzados con `/spawn` se ejecutan en un thread de background.
 
-El output del sub-agente **aparece en tiempo real** con el prefijo `│` coloreado. Al terminar, el resultado se devuelve al agente principal como resultado de la herramienta.
+El output del sub-agente **aparece en tiempo real** con el prefijo `│` coloreado:
 
 ```
 Agente principal
@@ -96,7 +160,7 @@ Agente principal
         └── tool_call: spawn_subagent("coding", "subtarea")
               │                                              ← padre bloqueado aquí
               ├── │  Cavilando…  (1.2s)
-              ├── │  ⚙  read_file  "src/main.py"
+              ├── │  💻  read_file  "src/main.py"
               ├── │  ●  Aquí están mis sugerencias…
               └── return resultado_str
         └── context.add_tool_result(resultado_str)
@@ -105,21 +169,23 @@ Agente principal
 
 ## Aislamiento del sub-agente
 
-| Recurso | ¿Aislado? | Detalle |
-|---------|-----------|---------|
-| Historial de conversación | ✓ | Contexto propio desde cero |
-| Workspace / OOCODE.md | ✓ | El definido en `oocode.json` para ese agente |
-| Memoria (MEMORY.md) | ✓ | Carpeta `~/.oocode/memory/<id>/` propia |
-| Modelo de inferencia | ✗ | Forzado = modelo del padre |
-| Modelo de embeddings | ✗ | Forzado = embed del padre |
-| EmbeddingClient | ✗ | Instancia compartida (misma conexión) |
-| Permisos | ✗ | Heredados del agente principal |
-| Sesión | ✓ | JSONL propio en `~/.oocode/sessions/<id>/` |
-| Plugins y skills | ✗ | Los mismos que el padre |
+| Recurso | Aislado | Detalle |
+|---------|---------|---------|
+| Historial de conversación | si | Contexto propio desde cero |
+| Workspace / OOCODE.md | si | El definido en `oocode.json` para ese agente |
+| Memoria (MEMORY.md) | si | Carpeta `~/.oocode/workspace/<id>/` propia |
+| Modelo de inferencia | no | Forzado = modelo del padre |
+| Modelo de embeddings | no | Forzado = embed del padre |
+| EmbeddingClient | no | Instancia compartida (si el padre ya la tiene) |
+| Host Ollama (LLM) | parcialmente | Asignado por round-robin entre `host` + `extraHosts` |
+| Host Ollama (embeddings) | no | `embedHost` del padre (o `host` si vacío) |
+| Permisos | no | Heredados del agente principal (elevated también) |
+| Sesión | si | JSONL propio en `~/.oocode/sessions/<id>/` |
+| Plugins y skills | no | Los mismos que el padre |
 
 ## Añadir un nuevo agente
 
-1. Añadir una entrada en `agents.list` de `~/.oocode/oocode.json`:
+1. Añadir entrada en `agents.list` de `~/.oocode/oocode.json`:
 
 ```json
 {
@@ -133,4 +199,6 @@ Agente principal
 
 2. (Opcional) Crear un `OOCODE.md` en su workspace con instrucciones específicas.
 
-3. El nuevo agente ya está disponible en `spawn_subagent` sin reiniciar.
+3. (Opcional) Crear los ficheros de identidad del workspace (`IDENTITY.md`, `SOUL.md`, etc.).
+
+4. El nuevo agente ya está disponible en `spawn_subagent` y `/switch` sin reiniciar.

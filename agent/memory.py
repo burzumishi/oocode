@@ -173,8 +173,8 @@ class MemorySystem:
                     raw = md_path.read_text()
                     snippet = _extract_body(raw, self._snippet_chars)
                     results.append((score, md_path.name, snippet))
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("mem_read_snippet_error", file=md_path.name, error=str(e))
 
         results.sort(key=lambda x: x[0], reverse=True)
         results = results[:k]

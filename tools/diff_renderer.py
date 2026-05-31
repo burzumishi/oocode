@@ -7,6 +7,7 @@ Módulo autónomo: no importa nada de plugins/. Es importado por:
 import difflib
 import re
 import shutil
+import threading
 from pathlib import Path
 from rich.markup import escape as _esc
 from rich.text import Text
@@ -16,6 +17,12 @@ from ui.console import console
 # ── Redirección TUI: el loop puede inyectar self._print para mostrar diffs ────
 # Set by agent/loop.py at the start of each run(); reset to None at end.
 _dprint_fn = None
+
+
+def set_dprint_fn(fn) -> None:
+    """Configura la función de impresión para diffs (TUI-aware). None = REPL mode."""
+    global _dprint_fn
+    _dprint_fn = fn
 
 
 def _dprint(x) -> None:
@@ -29,6 +36,7 @@ def _dprint(x) -> None:
 # ── Historial de sesión ────────────────────────────────────────────────────────
 
 _history: list[dict] = []
+_history_lock = threading.Lock()
 _MAX_HISTORY   = 50
 _MAX_DIFF_LINES = 400
 _CONTEXT_LINES  = 2
@@ -174,9 +182,10 @@ def _render_diff(path: str, old: str, new: str) -> None:
         f"{'+'if l['kind']=='add' else '-' if l['kind']=='del' else ' '}{l['text']}"
         for h in hunks for l in h["lines"]
     )
-    _history.append({"path": path, "diff": diff_text, "added": added, "removed": removed})
-    if len(_history) > _MAX_HISTORY:
-        _history.pop(0)
+    with _history_lock:
+        _history.append({"path": path, "diff": diff_text, "added": added, "removed": removed})
+        if len(_history) > _MAX_HISTORY:
+            _history.pop(0)
 
     _dprint("")
     _dprint(_header_line(path, added, removed, is_new))
@@ -358,11 +367,13 @@ def render_bulk_diff(args: dict, result: str) -> None:
 
 
 def get_history() -> list[dict]:
-    return list(_history)
+    with _history_lock:
+        return list(_history)
 
 
 def clear_history() -> None:
-    _history.clear()
+    with _history_lock:
+        _history.clear()
 
 
 def rerender_entry(entry: dict) -> None:
