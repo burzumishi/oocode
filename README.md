@@ -1,4 +1,4 @@
-# OOCode v0.3.6 — Asistente de programación 100% local
+# OOCode v0.3.8 — Asistente de programación 100% local
 
 Asistente de programación local para la terminal, inspirado en Claude Code pero funcionando **100% con [Ollama](https://ollama.com)**. Sin API keys, sin suscripciones, sin enviar tu código a servidores externos.
 
@@ -442,28 +442,7 @@ oocode/
 
 ## Changelog
 
-### v0.3.6 (2026-05-31)
-
-- **TUI refinements** — `_update_live_bullet_cb` muestra la acción de la herramienta activa en el `●` pulsante; `●display(ctx)` como encabezado de tool; `⎿` sin `◐`; resumen compacto normalizado ("Searched for", "lines" en inglés)
-- **WebUI print pollution fix** — `_print()` TUI-específicos (preflight/auto-continue/plan/resume/retry) filtrados con `if not _webui_queue`; JS de `thinking` preserva el label preflight
-- **WebUI/TUI callbacks** — TUI sin `invalidate()` en callbacks intermedios del live block (blink timer suficiente); status SSE emitido al inicio de turno; file cards unificadas a `.tui-file-card`
-- **Tests** — 3932 tests (100% pasando)
-
-### v0.3.5 (2026-05-31)
-
-- **Configuración completa desde oocode.json** — todos los parámetros internos (chunking RAG, caché embeddings, highWater de contexto) son ahora configurables en `~/.oocode/oocode.json`; eliminados todos los valores hardcodeados
-- **Display compacto mejorado** — cada fichero en una línea separada con `│` (U+2502) y `⎿` en el último elemento; símbolo correcto `↻` para compactación en la barra de estado
-- **Limpieza de código** — eliminados duplicados funcionales (`_fmt_tokens`, `_progress_bar`, `chunk_with_metadata` standalone); eliminadas 5 entradas no-op en `_TOOL_ALIASES`; unificadas 6 sets de write-tools en `_is_modify_tool()`; eliminado tracking dual `_task_modified_files`
-- **Correcciones de robustez** — sincronizado `_RICH_TAG_RE` entre `loop.py` y `app.py`; corregido prefijo `[caché]` visible al LLM; eliminado bloque unreachable en el dispatch de tools; eliminado segundo `keep_alive` pop en `_chat_kwargs`
-
-### v0.3.4 (2026-05-30)
-
-- TUI Claude Code style: `●` sin sangría, `⎿` sin `◐`, resumen compacto
-- WebUI + TUI fixes: collapse via `.expanded`, file cards unificadas, status al inicio de turno
-- Home Office v5: `doc_create` + `template_path`, checklist/callout/highlight/toc en Word
-- Home Office OOXML refactor: gráficas OOXML nativas (sin PNG), diagramas bar/pie/line
-- External MCP support: `mcp_manager.py` + `catalog.json`, hot-add sin reiniciar
-- WebUI refactorizada en 13 módulos Blueprint
+Ver [CHANGELOG.md](CHANGELOG.md) para el historial completo de versiones.
 
 ---
 

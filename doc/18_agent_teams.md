@@ -82,12 +82,41 @@ Los agentes con `"model": null` heredan el modelo del padre cuando se lanzan com
 
 ### Lanzamiento automático por el LLM
 
-El agente principal puede lanzar subagentes directamente usando la herramienta `spawn_subagent`:
+El agente puede lanzar subagentes y equipos directamente como herramientas nativas:
 
+**Un subagente:**
 ```
 spawn_subagent(
   agent_id="coding",
-  task="Analiza src/main.py y propone mejoras de rendimiento"
+  task="Analiza src/main.py y propone mejoras de rendimiento",
+  timeout_seconds=300
+)
+```
+
+**Equipo paralelo** (subtareas independientes en agentes especializados):
+```
+create_team(
+  team_id="mi-equipo",
+  lead_agent_id="reasoning",
+  subtasks=[
+    {"description": "Refactoriza agent/loop.py", "assign_to": "coding"},
+    {"description": "Genera informe de cambios", "assign_to": "home_office"},
+    {"description": "Investiga mejores prácticas", "assign_to": "webcrawler"}
+  ]
+)
+run_team(team_id="mi-equipo")
+```
+
+**Fanout** (mismo agente, N chunks del mismo problema en paralelo):
+```
+spawn_fanout(
+  agent_id="coding",
+  task_chunks=[
+    "Analiza agent/loop.py: detecta code smells",
+    "Analiza ui/app.py: detecta code smells",
+    "Analiza mcp_servers/: detecta code smells"
+  ],
+  timeout_seconds=120
 )
 ```
 
@@ -196,6 +225,45 @@ team.add_subtask("Implementar endpoints v2", "coding")
 team.add_subtask("Generar documentación de migración", "home_office")
 team.add_subtask("Revisar y coordinar resultados", "reasoning")
 ```
+
+## Herramientas LLM de orquestación
+
+Desde v0.3.7 el agente puede usar estas herramientas de orquestación como cualquier otra herramienta nativa:
+
+| Herramienta | Descripción | Cuándo usar |
+|-------------|-------------|-------------|
+| `spawn_subagent` | Lanza un subagente y espera resultado | Tarea delegada a un agente especializado |
+| `create_team` | Crea equipo con subtareas para múltiples agentes | Tarea descomponible en partes paralelas independientes |
+| `run_team` | Ejecuta el equipo y devuelve resultados | Tras `create_team` |
+| `spawn_fanout` | N chunks del mismo problema en paralelo (mismo agente) | Análisis de repo grande, divide-and-conquer |
+
+### `spawn_subagent` — parámetros
+
+| Parámetro | Tipo | Descripción |
+|-----------|------|-------------|
+| `agent_id` | str | ID del agente destino |
+| `task` | str | Tarea a ejecutar |
+| `timeout_seconds` | int | Segundos máximos (0 = sin límite) |
+
+### `spawn_fanout` — parámetros
+
+| Parámetro | Tipo | Descripción |
+|-----------|------|-------------|
+| `agent_id` | str | Agente para todos los chunks |
+| `task_chunks` | list[str] | Cada chunk es una subtarea independiente |
+| `timeout_seconds` | int | Timeout por chunk (0 = sin límite) |
+| `max_concurrent` | int | Máximo paralelo (default: semáforo global) |
+
+### Timeout y watchdog
+
+Todos los métodos de spawn aceptan `timeout_seconds`. Al expirar, un watchdog thread dispara el `kill_event` del subagente, que termina limpiamente en la siguiente iteración del loop. El resultado indica el error de timeout.
+
+### Plan ↔ TaskManager
+
+Cuando el agente ejecuta un plan multi-tarea con `_plan_tasks`, las tareas se sincronizan automáticamente con `TaskManager`:
+- Visibles en `/task list` durante la ejecución
+- Sobreviven un reinicio del agente — se restauran en el siguiente arranque
+- Distinguidas del resto de tareas con el marcador interno `__plan__`
 
 ## Restricciones y consideraciones
 

@@ -849,16 +849,23 @@ Cuando el usuario proporciona ≥2 tareas en una sola solicitud, evalúa su inde
 | Situación | Estrategia |
 |-----------|------------|
 | Tareas sin dependencias entre sí | `spawn_subagent` × N en paralelo (cada una en su hilo) |
-| Tareas en dominios distintos (código + docs + web) | `AgentTeam` con agentes especializados (`coding`, `home_office`, `webcrawler`) |
+| Mismo problema dividido en N partes (módulo A + B + C) | `spawn_fanout(agent_id, task_chunks=[…])` — mismo agente × N chunks |
+| Tareas en dominios distintos (código + docs + web) | `create_team` → `run_team`: agentes especializados (ver IDs disponibles en el schema de la tool) |
 | Tarea principal + exploración intensiva | Subagente para exploración, hilo principal para implementación |
 | Tareas con orden estricto (A→B→C) | Secuencial en el hilo principal, sin subagentes |
-| Análisis read-only de múltiples ficheros | `spawn_subagent(explore=True)` × N simultáneos |
+| Análisis read-only de múltiples ficheros | `explore` para mapear arquitectura antes de modificar |
 
 **Cuándo usar subagente (`spawn_subagent`):**
 - Proyecto muy grande: exploración exhaustiva de codebase mientras el hilo principal prepara el plan.
 - Tareas completamente independientes que no comparten estado (ej. explorar fichero A y explorar fichero B simultáneamente).
-- Análisis read-only intensivo: `spawn_subagent(task="explorar…", explore=True)`.
-- Si hay ≥3 tareas independientes, considera lanzar un equipo: `AgentTeam` con `spawn_background` × N.
+
+**Cuándo usar fanout (`spawn_fanout`):**
+- Mismo dominio, mismo agente, problema fragmentado: analizar módulo A + B + C en paralelo, buscar vulnerabilidades en src/auth/ + src/db/ + src/api/, revisar tests de varios paquetes.
+- Flujo: `spawn_fanout(agent_id="<agente>", task_chunks=["Analiza A", "Analiza B", "Analiza C"])` → combina hallazgos.
+
+**Cuándo usar equipo (`create_team` + `run_team`):**
+- ≥2 dominios distintos (código + documentación + web + ofimática) en paralelo con agentes especializados.
+- Flujo: `create_team(team_id="my-team", subtasks=[{"description": "...", "assign_to": "<agente>"}, ...])` → `run_team(team_id="my-team")` → sintetiza.
 
 **Cuándo NO usar subagente:** edición de ficheros, tests, implementación — hazlo directamente con las tools.
 
@@ -960,14 +967,22 @@ _TOOL_LIVE_VERBS: dict[str, str] = {
 
 
 def _make_tool_preview(name: str, args: dict) -> list[str]:
-    """Returns 1-4 context lines to show in the live block preview while a tool runs.
+    """Returns 1-5 context lines for the live block while a tool runs.
 
-    These are shown under '|  ◐ tool:' and hidden when the tool completes.
+    Element [0] is shown INLINE with the tool header: ◐ Tool: <first>.
+    Elements [1:] are shown BELOW the tool line (diff, command, 'Running…').
+    All lines disappear when the tool completes.
     """
     if name == "bash":
         cmd = (args.get("command") or "").strip()
         lines = cmd.splitlines()
-        return [f"$ {l}" for l in lines[:4]] if lines else []
+        if not lines:
+            return []
+        preview = [f"$ {lines[0]}"]
+        if len(lines) > 1:
+            preview.append(f"  {lines[1][:70]}")
+        preview.append("Running…")
+        return preview[:3]
     if name == "read_file":
         p   = args.get("path", "")
         off = args.get("offset")
@@ -979,12 +994,31 @@ def _make_tool_preview(name: str, args: dict) -> list[str]:
             suffix += f":{off}"
         if lim:
             suffix += f"+{lim}"
-        return [f"{p}{suffix}"]
+        return [f"({p}{suffix})"]
     if name == "read_files":
         ps = args.get("paths", [])
         if isinstance(ps, list):
-            return [str(x) for x in ps[:4]]
-        return [str(ps)] if ps else []
+            return [f"({x})" for x in ps[:4]]
+        return [f"({ps})"] if ps else []
+    if name == "write_file":
+        p = args.get("path", "")
+        content = (args.get("content") or "").strip()
+        result: list[str] = [f"({p})"] if p else []
+        for _l in content.splitlines()[:4]:
+            result.append(f"  {_l[:70]}")
+        return result[:5]
+    if name in ("edit_file", "smart_replace", "regex_replace"):
+        p = args.get("path", "") or args.get("file", "")
+        return [f"({p})"] if p else []
+    if name == "edit_files":
+        edits = args.get("edits", [])
+        if isinstance(edits, list):
+            paths = [e.get("path", "") for e in edits[:3] if isinstance(e, dict) and e.get("path")]
+            return [f"({p})" for p in paths]
+        return []
+    if name in ("bulk_replace", "patch_apply"):
+        p = args.get("path", "")
+        return [f"({p})"] if p else []
     if name in ("grep_code", "grep_file"):
         pat  = args.get("pattern", "")
         d    = args.get("directory", args.get("path", ""))
@@ -1173,9 +1207,20 @@ def _make_compact_summary(blocks: list[tuple[str, dict, str, bool]]) -> str:
 
         # Lecturas: recoger nombre de fichero para mostrar en resumen
         elif base_name in _READ_TOOLS and not _is_err:
-            path = args.get("path") or args.get("file_path", "")
-            if path:
-                read_files.append(os.path.basename(str(path)))
+            if base_name == "read_files":
+                # read_files recibe una lista en args["paths"]
+                ps = args.get("paths", [])
+                if isinstance(ps, list):
+                    for p in ps:
+                        bn = os.path.basename(str(p))
+                        if bn:
+                            read_files.append(bn)
+                elif ps:
+                    read_files.append(os.path.basename(str(ps)))
+            else:
+                path = args.get("path") or args.get("file_path", "")
+                if path:
+                    read_files.append(os.path.basename(str(path)))
 
         # Bash: recoger comando abreviado
         elif base_name in _BASH_TOOLS and not _is_err:
@@ -1197,12 +1242,14 @@ def _make_compact_summary(blocks: list[tuple[str, dict, str, bool]]) -> str:
             if total_added or total_removed:
                 entry += f" (+{total_added} -{total_removed})"
             parts.append(entry)
-        # Lecturas: mostrar nombres de ficheros leídos
+        # Lecturas: mostrar nombres de ficheros leídos (deduplicados)
         elif verb == "Read" and n >= 1 and read_files:
-            shown = read_files[:3]
-            extra = n - len(shown)
+            unique = list(dict.fromkeys(read_files))
+            shown = unique[:3]
+            extra = len(unique) - len(shown)
             flist = ", ".join(shown) + (f" +{extra}" if extra > 0 else "")
-            parts.append(f"Read {n} file{'s' if n != 1 else ''} ({flist})")
+            nu = len(unique)
+            parts.append(f"Read {nu} file{'s' if nu != 1 else ''} ({flist})")
         # Bash: mostrar comando abreviado
         elif verb == "Ran" and n >= 1 and bash_cmds:
             shown_cmd = bash_cmds[0]

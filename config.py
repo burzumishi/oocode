@@ -9,7 +9,7 @@ MEMORY_DIR       = CONFIG_DIR / "memory"
 HISTORY_FILE     = CONFIG_DIR / "history"
 KEYBINDINGS_FILE = CONFIG_DIR / "keybindings.json"
 
-VERSION     = "0.3.6"
+VERSION     = "0.3.8"
 APP_NAME    = "OOCode"
 APP_SUBTITLE = "Ollama Open Code"
 
@@ -51,6 +51,8 @@ DEFAULT_CONFIG: dict = {
         "searxng_search":    "auto",
         "spawn_subagent":    "ask",
         "explore":           "auto",
+        "create_team":       "ask",
+        "run_team":          "ask",
         # Linting (MCP tools)
         "lint_file":         "auto",
         "lint_project":      "auto",

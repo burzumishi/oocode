@@ -90,8 +90,14 @@ Equivale a `/subagents spawn <id> <tarea>`.
 El LLM también puede lanzar sub-agentes directamente usando la herramienta `spawn_subagent`:
 
 ```
-spawn_subagent(agent_id="review", task="revisa el diff actual y lista los riesgos")
+spawn_subagent(
+  agent_id="review",
+  task="revisa el diff actual y lista los riesgos",
+  timeout_seconds=180     # opcional: mata el subagente si tarda más de 3 minutos
+)
 ```
+
+El parámetro `timeout_seconds` activa un **watchdog thread** que dispara el `kill_event` del subagente al expirar. El subagente termina limpiamente en la siguiente iteración de su loop y el padre recibe un mensaje de error de timeout en lugar de bloquearse indefinidamente.
 
 ## Control de sub-agentes con `/subagents`
 

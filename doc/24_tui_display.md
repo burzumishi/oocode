@@ -2,15 +2,17 @@
 
 ## Visión general
 
-El TUI de OOCode muestra un **live block** al final del área de conversación mientras el agente ejecuta herramientas. El bloque es dinámico: se actualiza en tiempo real con el nombre de la tool activa y 1-4 líneas de contexto, y desaparece limpiamente al completarse la tarea, dejando solo el resumen compacto `⎿`.
+El TUI de OOCode muestra un **live block** al final del área de conversación mientras el agente ejecuta herramientas. El bloque es dinámico: se actualiza en tiempo real con el nombre de la tool activa, el fichero o comando inline, y hasta 4 líneas de contexto (diff, "Running…"), y desaparece limpiamente al completarse la tarea, dejando solo el resumen compacto `⎿`.
 
 ```
   ● Voy a revisar el código y corregir los errores de compilación.
 
   ● Updating act_comm.c:
-  |  ◐ Bash:
-  |     $ grep -rn "gethostname" src/
-  ⎿ Used 2 tools (ctrl+o to expand)
+  │ ◐ Replace: (act_comm.c)
+  │ ◐ Bash: $ grep -rn "gethostname" src/
+  │   Running…
+  │ ◐ Read: (doc/api.md)
+  ⎿ Used 3 tools (ctrl+o to expand)
 ```
 
 ---
@@ -19,11 +21,13 @@ El TUI de OOCode muestra un **live block** al final del área de conversación m
 
 ```
   ●  Texto del agente (aparece cuando empieza el turno con tools)
-  |  ◐ NombreTool:                ← tool actualmente en ejecución
-  |     arg / path / comando      ← preview: 1-4 líneas de contexto
-  |     arg2                      ← solo visible mientras la tool corre
+  │  ◐ ToolAnterior: (path/cmd)   ← tool ya completada (greyed, hasta 3)
+  │  ◐ NombreTool: (path)         ← tool activa — path/cmd inline
+  │     Running…                  ← preview debajo: solo visible mientras corre
   ⎿  Used N tools (ctrl+o to expand)
 ```
+
+**Máximo 8 líneas `│`** antes del `⎿`. El budget se distribuye: N tools completadas (hasta 3) + 1 tool activa + líneas de preview hasta completar 8.
 
 ### Alineación de columnas
 
@@ -66,8 +70,8 @@ Al terminar la tool, el `●` recupera el texto original del agente.
 Cuando una tool empieza, el live block muestra:
 
 ```
-  |  ◐ NombreTool:
-  |     contexto extraído de los args
+  |  ◐ NombreTool: contexto extraído de los args
+  |     líneas de preview debajo (solo para bash: Running…)
 ```
 
 ### Nombre de la herramienta
@@ -88,30 +92,46 @@ El nombre corto se obtiene de `_TOOL_DISPLAY_NAMES` en `agent/loop.py`:
 
 ### Líneas de preview (contexto de args)
 
-La función `_make_tool_preview(name, args)` en `agent/loop_helpers.py` extrae 1-4 líneas de contexto según el tipo de herramienta:
+La función `_make_tool_preview(name, args)` en `agent/loop_helpers.py` devuelve hasta 5 elementos:
+- **Elemento [0]**: se muestra **inline** con el nombre de la tool → `◐ Tool: <first>`
+- **Elementos [1:]**: se muestran **debajo** de la línea de tool (diff, "Running…", etc.)
 
-| Tool | Preview mostrado |
-|------|-----------------|
-| `bash` | `$ comando` (hasta 4 líneas del comando) |
-| `read_file` | `path/fichero.py` o `path/fichero.py:offset+limit` |
-| `read_files` | lista de rutas (hasta 4) |
-| `grep_code` / `grep_file` | `"patrón"  in directorio` |
-| `multi_grep` | cada patrón en su línea (hasta 3) |
-| `code_search` | `"query"` |
-| `find_file` / `find_files` | `nombre  in directorio` |
-| `python_exec` | primeras 4 líneas del código |
-| `lsp_diagnostics` | ruta del fichero |
-| `git_commit` / `git_log` | mensaje o ruta |
-| `write_file` / `edit_file` | (sin preview — muestran diff) |
+| Tool | Inline [0] | Debajo [1:] |
+|------|-----------|-------------|
+| `bash` | `$ comando` (primera línea) | segunda línea cmd + `Running…` |
+| `read_file` | `(path)` o `(path:offset+limit)` | — |
+| `read_files` | `(path1)` | `(path2)`, `(path3)`, ... |
+| `write_file` | `(path)` | primeras 4 líneas del contenido nuevo |
+| `edit_file` / `smart_replace` / `regex_replace` | `(path)` | — (el diff coloreado se muestra tras la ejecución) |
+| `edit_files` | `(path1)` | `(path2)`, `(path3)` |
+| `bulk_replace` / `patch_apply` | `(path)` | — |
+| `grep_code` / `grep_file` | `"patrón"  in dir` | — |
+| `multi_grep` | `"patrón1"` | `"patrón2"`, `"patrón3"` |
+| `code_search` | `"query"` | — |
+| `find_file` / `find_files` | `nombre  in dir` | — |
+| `python_exec` | primera línea del código | siguientes líneas (hasta 3) |
+| `lsp_diagnostics` / `lint_file` | ruta del fichero | — |
+| `git_commit` / `git_log` | mensaje o ruta | — |
+
+### Tools completadas con contexto
+
+Cuando una tool termina, `_update_live_tools()` captura `tool_label + preview[0]` en el historial de completed_tools. Así las líneas grises de tools pasadas muestran también el path o comando:
+
+```
+  │ ◐ Write: (agent/loop.py)      ← ya completada — con path
+  │ ◐ Bash: $ pytest tests/ -q    ← ya completada — con comando
+  │ ◐ Read: (config.py)           ← tool activa actual
+  │   25 líneas de contenido…
+```
 
 ### Visibilidad temporal
 
 Las líneas de preview son **solo visibles mientras la tool está corriendo**. Al completarse:
-1. `_update_live_tools_cb(count)` incrementa el contador y limpia `_live_block_preview = []`
-2. La línea `|  ◐ Tool:` desaparece
+1. `_update_live_tools_cb(count)` captura `label + preview[0]` en `completed_tools`, incrementa el contador y limpia `_live_block_preview = []`
+2. La línea `◐ Tool:` activa pasa a la lista de completadas (greyed)
 3. El `⎿ Used N tools` se actualiza
 
-El preview **nunca aparece en el historial estático** de la conversación.
+El preview detallado (líneas debajo) **nunca aparece en el historial estático** de la conversación.
 
 ---
 

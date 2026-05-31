@@ -24,7 +24,7 @@ from agent.session import SessionManager
 from agent.runtime import RuntimeSettings, COLOR_PRESETS
 from tools.registry import ToolRegistry
 from tools.permissions import PermissionManager
-from tools.hooks import _is_write_tool, _is_modify_tool
+from tools.hooks import _is_modify_tool
 from workspace.manager import WorkspaceManager
 from config import DEFAULT_CONFIG as _DEFAULT_CONFIG
 
@@ -481,8 +481,12 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             base = d.rsplit("/", 1)[-1] if d else ""
             return _esc(f"({n}  {base})") if n and base else _esc(f"({n})") if n else ""
         if name in ("bulk_replace", "regex_replace", "smart_replace"):
-            pat = str(args.get("pattern", "") or args.get("search", ""))
-            return _esc(f'("{pat}")') if pat else ""
+            pat = str(args.get("pattern", "") or args.get("old_string", "") or args.get("search", ""))
+            if not pat:
+                return ""
+            first = pat.splitlines()[0][:55]
+            suffix = "…" if len(pat.splitlines()) > 1 or len(pat) > 55 else ""
+            return _esc(f'("{first}{suffix}")')
         if name == "make_run":
             target = args.get("target", "all")
             d      = args.get("directory", "").rsplit("/", 1)[-1]
@@ -1677,8 +1681,8 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
     })
     # Tools de escritura: bloquear si se llaman con los mismos args en el mismo turno
     _WRITE_TOOLS = frozenset({
-        "edit_file", "edit_files", "write_file", "regex_replace", "bulk_replace",
-        "patch_apply", "lsp_rename", "lsp_code_actions",
+        "edit_file", "edit_files", "write_file", "regex_replace", "smart_replace",
+        "bulk_replace", "patch_apply", "lsp_rename", "lsp_code_actions",
     })
 
     # Patrón para detectar scripts temporales creados por el LLM en lugar de usar tools
@@ -2799,6 +2803,13 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         if not tasks:
             return "Error: todas las tareas están vacías."
 
+        # Borrar el plan anterior de TaskManager antes de reemplazarlo
+        if not self.is_subagent and getattr(self, "tasks", None) is not None:
+            for old_pt in self._plan_tasks:
+                old_id = old_pt.get("task_id")
+                if old_id:
+                    self.tasks.delete(old_id)
+
         # Crear plan
         self._plan_tasks = [
             {"text": t, "status": "pending", "start_ts": 0.0, "end_ts": 0.0}
@@ -2806,6 +2817,16 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         ]
         self._plan_tasks[0]["status"] = "active"
         self._plan_tasks[0]["start_ts"] = time.time()
+
+        # Persistir en TaskManager para /task list y supervivencia a reinicios
+        if not self.is_subagent and getattr(self, "tasks", None) is not None:
+            for pt in self._plan_tasks:
+                tm_task = self.tasks.add(pt["text"], description="__plan__")
+                pt["task_id"] = tm_task["id"]
+            # Primera tarea ya activa → wip
+            first_id = self._plan_tasks[0].get("task_id")
+            if first_id:
+                self.tasks.update(first_id, status="wip")
 
         # Panel visual: impresión inmediata en formato simple MD — una sola vez al crear el plan.
         # No se repite tras compactación ni con cada cambio de tarea.
@@ -2876,6 +2897,12 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         self._plan_tasks[active_idx]["status"] = "done"
         self._plan_tasks[active_idx]["end_ts"] = now_ts
 
+        # Sync TaskManager: tarea completada
+        if not self.is_subagent and getattr(self, "tasks", None) is not None:
+            done_tid = self._plan_tasks[active_idx].get("task_id")
+            if done_tid:
+                self.tasks.update(done_tid, status="done")
+
         done_count = sum(1 for t in self._plan_tasks if t["status"] == "done")
         total = len(self._plan_tasks)
 
@@ -2886,6 +2913,11 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         if next_idx >= 0:
             self._plan_tasks[next_idx]["status"] = "active"
             self._plan_tasks[next_idx]["start_ts"] = now_ts
+            # Sync TaskManager: siguiente tarea activa
+            if not self.is_subagent and getattr(self, "tasks", None) is not None:
+                next_tid = self._plan_tasks[next_idx].get("task_id")
+                if next_tid:
+                    self.tasks.update(next_tid, status="wip")
             next_text = self._plan_tasks[next_idx]["text"][:80]
             # Emitir progreso al WebUI y actualizar panel TUI
             self._webui_emit({
@@ -2920,6 +2952,12 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
 
         # Todas completadas → marcar todas las activas/pending como done también
         self._mark_all_plan_tasks_done()
+        # Limpiar del TaskManager: plan finalizado, no se necesita persistencia
+        if not self.is_subagent and getattr(self, "tasks", None) is not None:
+            for pt in self._plan_tasks:
+                tid = pt.get("task_id")
+                if tid:
+                    self.tasks.delete(tid)
         # Flush ⎿ final y cerrar live block de la última tarea
         self._flush_task_intermediate_summary()
         if not self.capture_output and self._flush_live_block_cb:
@@ -2931,6 +2969,34 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             f"⚠️ Responde al usuario con un resumen conciso y di "
             f"'He completado todas las tareas.' como primera frase."
         )
+
+    def _restore_plan_from_tasks(self) -> None:
+        """Restaura _plan_tasks desde TaskManager al inicio de sesión.
+
+        Si el proceso se reinició con un plan a medias, las entradas __plan__
+        siguen en tasks.json como todo/wip. Las recuperamos para que el spinner
+        y el panel TUI vuelvan a mostrar el estado correcto.
+        """
+        _tm = getattr(self, "tasks", None)
+        if self._plan_tasks or _tm is None or self.is_subagent:
+            return
+        plan_tasks = [
+            t for t in _tm.all_tasks()
+            if t.get("description") == "__plan__" and t["status"] != "done"
+        ]
+        if not plan_tasks:
+            return
+        _status_map = {"todo": "pending", "wip": "active"}
+        self._plan_tasks = [
+            {
+                "text":     t["title"],
+                "status":   _status_map.get(t["status"], "pending"),
+                "start_ts": 0.0,
+                "end_ts":   0.0,
+                "task_id":  t["id"],
+            }
+            for t in plan_tasks
+        ]
 
     def _auto_save_task_memory(self, output_parts: list[str]) -> None:
         """Auto-guarda una memoria resumen al final de tareas significativas.
@@ -3744,13 +3810,10 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                 _body_extra  = ""
 
             # ── Auto-split: planning text largo + write tools sin mención de fichero ──
-            _write_tool_names = frozenset((
-                "write_file", "edit_file", "edit_files",
-                "regex_replace", "smart_replace", "bulk_replace", "patch_apply",
-            ))
+            _write_tool_names = self._WRITE_TOOLS
             _write_sfxs = ("_edit_file", "_edit_files", "_write_file",
                            "_smart_replace", "_regex_replace", "_bulk_replace",
-                           "_patch_apply")
+                           "_patch_apply", "_lsp_rename", "_lsp_code_actions")
             _write_files_auto: list[str] = []
             for _wtc in tool_calls:
                 try:
@@ -4352,6 +4415,7 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         if self._compact_running.is_set():
             self._compact_running.wait(timeout=30.0)
 
+        self._restore_plan_from_tasks()
         self._turn_reset_state(user_message, images)
         full_output_parts, t_run_start = self._turn_start(user_message)
 

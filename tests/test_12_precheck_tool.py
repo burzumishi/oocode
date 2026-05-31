@@ -636,7 +636,7 @@ class TestOtherToolsPassThrough:
 class TestIsCompletionReport:
     """Tests para _is_completion_report — distingue informe final de plan."""
 
-    def test_he_completado(self, loop):
+    def test_completion_signal_he_completado(self, loop):
         text = "He completado todas las tareas solicitadas. Los cambios están en su lugar."
         assert loop._is_completion_report(text) is True
 
@@ -648,7 +648,7 @@ class TestIsCompletionReport:
         text = "## Resumen de cambios\n- Se migró mud.h\n- Se corrigió handler"
         assert loop._is_completion_report(text) is True
 
-    def test_tareas_completadas(self, loop):
+    def test_all_tasks_completed_signal(self, loop):
         text = "Las 5 tareas están completadas. Aquí el detalle de cada una."
         assert loop._is_completion_report(text) is True
 

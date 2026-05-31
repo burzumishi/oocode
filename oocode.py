@@ -744,6 +744,10 @@ def main() -> None:
     registry.register(name, fn, schema)
     exp_name, exp_fn, exp_schema = subagent_runner.as_explore_schema()
     registry.register(exp_name, exp_fn, exp_schema)
+    for team_name, team_fn, team_schema in subagent_runner.as_team_schemas():
+        registry.register(team_name, team_fn, team_schema)
+    fan_name, fan_fn, fan_schema = subagent_runner.as_fanout_schema()
+    registry.register(fan_name, fan_fn, fan_schema)
 
     # mem_save — requiere la instancia de memory, no disponible en build_registry()
     _mem_ref = memory

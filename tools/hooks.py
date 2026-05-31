@@ -65,10 +65,11 @@ def _is_tui_mode() -> bool:
 _WRITE_TOOLS = frozenset({"write_file", "edit_file", "edit_files"})
 _WRITE_SUFFIXES = frozenset(f"_{n}" for n in _WRITE_TOOLS)
 
-# Conjunto ampliado: incluye también replace/patch tools que modifican ficheros.
+# Conjunto ampliado: incluye también replace/patch y LSP tools que modifican ficheros.
 # Se usa en hooks de lint/ctags/LSP para activarlos también tras regex_replace etc.
 _ALL_MODIFY_TOOLS = _WRITE_TOOLS | frozenset({
     "regex_replace", "smart_replace", "bulk_replace", "patch_apply",
+    "lsp_rename", "lsp_code_actions",
 })
 _ALL_MODIFY_SUFFIXES = frozenset(f"_{n}" for n in _ALL_MODIFY_TOOLS)
 

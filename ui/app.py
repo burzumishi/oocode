@@ -433,16 +433,18 @@ class OOCodeApp:
         pulse = self._live_pulse_idx
         color = _LIVE_PULSE_COLORS[pulse % len(_LIVE_PULSE_COLORS)]
         # Mostrar acción actual en ● si hay tool ejecutando, si no el texto del agente
-        display_bullet = self._live_block_action if self._live_block_action else self._live_block_bullet
+        display_bullet = self._live_block_bullet if self._live_block_current_tool else (self._live_block_action or self._live_block_bullet)
         lines: list[str] = [f"\n  {color}●{_LIVE_RESET} {display_bullet}"]
         body = "".join(self._live_block_body)
         if self._live_block_current_tool:
-            lines.append(f"  \x1b[2m│\x1b[0m \x1b[2m◐ {self._live_block_current_tool}\x1b[0m")
+            _preview = self._live_block_preview
+            _inline = f" {_preview[0]}" if _preview else ""
+            lines.append(f"  \x1b[2m│\x1b[0m \x1b[2m◐ {self._live_block_current_tool}{_inline}\x1b[0m")
             if body.strip():
                 for _bl in body.rstrip('\n').splitlines()[:5]:
                     lines.append(f"  \x1b[2m│    {_bl}\x1b[0m")
-            elif self._live_block_preview:
-                for _pl in self._live_block_preview[:4]:
+            elif _preview[1:]:
+                for _pl in _preview[1:5]:
                     lines.append(f"  \x1b[2m│    {_pl}\x1b[0m")
         elif body.strip():
             lines.append(body.rstrip('\n'))
@@ -508,15 +510,14 @@ class OOCodeApp:
             # Tools completadas anteriores (hasta 3, greyed)
             for _ct in live_completed_tools[-3:]:
                 lb.append(f"  \x1b[2m│\x1b[0m \x1b[2m◐ {_ct}\x1b[0m")
-            # Tool activa: live_action en la misma línea si está disponible, si no, preview aparte
+            # Tool activa: primer preview inline, resto debajo (máx 8 líneas │ total)
             if live_current_tool:
-                _tl = f"◐ {live_current_tool}"
-                if live_action:
-                    _tl += f" {live_action}"
-                lb.append(f"  \x1b[2m│\x1b[0m \x1b[2m{_tl}\x1b[0m")
-                if not live_action and live_preview:
-                    for _pl in live_preview[:3]:
-                        lb.append(f"  \x1b[2m│    {_pl}\x1b[0m")
+                _n_done = min(len(live_completed_tools), 3)
+                _preview_budget = max(0, 7 - _n_done)  # 8 │ lines - N_done - 1 current
+                _inline = f" {live_preview[0]}" if live_preview else ""
+                lb.append(f"  \x1b[2m│\x1b[0m \x1b[2m◐ {live_current_tool}{_inline}\x1b[0m")
+                for _pl in live_preview[1:1 + _preview_budget]:
+                    lb.append(f"  \x1b[2m│    {_pl}\x1b[0m")
             # live_body (texto del mensaje) NO se muestra en la zona live — se preserva
             # en _live_block_body para que aparezca correctamente tras el flush.
             if live_tool_n > 0:
@@ -586,7 +587,11 @@ class OOCodeApp:
         """Actualiza el contador de tools en la línea ⎿."""
         with self._lock:
             if self._live_block_current_tool:
-                self._live_block_completed_tools.append(self._live_block_current_tool)
+                # Capturar primer preview inline para que completed_tools muestre path/cmd
+                _tool_entry = self._live_block_current_tool
+                if self._live_block_preview:
+                    _tool_entry = f"{_tool_entry} {self._live_block_preview[0]}"
+                self._live_block_completed_tools.append(_tool_entry)
                 if len(self._live_block_completed_tools) > 4:
                     self._live_block_completed_tools.pop(0)
             self._live_block_tool_n = count

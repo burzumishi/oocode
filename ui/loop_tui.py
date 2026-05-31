@@ -4,15 +4,13 @@ Extraído de agent/loop.py para mantener la separación TUI/WebUI.
 Importado por AgentLoop como primer mixin base:
     class AgentLoop(TUIDisplayMixin, WebUIMixin): ...
 """
-import sys
-import os
 import time
 import threading
 from typing import Any, Callable, Optional
 
 from agent.loop_helpers import (
     _HEADER_ANIM_CODES, _ANSI_BOLD, _ANSI_RESET,
-    _SPINNER_FRAMES, _TASK_ICON_COLORS, _TOOL_LIVE_VERBS,
+    _SPINNER_FRAMES, _TASK_ICON_COLORS,
     _make_compact_summary, _ctx_bar, _fmt_tokens, _pbar_thin_ratio,
     _sfmt, _COMPACT_LOCK,
     _ANIM_JOIN_TIMEOUT, _COMPACT_SPINNER_POLL,

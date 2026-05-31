@@ -1,5 +1,6 @@
 """Sistema de tareas persistentes: todo / wip / done + Agent Teams."""
 import json
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -94,14 +95,14 @@ class AgentTeam:
         self._save()
 
     def execute(self, runner) -> dict[str, str]:
-        """Ejecuta todas las subtasks pendientes en paralelo vía SubAgentRunner.
+        """Ejecuta todas las subtasks pendientes en paralelo.
 
-        Cada subtask se asigna al agente indicado en `assign_to`.
-        Espera a que terminen todas y persiste los resultados.
+        Lanza un thread por subtask que llama a runner.run(). Si runner expone
+        _concurrency_sem (SubAgentRunner real), cada thread adquiere el semáforo
+        antes de ejecutar para respetar el límite de VRAM configurado.
+        Espera a que todos los threads terminen y persiste los resultados.
         Retorna dict subtask_id -> resultado.
         """
-        import threading
-
         pending = self.get_pending_subtasks()
         if not pending:
             return dict(self.results)
@@ -109,34 +110,47 @@ class AgentTeam:
         self.status = "active"
         self._save()
 
-        collected: dict[str, str] = {}
+        sem = getattr(runner, "_concurrency_sem", None)
+        results_map: dict[str, str] = {}
+        errors_map: dict[str, str] = {}
         lock = threading.Lock()
 
-        def _run_subtask(subtask: dict) -> None:
+        def _worker(st_id: str, desc: str, agent_id: str) -> None:
+            if sem is not None:
+                sem.acquire()
             try:
-                result = runner.run(subtask["assign_to"], subtask["description"], silent=True)
+                result = runner.run(agent_id, desc, silent=True)
                 with lock:
-                    collected[subtask["id"]] = result or ""
-                self.complete_subtask(subtask["id"], result or "")
+                    results_map[st_id] = result or ""
             except Exception as exc:
-                err = str(exc)
                 with lock:
-                    collected[subtask["id"]] = f"[error] {err}"
-                self.fail_subtask(subtask["id"], err)
+                    errors_map[st_id] = str(exc)
+            finally:
+                if sem is not None:
+                    sem.release()
 
-        threads = [
-            threading.Thread(target=_run_subtask, args=(st,), daemon=True)
-            for st in pending
-        ]
-        for t in threads:
+        threads: list[tuple[str, threading.Thread]] = []
+        for subtask in pending:
+            t = threading.Thread(
+                target=_worker,
+                args=(subtask["id"], subtask["description"], subtask["assign_to"]),
+                daemon=True,
+                name=f"oocode-team-{self.team_id}-{subtask['id'][:6]}",
+            )
+            threads.append((subtask["id"], t))
             t.start()
-        for t in threads:
+
+        for st_id, t in threads:
             t.join()
+            if st_id in results_map:
+                self.complete_subtask(st_id, results_map[st_id])
+            else:
+                self.fail_subtask(st_id, errors_map.get(st_id, "unknown error"))
 
         if self.is_all_completed():
             self.mark_completed()
 
-        return collected
+        return dict(self.results)
 
     def mark_completed(self) -> None:
         """Marca el equipo como completado."""

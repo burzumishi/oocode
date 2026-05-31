@@ -11,6 +11,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
+from agent.loop_helpers import _fmt_elapsed
 from ui.console import console
 
 
@@ -75,39 +76,22 @@ def _pick_subagent_host(config) -> str:
         _host_rr_counter += 1
     return all_hosts[idx]
 
-# Cola de subagentes con gestión de prioridades
-_subagent_queue: list[tuple[float, int, "ActiveSubAgent"]] = []  # (timestamp, priority, sub)
-_queue_lock = threading.Lock()
-
-# Worker global para procesar la cola de subagentes
-_queue_worker: Optional[threading.Thread] = None
-_queue_shutdown = threading.Event()
+# Semáforo global de concurrencia — inicializado por SubAgentRunner al primer spawn.
+# Limita cuántos subagentes pueden ejecutar self.run() simultáneamente.
+_concurrency_sem: Optional[threading.Semaphore] = None
+_concurrency_sem_lock = threading.Lock()
+_concurrency_sem_value: int = 0  # valor con el que se inicializó
 
 
-def _enqueue(sub: "ActiveSubAgent") -> None:
-    """Añade subagente a la cola con gestión de prioridades."""
-    global _subagent_queue
-    with _queue_lock:
-        _subagent_queue.append((time.time(), sub.priority, sub))
-        # Ordenar por prioridad (mayor primero)
-        _subagent_queue.sort(key=lambda x: x[1], reverse=True)
-
-
-def _dequeue() -> Optional["ActiveSubAgent"]:
-    """Extrae subagente de la cola."""
-    global _subagent_queue
-    with _queue_lock:
-        if _subagent_queue:
-            # Extraer el de mayor prioridad
-            _, _, sub = _subagent_queue.pop(0)
-            return sub
-    return None
-
-
-def _queue_worker_fn() -> None:
-    """Placeholder — la cola se mantiene por compatibilidad pero los subagentes
-    se ejecutan directamente en spawn_background con su propio thread."""
-    pass
+def _get_concurrency_sem(max_concurrent: int) -> threading.Semaphore:
+    """Devuelve el semáforo global, inicializándolo si es necesario."""
+    global _concurrency_sem, _concurrency_sem_value
+    max_concurrent = max(1, int(max_concurrent))
+    with _concurrency_sem_lock:
+        if _concurrency_sem is None or _concurrency_sem_value != max_concurrent:
+            _concurrency_sem = threading.Semaphore(max_concurrent)
+            _concurrency_sem_value = max_concurrent
+        return _concurrency_sem
 
 
 def _register(sub: "ActiveSubAgent") -> None:
@@ -116,9 +100,11 @@ def _register(sub: "ActiveSubAgent") -> None:
         _registry[sub.run_id] = sub
 
 
-def _start_queue_worker() -> None:
-    """No-op — subagentes se lanzan directamente con spawn_background."""
-    pass
+def list_queued() -> list[ActiveSubAgent]:
+    """Subagentes en estado 'queued' (esperando slot de concurrencia), por prioridad desc."""
+    with _registry_lock:
+        queued = [s for s in _registry.values() if s.status == "queued"]
+    return sorted(queued, key=lambda s: s.priority, reverse=True)
 
 
 def _get_recent_ttl() -> int:
@@ -142,9 +128,8 @@ def _deregister(run_id: str) -> None:
         if run_id in _registry:
             sub = _registry[run_id]
             sub.finished_at = time.time()
-            # Solo sobreescribir si aún figura como running (el worker puede haber
-            # fijado "error" o "killed" antes de llamar a _deregister)
-            if sub.status == "running":
+            # Solo sobreescribir si aún figura como running/queued
+            if sub.status in ("running", "queued"):
                 sub.status = "done"
 
 
@@ -168,15 +153,17 @@ def list_recent(ttl: float = _RECENT_TTL) -> list[ActiveSubAgent]:
 
 
 def list_active() -> list[ActiveSubAgent]:
-    """Todos los subagentes del registro (running + recientes). Orden: running primero."""
+    """Todos los subagentes del registro. Orden: queued→running→finalizados (recientes primero)."""
     with _registry_lock:
         all_subs = list(_registry.values())
+    queued  = sorted([s for s in all_subs if s.status == "queued"],
+                     key=lambda s: s.priority, reverse=True)
     running = [s for s in all_subs if s.status == "running"]
     finished = sorted(
-        [s for s in all_subs if s.status != "running"],
+        [s for s in all_subs if s.status not in ("queued", "running")],
         key=lambda s: s.finished_at or 0, reverse=True,
     )
-    return running + finished
+    return queued + running + finished
 
 
 def get_by_prefix(prefix: str) -> Optional[ActiveSubAgent]:
@@ -212,6 +199,9 @@ class SubAgentRunner:
         self._parent_client  = parent_client    # ollama.Client del padre (evita reload)
         self._parent_rt         = None   # RuntimeSettings del padre (se inyecta en oocode.py)
         self._parent_webui_queue = None  # queue del padre en modo WebUI (se inyecta en sessions.py)
+        # Semáforo de concurrencia: inicializado desde config.subagents_max_concurrent
+        max_c = getattr(config, "subagents_max_concurrent", 4)
+        self._concurrency_sem = _get_concurrency_sem(max_c)
 
     # ── Herramientas bloqueadas en modo explore ───────────────────────────────
 
@@ -522,7 +512,7 @@ RESTRICCIONES ABSOLUTAS:
                 },
             })
 
-        result = loop.run(task)
+        loop.run(task)
         session_manager.end()
 
         if not silent:
@@ -532,10 +522,20 @@ RESTRICCIONES ABSOLUTAS:
             )
             console.print()
 
-        return result or ""
+        # capture_output=False hace que loop.run() devuelva None, pero _last_response
+        # siempre se actualiza. Lo usamos para devolver el output real del subagente.
+        return loop._last_response or ""
 
-    def spawn_background(self, agent_id: str, task: str, priority: int = 0) -> "ActiveSubAgent":
-        """Lanza un subagente en background y lo registra. Devuelve el handle."""
+    def spawn_background(self, agent_id: str, task: str, priority: int = 0,
+                         timeout_seconds: int = 0) -> "ActiveSubAgent":
+        """Lanza un subagente en background respetando el límite de concurrencia.
+
+        El subagente empieza en estado 'queued' hasta que hay un slot disponible
+        (controlado por _concurrency_sem). Al adquirir el semáforo pasa a 'running'.
+
+        Si timeout_seconds > 0, un watchdog dispara kill_event tras ese tiempo y
+        marca el subagente como 'killed' con sub.error = "Timeout: …".
+        """
         sub_cfg_agents = self.config.agents
         target = next((a for a in sub_cfg_agents if a.id == agent_id), None)
         name   = target.name  if target else agent_id
@@ -554,14 +554,37 @@ RESTRICCIONES ABSOLUTAS:
             thread      = None,  # type: ignore[arg-type]
             kill_event  = kill_ev,
             steer_queue = steer_q,
-            priority     = priority,
-            queue_time   = 0.0,
+            status      = "queued",
+            priority    = priority,
+            queue_time  = 0.0,
         )
         _register(sub)
 
-        # Iniciar worker en thread
+        sem = self._concurrency_sem
+
         def _worker():
+            enqueued_at = time.time()
+            # Espera slot — puede bloquearse si hay max_concurrent corriendo
+            sem.acquire()
             try:
+                if sub.status == "killed":
+                    # Matado mientras esperaba en cola — liberar slot y salir
+                    return
+                sub.queue_time  = time.time() - enqueued_at
+                sub.started_at  = time.time()
+                sub.status      = "running"
+                # Watchdog: dispara kill_ev si el subagente supera timeout_seconds
+                if timeout_seconds > 0:
+                    def _watchdog(ev=kill_ev, s=sub, secs=timeout_seconds):
+                        signaled = ev.wait(timeout=secs)
+                        if not signaled and s.status == "running":
+                            s.error  = f"Timeout: subagente detenido tras {secs}s"
+                            s.status = "killed"
+                            ev.set()
+                    threading.Thread(
+                        target=_watchdog, daemon=True,
+                        name=f"oocode-wdog-{run_id[:6]}",
+                    ).start()
                 sub.result = self.run(
                     agent_id, task, silent=True,
                     kill_event=kill_ev, steer_queue=steer_q,
@@ -575,6 +598,7 @@ RESTRICCIONES ABSOLUTAS:
             finally:
                 sub.finished_at = time.time()
                 _deregister(run_id)
+                sem.release()
 
         t = threading.Thread(
             target=_worker, daemon=True,
@@ -607,7 +631,7 @@ RESTRICCIONES ABSOLUTAS:
 
     def kill(self, run_id_prefix: str) -> bool:
         sub = get_by_prefix(run_id_prefix)
-        if sub is None or sub.status != "running":
+        if sub is None or sub.status not in ("queued", "running"):
             return False
         sub.kill_event.set()
         sub.status = "killed"
@@ -617,7 +641,7 @@ RESTRICCIONES ABSOLUTAS:
         n = 0
         with _registry_lock:
             for sub in _registry.values():
-                if sub.status == "running":
+                if sub.status in ("queued", "running"):
                     sub.kill_event.set()
                     sub.status = "killed"
                     n += 1
@@ -630,30 +654,37 @@ RESTRICCIONES ABSOLUTAS:
         ids_str    = ", ".join(f'"{i}"' for i in agent_ids)
         model_name = self.config.model or "modelo actual"
 
-        def _fmt_sub_elapsed(secs: float) -> str:
-            if secs < 60:
-                return f"{secs:.0f}s"
-            m, s = divmod(int(secs), 60)
-            return f"{m}m {s:02d}s"
-
-        def spawn_subagent(agent_id: str, task: str) -> str:
+        def spawn_subagent(agent_id: str, task: str, timeout_seconds: int = 0) -> str:
             if agent_id not in agent_ids:
                 return f"Error: agente '{agent_id}' no existe. Disponibles: {ids_str}"
-            sub = self.spawn_background(agent_id, task, priority=0)
+            sub = self.spawn_background(agent_id, task, priority=0,
+                                        timeout_seconds=timeout_seconds)
             sub.thread.join()
+            elapsed_str = _fmt_elapsed(sub.elapsed())
+            if sub.status == "killed":
+                if not self._parent_webui_queue:
+                    console.print(
+                        f"  [dim red]⎿  Timeout ({elapsed_str}): subagente detenido[/dim red]"
+                    )
+                return (
+                    f"Timeout: el subagente '{agent_id}' fue detenido tras {timeout_seconds}s "
+                    f"sin completar la tarea. Considera dividir la tarea o aumentar el timeout."
+                )
             if sub.error:
-                elapsed_str = _fmt_sub_elapsed(sub.elapsed())
-                console.print(f"  [dim red]⎿  Error ({elapsed_str}): {sub.error[:120]}[/dim red]")
+                if not self._parent_webui_queue:
+                    console.print(
+                        f"  [dim red]⎿  Error ({elapsed_str}): {sub.error[:120]}[/dim red]"
+                    )
                 return f"Error en subagente: {sub.error}"
-            # Imprimir footer con estadísticas
-            elapsed_str = _fmt_sub_elapsed(sub.elapsed())
+            # Footer con estadísticas
             n_tools     = sub.n_tool_uses
             n_tok       = sub.n_tokens_out
             tok_str     = (f" · {n_tok // 1000:.1f}k tokens" if n_tok >= 1000
                            else (f" · {n_tok} tokens" if n_tok > 0 else ""))
             tools_str   = f"{n_tools} tool use{'s' if n_tools != 1 else ''}" if n_tools > 0 else ""
             stats_inner = "  ·  ".join(filter(None, [tools_str, tok_str.lstrip(" · "), elapsed_str]))
-            console.print(f"  [dim]⎿  Done ({stats_inner}) (ctrl+o to expand)[/dim]")
+            if not self._parent_webui_queue:
+                console.print(f"  [dim]⎿  Done ({stats_inner}) (ctrl+o to expand)[/dim]")
             return sub.result or ""
 
         schema = {
@@ -677,6 +708,14 @@ RESTRICCIONES ABSOLUTAS:
                     "task": {
                         "type": "string",
                         "description": "Tarea completa que debe ejecutar el subagente.",
+                    },
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "description": (
+                            "Segundos máximos antes de matar el subagente automáticamente. "
+                            "0 = sin timeout (por defecto). Útil para tareas acotadas "
+                            "donde un cuelgue bloquearía la cola."
+                        ),
                     },
                 },
                 "required": ["agent_id", "task"],
@@ -764,5 +803,268 @@ RESTRICCIONES ABSOLUTAS:
         }
         return "explore", explore, schema
 
+    def as_team_schemas(self) -> list[tuple[str, object, dict]]:
+        """Tools 'create_team' y 'run_team' para orquestar equipos de agentes."""
+        from agent.tasks import create_team as _create_team_fn, _load_team_obj
+
+        agent_ids = [a.id for a in self.config.agents]
+        ids_str   = ", ".join(f'"{i}"' for i in agent_ids)
+
+        default_lead = agent_ids[0] if agent_ids else "main"
+
+        def create_team(team_id: str, subtasks: list,
+                        lead_agent_id: str = default_lead) -> str:
+            """Crea un equipo de agentes con subtasks asignadas a miembros."""
+            if not team_id or not subtasks:
+                return "Error: team_id y subtasks son obligatorios"
+            if lead_agent_id not in agent_ids:
+                return (f"Error: lead_agent_id '{lead_agent_id}' no existe. "
+                        f"Disponibles: {ids_str}")
+            invalid = [st.get("assign_to") for st in subtasks
+                       if isinstance(st, dict) and st.get("assign_to") not in agent_ids]
+            if invalid:
+                return (f"Error: agente(s) no válidos en assign_to: {invalid}. "
+                        f"Disponibles: {ids_str}")
+            members = list({st.get("assign_to", lead_agent_id) for st in subtasks
+                            if isinstance(st, dict)})
+            members = [lead_agent_id] + [m for m in members if m != lead_agent_id]
+            team = _create_team_fn(team_id, lead_agent_id, members)
+            from agent.tasks import add_subtask as _add_st
+            added = 0
+            for st in subtasks:
+                if not isinstance(st, dict):
+                    continue
+                desc = st.get("description", "").strip()
+                assign = st.get("assign_to", lead_agent_id)
+                if desc:
+                    _add_st(team_id, desc, assign)
+                    added += 1
+            lines = [f"Equipo '{team_id}' creado — lead: {lead_agent_id}, {added} subtask(s):"]
+            for st in subtasks:
+                if isinstance(st, dict) and st.get("description"):
+                    lines.append(f"  [{st.get('assign_to', lead_agent_id)}] {st['description']}")
+            lines.append("Llama run_team(team_id) para ejecutar todas las subtasks en paralelo.")
+            return "\n".join(lines)
+
+        def run_team(team_id: str) -> str:
+            """Ejecuta todas las subtasks del equipo en paralelo y devuelve los resultados."""
+            team_obj = _load_team_obj(team_id)
+            if team_obj is None:
+                return f"Error: equipo '{team_id}' no encontrado. Créalo primero con create_team()."
+            pending = team_obj.get_pending_subtasks()
+            if not pending:
+                if team_obj.is_all_completed():
+                    return f"El equipo '{team_id}' ya completó todas sus subtasks."
+                return f"El equipo '{team_id}' no tiene subtasks pendientes."
+            if not self._parent_webui_queue:
+                console.print(
+                    f"  [bold cyan]◈ Equipo [white]{team_id}[/white]:[/bold cyan] "
+                    f"ejecutando [cyan]{len(pending)}[/cyan] subtask(s) en paralelo…"
+                )
+            results = team_obj.execute(self)
+            # Formatear resultados para que el lead agent pueda sintetizarlos
+            n_ok  = sum(1 for st in team_obj.subtasks if st["status"] == "completed")
+            n_err = len(team_obj.subtasks) - n_ok
+            sections = [f"## Resultados del equipo '{team_id}' ({n_ok} OK, {n_err} errores)\n"]
+            for st in team_obj.subtasks:
+                sid  = st["id"]
+                desc = st["description"]
+                who  = st["assign_to"]
+                stat = st["status"]
+                res  = (results.get(sid, "") or "").strip()
+                header = f"### [{who}] {desc}"
+                if stat == "completed":
+                    # Truncar resultados muy largos por subtask (≤4000 chars)
+                    if len(res) > 4000:
+                        res = res[:4000] + f"\n… [truncado — {len(res)-4000} chars más]"
+                    sections.append(f"{header}\n{res}" if res else f"{header}\n_(sin output)_")
+                else:
+                    sections.append(f"{header}\n⛔ {stat}: {res}")
+            sections.append(
+                "\n---\n"
+                "Sintetiza los resultados anteriores en una respuesta estructurada para el usuario. "
+                "Combina los hallazgos de todos los agentes, destaca lo completado, "
+                "y menciona cualquier error si los hay."
+            )
+            return "\n\n".join(sections)
+
+        create_schema = {
+            "name": "create_team",
+            "description": (
+                "Crea un equipo de agentes especializados con subtasks asignadas a cada miembro. "
+                "Úsalo cuando la tarea tenga dominios distintos (código, documentación, búsqueda web) "
+                "que pueden ejecutarse en paralelo. "
+                f"Agentes disponibles: {ids_str}. "
+                "Después de crear el equipo, llama run_team(team_id) para ejecutar todo en paralelo."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "team_id": {
+                        "type": "string",
+                        "description": "Identificador único del equipo en kebab-case (ej: 'refactor-2024')",
+                    },
+                    "subtasks": {
+                        "type": "array",
+                        "description": "Lista de subtasks, cada una con 'description' y 'assign_to'",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "description": {
+                                    "type": "string",
+                                    "description": "Descripción concisa de la subtask",
+                                },
+                                "assign_to": {
+                                    "type": "string",
+                                    "description": f"ID del agente que ejecuta esta subtask: {ids_str}",
+                                },
+                            },
+                            "required": ["description", "assign_to"],
+                        },
+                    },
+                    "lead_agent_id": {
+                        "type": "string",
+                        "description": f"Agente coordinador (default: '{default_lead}'). Opciones: {ids_str}",
+                    },
+                },
+                "required": ["team_id", "subtasks"],
+            },
+        }
+
+        run_schema = {
+            "name": "run_team",
+            "description": (
+                "Ejecuta todas las subtasks pendientes del equipo en paralelo y devuelve los resultados "
+                "de cada subagente para que puedas sintetizarlos. "
+                "Bloquea hasta que todas las subtasks terminen. "
+                "Llama create_team() primero si el equipo no existe."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "team_id": {
+                        "type": "string",
+                        "description": "ID del equipo a ejecutar (creado con create_team)",
+                    },
+                },
+                "required": ["team_id"],
+            },
+        }
+
+        return [
+            ("create_team", create_team, create_schema),
+            ("run_team",    run_team,    run_schema),
+        ]
+
+    def as_fanout_schema(self) -> tuple:
+        """Tool 'spawn_fanout': mismo agente × N chunks en paralelo (divide y vencerás)."""
+        agent_ids = [a.id for a in self.config.agents]
+        ids_str   = ", ".join(f'"{i}"' for i in agent_ids)
+
+        def spawn_fanout(agent_id: str, task_chunks: list,
+                         timeout_seconds: int = 0) -> str:
+            if agent_id not in agent_ids:
+                return f"Error: agente '{agent_id}' no existe. Disponibles: {ids_str}"
+            chunks = [c for c in task_chunks if isinstance(c, str) and c.strip()]
+            if not chunks:
+                return "Error: task_chunks no puede estar vacío"
+            if len(chunks) > 10:
+                return f"Error: máximo 10 chunks (recibidos: {len(chunks)})"
+
+            if not self._parent_webui_queue:
+                console.print(
+                    f"  [bold cyan]⚡ Fanout[/bold cyan] [dim]{agent_id}[/dim]  "
+                    f"ejecutando [cyan]{len(chunks)}[/cyan] chunks en paralelo…"
+                )
+
+            # Lanzar todos los chunks via spawn_background:
+            # hereda semáforo de concurrencia, kill_event y watchdog de timeout.
+            subs: list[tuple[int, "ActiveSubAgent"]] = []
+            for i, chunk in enumerate(chunks):
+                sub = self.spawn_background(
+                    agent_id, chunk, timeout_seconds=timeout_seconds,
+                )
+                # Prefijo cosmético para identificar cada worker en /agents
+                sub.task = f"[fanout {i+1}/{len(chunks)}] {chunk}"
+                subs.append((i, sub))
+            for _, sub in subs:
+                sub.thread.join()
+
+            results: dict[int, str] = {}
+            errors:  dict[int, str] = {}
+            for i, sub in subs:
+                if sub.status == "done":
+                    results[i] = sub.result or ""
+                elif sub.status == "killed":
+                    errors[i] = sub.error or f"Timeout tras {timeout_seconds}s"
+                else:
+                    errors[i] = sub.error or "unknown error"
+
+            n_ok  = len(results)
+            n_err = len(errors)
+            sections = [f"## Fanout {agent_id}: {n_ok}/{len(chunks)} chunks OK\n"]
+            for i, chunk in enumerate(chunks):
+                header = f"### Chunk {i+1}/{len(chunks)}: {chunk[:80]}"
+                if i in results:
+                    res = (results[i] or "").strip()
+                    if len(res) > 4000:
+                        res = res[:4000] + f"\n… [truncado — {len(res)-4000} chars más]"
+                    sections.append(f"{header}\n{res}" if res else f"{header}\n_(sin output)_")
+                else:
+                    sections.append(f"{header}\n⛔ Error: {errors.get(i, 'unknown error')}")
+            sections.append(
+                "\n---\n"
+                "Combina los hallazgos de todos los chunks anteriores en un análisis cohesivo. "
+                "Identifica patrones comunes, diferencias importantes entre chunks, "
+                "y extrae conclusiones globales."
+            )
+            return "\n\n".join(sections)
+
+        schema = {
+            "name": "spawn_fanout",
+            "description": (
+                "Lanza el MISMO agente en paralelo sobre N fragmentos del mismo problema "
+                "(patrón divide y vencerás). Ideal para analizar múltiples módulos, "
+                "directorios o secciones de un repo grande de forma simultánea. "
+                "Diferencia con create_team: mismo agente + mismo dominio (problema fragmentado); "
+                "create_team usa agentes distintos para dominios distintos (código, docs, web). "
+                f"Agentes disponibles: {ids_str}. Máximo 10 chunks."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "agent_id": {
+                        "type": "string",
+                        "description": f"Agente que procesa todos los chunks. Uno de: {ids_str}",
+                    },
+                    "task_chunks": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Lista de 1-10 chunks. Cada chunk es una tarea autónoma que el agente "
+                            "puede ejecutar de forma independiente. "
+                            "Ejemplo: ['Analiza src/auth/ buscando vulnerabilidades XSS', "
+                            "'Analiza src/db/ buscando vulnerabilidades SQL injection', "
+                            "'Analiza src/api/ buscando vulnerabilidades IDOR']"
+                        ),
+                        "minItems": 1,
+                        "maxItems": 10,
+                    },
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "description": (
+                            "Segundos máximos por chunk antes de matarlo automáticamente. "
+                            "0 = sin timeout (por defecto). Se aplica individualmente a cada chunk: "
+                            "un chunk lento no bloquea los demás."
+                        ),
+                    },
+                },
+                "required": ["agent_id", "task_chunks"],
+            },
+        }
+        return "spawn_fanout", spawn_fanout, schema
+
+
 # Exportar funciones para tests
-__all__ = ["SubAgentRunner", "ActiveSubAgent", "_enqueue", "_dequeue", "_register", "_deregister", "_subagent_queue"]
+__all__ = ["SubAgentRunner", "ActiveSubAgent", "_get_concurrency_sem",
+           "_register", "_deregister", "list_queued"]

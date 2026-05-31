@@ -113,7 +113,7 @@ class TestAdvancePlanTask(unittest.TestCase):
         # No debe lanzar excepción
         loop._advance_plan_task("Tarea 2: hola")
 
-    def test_explicit_tarea_n_advances(self):
+    def test_explicit_task_n_advances(self):
         loop = self._loop_with_tasks(4)
         loop._advance_plan_task("Tarea 3: reviso los tests")
         self.assertEqual(loop._plan_tasks[0]["status"], "done")
