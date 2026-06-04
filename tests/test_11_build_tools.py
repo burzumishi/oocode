@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from mcp_servers.oocode_assistant import (
+from mcp_servers.devops_assistant import (
     _tool_make_run,
     _tool_run_script,
     _tool_format_code,

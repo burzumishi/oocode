@@ -13,14 +13,26 @@ from __future__ import annotations
 import base64
 import datetime
 import hashlib
-import ipaddress
 import json
-import os
 import re
 import shutil
+
+# Límite de truncado de salida (configurable: tools.mcpMaxOutputChars en oocode.json)
+def _mcp_max_output(default: int = 4000) -> int:
+    try:
+        from pathlib import Path as _P
+        import json as _j
+        _f = _P.home() / ".oocode" / "oocode.json"
+        if _f.exists():
+            return int(_j.loads(_f.read_text()).get("tools", {}).get("mcpMaxOutputChars", default))
+    except Exception:
+        pass
+    return default
+
+
+_MAX_OUTPUT = _mcp_max_output()
 import socket
 import ssl
-import struct
 import subprocess
 import sys
 import urllib.error
@@ -240,7 +252,7 @@ def _tool_whois_lookup(args: dict) -> str:
     if rc != 0:
         return f"Error whois: {err}"
     _add_history("whois_lookup", target, out[:200])
-    return out[:4000] if out else "Sin resultados"
+    return out[:_MAX_OUTPUT] if out else "Sin resultados"
 
 
 def _tool_dns_enum(args: dict) -> str:
@@ -586,7 +598,7 @@ def _tool_cert_inspect(args: dict) -> str:
         rc, out, err = _run(["openssl", "x509", "-inform", "DER", "-in", tmpfile, "-text", "-noout"], timeout=10)
         Path(tmpfile).unlink(missing_ok=True)
         if rc == 0:
-            return out[:4000]
+            return out[:_MAX_OUTPUT]
 
     # Fallback: solo info básica del peercert
     subject = dict(x[0] for x in cert.get("subject", []))

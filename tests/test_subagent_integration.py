@@ -251,5 +251,86 @@ class TestSubagentIntegrationWithAgent:
         assert runner.config is not None
 
 
+class TestInactivityWatchdog:
+    """El watchdog de timeout mide INACTIVIDAD (por paso/petición al LLM),
+    no tiempo total: un subagente que progresa no se detiene aunque la tarea
+    dure más que `timeout_seconds`; uno que se cuelga sin progreso sí se mata.
+    """
+
+    @pytest.fixture
+    def mock_config(self):
+        config = MagicMock()
+        config.agents = [MagicMock(id="coding", name="coding", emoji="💻")]
+        config.subagents_max_concurrent = 4
+        return config
+
+    @pytest.fixture
+    def runner(self, mock_config):
+        from agent.subagent import SubAgentRunner
+        return SubAgentRunner(
+            config=mock_config,
+            permissions=MagicMock(),
+            build_registry_fn=lambda ws, cfg: {},
+        )
+
+    def test_heartbeat_updates_last_activity(self):
+        from agent.subagent import ActiveSubAgent
+        import threading, queue
+        sub = ActiveSubAgent(
+            run_id="x", agent_id="a", agent_name="a", agent_emoji="🤖",
+            task="t", thread=None, kill_event=threading.Event(),
+            steer_queue=queue.SimpleQueue(),
+        )
+        old = sub.last_activity
+        time.sleep(0.05)
+        sub.heartbeat()
+        assert sub.last_activity > old
+
+    def test_watchdog_kills_on_inactivity(self, runner):
+        """Un paso que se cuelga sin heartbeat se mata tras `timeout_seconds`."""
+        def stalled_run(*a, **kw):
+            time.sleep(3)          # se cuelga, nunca llama heartbeat
+            return "done"
+        runner.run = stalled_run
+
+        sub = runner.spawn_background("coding", "tarea", priority=0, timeout_seconds=1)
+        sub.thread.join(timeout=6)
+
+        assert sub.status == "killed"
+        assert sub.error and "sin progreso" in sub.error
+
+    def test_watchdog_survives_with_heartbeat(self, runner):
+        """Con heartbeats sostenidos, el subagente sobrevive aunque supere el timeout total."""
+        def progressing_run(agent_id, task, silent=True, kill_event=None,
+                            steer_queue=None, priority=0, sub_ref=None):
+            # ~2.4s de trabajo total > timeout_seconds=1, pero progresando cada 0.4s
+            for _ in range(6):
+                if kill_event is not None and kill_event.is_set():
+                    break
+                if sub_ref is not None:
+                    sub_ref.heartbeat()
+                time.sleep(0.4)
+            return "done"
+        runner.run = progressing_run
+
+        sub = runner.spawn_background("coding", "tarea", priority=0, timeout_seconds=1)
+        sub.thread.join(timeout=8)
+
+        assert sub.status == "done"
+        assert sub.error is None
+
+    def test_no_watchdog_when_timeout_zero(self, runner):
+        """timeout_seconds=0 → sin watchdog (el subagente corre sin límite)."""
+        def quick_run(*a, **kw):
+            return "ok"
+        runner.run = quick_run
+
+        sub = runner.spawn_background("coding", "tarea", priority=0, timeout_seconds=0)
+        sub.thread.join(timeout=5)
+
+        assert sub.status == "done"
+        assert sub.error is None
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -1,5 +1,5 @@
 " OOCode autoload — wrapper completo del TUI (streaming SSE, tools, plan)
-" Versión: 3.0.0
+" Versión: 3.1.0
 
 " ── Estado interno ────────────────────────────────────────────────────────────
 let s:panel_bufname  = '__OOCode__'
@@ -38,6 +38,22 @@ let s:task_total     = 0
 let s:server_alive    = -1   " -1=desconocido  0=inactivo  1=activo
 let s:server_check_ts = 0
 let s:server_ports    = [4000, 7788, 3000, 5000]
+
+" Sesión Flask establecida en el cookie jar.
+" CRÍTICO: un curl SSE persistente NUNCA escribe el cookie jar (curl lo vuelca
+" al terminar la transferencia, y el stream no termina). Si el primer contacto
+" con el servidor es el SSE, el POST /api/chat/send va sin cookie → Flask crea
+" una sesión distinta → los eventos del turno caen en OTRA cola y el panel se
+" queda mudo. Por eso establecemos la cookie con una petición que COMPLETA
+" (GET /api/chat/status) ANTES de abrir el stream.
+let s:session_ready   = 0
+
+" Estado de subagente activo (para prefijar líneas con │, paridad TUI/WebUI)
+let s:sub_depth       = 0
+
+" Watchdog del turno: timer id que cierra el turno si el SSE enmudece
+let s:turn_watchdog   = -1
+let s:last_event_ts   = 0
 
 " ── Utilidades HTTP ───────────────────────────────────────────────────────────
 
@@ -95,6 +111,20 @@ function! s:get(path) abort
         \ shellescape(s:cookie_jar), shellescape(s:cookie_jar),
         \ shellescape(s:api_url(a:path))
     \ ))
+endfunction
+
+" Establece la cookie de sesión Flask con una petición que COMPLETA, de modo
+" que el SSE y el POST de envío compartan el mismo sid (misma cola de eventos).
+" Idempotente: solo realiza la petición una vez por sesión.
+function! s:ensure_session() abort
+    if s:session_ready | return | endif
+    " GET /api/chat/status invoca _get_or_create_sid() → Set-Cookie en el jar.
+    call system(printf(
+        \ 'curl -sf -c %s -b %s --connect-timeout 3 --max-time 8 %s >/dev/null 2>&1',
+        \ shellescape(s:cookie_jar), shellescape(s:cookie_jar),
+        \ shellescape(s:api_url('/api/chat/status?agent_id=' . g:oocode_agent))
+    \ ))
+    let s:session_ready = 1
 endfunction
 
 " ── Detección automática del servidor ────────────────────────────────────────
@@ -318,6 +348,8 @@ endfunction
 
 function! s:panel_end_turn() abort
     let s:turn_active = 0
+    let s:sub_depth   = 0
+    call s:cancel_watchdog()
     " Flush texto acumulado si lo hay
     if !empty(s:agent_text_buf)
         call s:panel_append(s:agent_text_buf)
@@ -327,12 +359,62 @@ function! s:panel_end_turn() abort
     call s:panel_update_header()
 endfunction
 
+" ── Watchdog del turno (modo streaming) ───────────────────────────────────────
+" Si el stream SSE no entrega NINGÚN evento en g:oocode_turn_timeout segundos,
+" cerramos el turno para reactivar el prompt (evita "Pensando…" colgado).
+
+function! s:arm_watchdog() abort
+    call s:cancel_watchdog()
+    let s:last_event_ts = localtime()
+    let l:secs = get(g:, 'oocode_turn_timeout', 360)
+    if exists('*timer_start')
+        let s:turn_watchdog = timer_start(l:secs * 1000, function('s:watchdog_fire'))
+    endif
+endfunction
+
+function! s:cancel_watchdog() abort
+    if s:turn_watchdog >= 0 && exists('*timer_stop')
+        call timer_stop(s:turn_watchdog)
+    endif
+    let s:turn_watchdog = -1
+endfunction
+
+function! s:watchdog_fire(timer) abort
+    let s:turn_watchdog = -1
+    if !s:turn_active | return | endif
+    let l:idle = localtime() - s:last_event_ts
+    let l:secs = get(g:, 'oocode_turn_timeout', 360)
+    if l:idle >= l:secs - 1
+        " Stream mudo demasiado tiempo: cerrar el turno.
+        call s:panel_hide_thinking()
+        call s:panel_append('  ⏳ Sin respuesta del stream — turno cerrado (revisa el servidor)')
+        call s:panel_end_turn()
+    else
+        " Hubo actividad reciente: re-armar para el tiempo restante.
+        if exists('*timer_start')
+            let s:turn_watchdog = timer_start((l:secs - l:idle) * 1000,
+                \ function('s:watchdog_fire'))
+        endif
+    endif
+endfunction
+
 " ── Eventos SSE → Panel ───────────────────────────────────────────────────────
 
 function! s:panel_on_thinking() abort
     " Asegurar que el indicador está visible
     if s:think_lnum < 0
         let s:think_lnum = s:panel_append('  ● Pensando…')
+    endif
+endfunction
+
+" Vuelca el texto acumulado del agente principal al panel, en orden.
+" Se llama antes de cada evento estructurado (tool/plan/subagente) para que la
+" prosa del agente aparezca intercalada en su sitio (paridad con TUI/WebUI),
+" no toda junta al final del turno.
+function! s:flush_text_buf() abort
+    if !empty(s:agent_text_buf)
+        call s:panel_append(s:agent_text_buf)
+        let s:agent_text_buf = []
     endif
 endfunction
 
@@ -370,16 +452,17 @@ function! s:panel_on_tool_start(tool, ctx) abort
     let s:tool_lnums[a:tool] = l:lnum
 endfunction
 
-function! s:panel_on_tool_done(tool, ok, nlines, preview) abort
+function! s:panel_on_tool_done(tool, ok, nlines, preview, ...) abort
+    let l:ctx   = a:0 >= 1 ? a:1 : ''
     let l:sym   = a:ok ? '⎿' : '✗'
-    let l:col   = a:ok ? '' : ''
+    let l:ctxs  = empty(l:ctx) ? '' : '  ' . l:ctx[:40]
     let l:detail = ''
     if a:nlines > 1
         let l:detail = '  ▸ ' . a:nlines . ' líneas'
     elseif !empty(a:preview)
         let l:detail = '  ' . a:preview[:50]
     endif
-    let l:line = '  ' . l:sym . ' ' . a:tool . l:detail
+    let l:line = '  ' . l:sym . ' ' . a:tool . l:ctxs . l:detail
 
     if has_key(s:tool_lnums, a:tool) && s:tool_lnums[a:tool] > 0
         call s:panel_setline(s:tool_lnums[a:tool], l:line)
@@ -404,6 +487,42 @@ function! s:panel_on_plan(tasks, n, summary) abort
     call s:panel_append('')
 endfunction
 
+function! s:panel_on_plan_progress(done, total, active_text) abort
+    if a:total <= 0 | return | endif
+    let l:line = '  ◈  Plan  [' . a:done . '/' . a:total . ']'
+    if !empty(a:active_text)
+        let l:line .= '  ▸ ' . a:active_text[:60]
+    endif
+    call s:panel_append(l:line)
+endfunction
+
+" Subagentes — paridad con el bloque dedicado del TUI/WebUI (líneas con │)
+function! s:panel_on_subagent_start(emoji, name, task) abort
+    call s:panel_hide_thinking()
+    " Flush del texto del agente principal antes de abrir el bloque del subagente
+    if !empty(s:agent_text_buf)
+        call s:panel_append(s:agent_text_buf)
+        let s:agent_text_buf = []
+    endif
+    let s:sub_depth += 1
+    call s:panel_append('  ' . a:emoji . ' ' . a:name . ' ◂ ' . a:task[:64])
+endfunction
+
+function! s:panel_on_subagent_done(name) abort
+    if s:sub_depth > 0 | let s:sub_depth -= 1 | endif
+    let l:label = empty(a:name) ? 'subagente' : a:name
+    call s:panel_append('  │ ⎿ ' . l:label . ' ✓')
+endfunction
+
+" Texto/chunk de subagente: se vuelca directo con prefijo │ (no al buffer del padre)
+function! s:panel_on_subagent_text(text) abort
+    call s:panel_hide_thinking()
+    if empty(a:text) | return | endif
+    for l:ln in split(a:text, "\n", 1)
+        call s:panel_append('  │ ' . l:ln)
+    endfor
+endfunction
+
 function! s:panel_on_error(msg) abort
     call s:panel_hide_thinking()
     call s:panel_append(['', '  ✗ Error: ' . a:msg, ''])
@@ -412,42 +531,89 @@ endfunction
 
 function! s:handle_sse_event(ev) abort
     let l:type = get(a:ev, 'type', '')
+    let s:last_event_ts = localtime()
+    let l:is_sub = get(a:ev, 'subagent', 0)
 
     if l:type ==# 'connected'
-        call s:panel_append('  [conectado → ' . g:oocode_host . ']')
+        " Confirmación silenciosa (evita ruido en cada reconexión del stream).
 
     elseif l:type ==# 'heartbeat'
         " silencioso
 
     elseif l:type ==# 'thinking'
-        call s:panel_on_thinking()
+        if !l:is_sub | call s:panel_on_thinking() | endif
 
     elseif l:type ==# 'text'
-        call s:panel_on_text(get(a:ev, 'text', ''))
+        if l:is_sub
+            call s:panel_on_subagent_text(get(a:ev, 'text', ''))
+        else
+            call s:panel_on_text(get(a:ev, 'text', ''))
+        endif
 
     elseif l:type ==# 'stream_chunk'
-        call s:panel_on_stream_chunk(get(a:ev, 'text', ''))
+        if l:is_sub
+            call s:panel_on_subagent_text(get(a:ev, 'text', ''))
+        else
+            call s:panel_on_stream_chunk(get(a:ev, 'text', ''))
+        endif
 
     elseif l:type ==# 'tool_start'
-        call s:panel_on_tool_start(get(a:ev, 'tool', '?'), get(a:ev, 'context', ''))
+        call s:flush_text_buf()
+        let l:pre = l:is_sub ? '│ ' : ''
+        call s:panel_on_tool_start(l:pre . get(a:ev, 'tool', '?'), get(a:ev, 'context', ''))
 
     elseif l:type ==# 'tool_done'
+        let l:pre = l:is_sub ? '│ ' : ''
         call s:panel_on_tool_done(
-            \ get(a:ev, 'tool',    '?'),
+            \ l:pre . get(a:ev, 'tool', '?'),
             \ get(a:ev, 'ok',      1),
             \ get(a:ev, 'n_lines', 0),
-            \ get(a:ev, 'preview', '')
+            \ get(a:ev, 'preview', ''),
+            \ get(a:ev, 'context', '')
         \ )
 
     elseif l:type ==# 'plan'
+        call s:flush_text_buf()
         call s:panel_on_plan(
             \ get(a:ev, 'tasks',   []),
             \ get(a:ev, 'n',        0),
             \ get(a:ev, 'summary', '')
         \ )
 
+    elseif l:type ==# 'plan_progress'
+        call s:flush_text_buf()
+        call s:panel_on_plan_progress(
+            \ get(a:ev, 'done',  0),
+            \ get(a:ev, 'total', 0),
+            \ get(a:ev, 'active_text', '')
+        \ )
+
+    elseif l:type ==# 'subagent_start'
+        call s:panel_on_subagent_start(
+            \ get(a:ev, 'agent_emoji', '🤖'),
+            \ get(a:ev, 'agent_name',  get(a:ev, 'agent_id', 'subagente')),
+            \ get(a:ev, 'task', '')
+        \ )
+
+    elseif l:type ==# 'subagent_done'
+        call s:panel_on_subagent_done(get(a:ev, 'subagent_name', get(a:ev, 'agent_id', '')))
+
+    elseif l:type ==# 'preflight'
+        " Reemplazar "Pensando…" por la frase preflight enlatada del servidor.
+        let l:label = get(a:ev, 'label', '')
+        if !empty(l:label) && s:think_lnum > 0
+            call s:panel_setline(s:think_lnum, '  ● ' . l:label)
+        endif
+
+    elseif l:type ==# 'embed_flash'
+        " Operación de memoria/RAG en curso — indicador discreto, sin romper el flujo.
+
+    elseif l:type ==# 'inference_done'
+        " Señal de fin de inferencia; el evento 'done' cierra el turno.
+
     elseif l:type ==# 'status'
         call s:update_agent_status(a:ev)
+        call s:panel_update_header()
 
     elseif l:type ==# 'done'
         call s:update_agent_status(a:ev)
@@ -547,9 +713,13 @@ endfunction
 function! s:sse_ensure_running() abort
     if s:sse_is_running() | return | endif
 
+    " La cookie DEBE existir antes de abrir el stream (ver nota en s:session_ready).
+    call s:ensure_session()
+
     let l:url = s:api_url('/api/chat/stream?agent_id=' . g:oocode_agent)
+    " Solo -b (leer cookie): el SSE es persistente y -c truncaría el jar al cerrar.
     let l:cmd = ['curl', '-sN', '--no-buffer',
-               \ '-c', s:cookie_jar, '-b', s:cookie_jar,
+               \ '-b', s:cookie_jar,
                \ '--connect-timeout', '5', '--max-time', '3600',
                \ l:url]
 
@@ -641,6 +811,14 @@ function! oocode#send(message) abort
         let s:server_alive = 1
     endif
 
+    " No solapar turnos: el servidor responde 409 si el agente está ocupado.
+    if s:turn_active
+        echohl WarningMsg
+        echo 'OOCode: el agente está procesando — usa :OOCodeKill para interrumpir'
+        echohl None
+        return
+    endif
+
     call oocode#open_panel()
     let l:is_slash = a:message =~# '^\s*/'
 
@@ -654,70 +832,115 @@ function! oocode#send(message) abort
     endif
     let s:no_hint_once = 0
 
-    if s:has_async()
-        " ── Modo asíncrono: send_sync en un job de fondo (no bloquea VIM) ──
-        " Usamos send_sync en lugar de SSE para evitar el problema de sesión:
-        " con SSE+POST separados, Flask crea dos sesiones distintas y los
-        " eventos nunca llegan al stream correcto.
-        call s:panel_start_turn(a:message, l:is_slash)
+    " Modo streaming (paridad TUI/WebUI): SSE persistente + POST /api/chat/send.
+    " Requiere jobs y g:oocode_stream activo. Si no, fallback send_sync bloqueante.
+    if get(g:, 'oocode_stream', 1) && s:has_async()
+        call s:send_via_stream(a:message, l:msg, l:is_slash)
+    else
+        call s:send_via_sync(a:message, l:msg, l:is_slash)
+    endif
+endfunction
 
-        let l:timeout = l:is_slash ? 60 : 300
+" ── Envío vía stream SSE (paridad con WebUI) ──────────────────────────────────
+" El POST /api/chat/send es fire-and-forget: dispara el turno y TODOS los eventos
+" (text, tool_start/done, plan, subagent, done) llegan por el stream SSE ya abierto.
+function! s:send_via_stream(raw, msg, is_slash) abort
+    call s:ensure_session()
+    call s:sse_ensure_running()
+    call s:panel_start_turn(a:raw, a:is_slash)
+
+    let l:url  = s:api_url('/api/chat/send')
+    let l:body = json_encode({'message': a:msg, 'agent_id': g:oocode_agent})
+    let l:cmd  = ['curl', '-s', '-o', '/dev/null', '-w', '%{http_code}',
+        \ '-b', s:cookie_jar,
+        \ '-X', 'POST', '-H', 'Content-Type: application/json',
+        \ '--connect-timeout', '5', '--max-time', '30',
+        \ '-d', l:body, l:url]
+
+    let s:sync_buf = ''
+    if has('nvim')
+        let s:sync_job = jobstart(l:cmd, {
+            \ 'on_stdout': function('s:nvim_send_stdout'),
+            \ 'on_exit':   function('s:nvim_send_exit'),
+            \ 'stdout_buffered': v:true,
+        \ })
+    elseif has('job')
+        let s:sync_job = job_start(l:cmd, {
+            \ 'out_cb':  function('s:vim_send_stdout'),
+            \ 'exit_cb': function('s:vim_send_exit'),
+        \ })
+    endif
+
+    " Watchdog: si tras N s no llega NINGÚN evento del stream, cerrar el turno.
+    call s:arm_watchdog()
+endfunction
+
+" Callbacks del POST /api/chat/send — solo comprueban el código HTTP del disparo.
+function! s:nvim_send_stdout(jid, data, event) abort
+    let s:sync_buf .= join(a:data, '')
+endfunction
+function! s:nvim_send_exit(jid, code, event) abort
+    let s:sync_job = v:null
+    call s:on_send_post_done(s:sync_buf)
+endfunction
+function! s:vim_send_stdout(ch, msg) abort
+    let s:sync_buf .= a:msg
+endfunction
+function! s:vim_send_exit(job, code) abort
+    let s:sync_job = v:null
+    call s:on_send_post_done(s:sync_buf)
+endfunction
+
+function! s:on_send_post_done(body) abort
+    let l:code = matchstr(a:body, '\d\+$')
+    " 409 = el agente ya estaba ocupado; 5xx/000 = servidor caído.
+    if l:code ==# '409'
+        call s:panel_hide_thinking()
+        call s:panel_append('  ⚠ El agente está ocupado — espera o usa :OOCodeKill')
+        call s:cancel_watchdog()
+        let s:turn_active = 0
+    elseif l:code !=# '200' && !empty(l:code)
+        call s:panel_hide_thinking()
+        call s:panel_append('  ✗ Error de envío (HTTP ' . l:code . ')')
+        call s:cancel_watchdog()
+        call s:panel_end_turn()
+    endif
+    " 200 → el turno continúa por SSE; el evento 'done' lo cerrará.
+endfunction
+
+" ── Envío síncrono (fallback sin jobs / g:oocode_stream=0) ─────────────────────
+function! s:send_via_sync(raw, msg, is_slash) abort
+    " En modo sync NO debe haber un SSE compitiendo por la misma cola de eventos.
+    call s:sse_stop()
+    call s:panel_start_turn(a:raw, a:is_slash)
+
+    let l:timeout = a:is_slash ? 60 : 300
+    if s:has_async()
         let l:url  = s:api_url('/api/chat/send_sync')
         let l:body = json_encode({
-            \ 'message':  l:msg,
-            \ 'agent_id': g:oocode_agent,
-            \ 'timeout':  l:timeout,
-        \ })
-        let l:cmd = ['curl', '-sf',
-            \ '-c', s:cookie_jar, '-b', s:cookie_jar,
+            \ 'message': a:msg, 'agent_id': g:oocode_agent, 'timeout': l:timeout})
+        let l:cmd = ['curl', '-sf', '-c', s:cookie_jar, '-b', s:cookie_jar,
             \ '-X', 'POST', '-H', 'Content-Type: application/json',
             \ '--connect-timeout', '3', '--max-time', string(l:timeout + 15),
             \ '-d', l:body, l:url]
-
         let s:sync_buf = ''
-
         if has('nvim')
             let s:sync_job = jobstart(l:cmd, {
                 \ 'on_stdout': function('s:nvim_sync_stdout'),
                 \ 'on_exit':   function('s:nvim_sync_exit'),
-                \ 'stdout_buffered': v:false,
+                \ 'stdout_buffered': v:true,
             \ })
-        elseif has('job')
+        else
             let s:sync_job = job_start(l:cmd, {
                 \ 'out_cb':  function('s:vim_sync_stdout'),
                 \ 'exit_cb': function('s:vim_sync_exit'),
             \ })
         endif
-
     else
-        " ── Modo fallback: send_sync bloqueante ────────────────────────────
-        call s:panel_start_turn(a:message, l:is_slash)
-        let l:timeout = l:is_slash ? 30 : 180
+        " Sin jobs: bloqueante.
         let l:resp = s:post('/api/chat/send_sync', {
-            \ 'message':  l:msg,
-            \ 'agent_id': g:oocode_agent,
-            \ 'timeout':  l:timeout,
-        \ })
-        call s:panel_hide_thinking()
-        if empty(l:resp)
-            call s:panel_append('  ⚠ Sin respuesta del servidor')
-        else
-            try
-                let l:data  = json_decode(l:resp)
-                let l:tools = get(l:data, 'tool_events', [])
-                for l:t in l:tools
-                    let l:sym = get(l:t, 'ok', 1) ? '⎿' : '✗'
-                    call s:panel_append('  ' . l:sym . ' ' . get(l:t, 'tool', '?'))
-                endfor
-                let l:text = get(l:data, 'response', '')
-                if !empty(l:text) && !s:sse_turn_shown
-                    call s:panel_append(split(l:text, "\n", 1))
-                endif
-            catch
-                call s:panel_append('  ⚠ Respuesta inválida')
-            endtry
-        endif
-        call s:panel_end_turn()
+            \ 'message': a:msg, 'agent_id': g:oocode_agent, 'timeout': l:timeout})
+        call s:display_sync_response(l:resp)
     endif
 endfunction
 
@@ -752,16 +975,18 @@ function! s:display_sync_response(resp) abort
             let l:tools = get(l:data, 'tool_events', [])
             for l:t in l:tools
                 let l:sym = get(l:t, 'ok', 1) ? '⎿' : '✗'
-                call s:panel_append('  ' . l:sym . ' ' . get(l:t, 'tool', '?'))
+                let l:ctx = get(l:t, 'context', '')
+                call s:panel_append('  ' . l:sym . ' ' . get(l:t, 'tool', '?')
+                    \ . (empty(l:ctx) ? '' : '  ' . l:ctx[:50]))
             endfor
             " Mostrar respuesta del agente
             let l:text = get(l:data, 'response', '')
             if get(l:data, 'timeout', v:false)
                 call s:panel_append('  ⏳ Respuesta parcial (timeout):')
             endif
-            if !empty(l:text) && !s:sse_turn_shown
+            if !empty(l:text)
                 call s:panel_append(split(l:text, "\n", 1))
-            elseif empty(l:tools) && !s:sse_turn_shown
+            elseif empty(l:tools)
                 call s:panel_append('  ⚠ Respuesta vacía')
             endif
         catch
@@ -872,10 +1097,13 @@ endfunction
 " ── Sesiones ─────────────────────────────────────────────────────────────────
 
 function! oocode#new_session() abort
+    call s:cancel_watchdog()
     call s:sse_stop()
     call s:post('/api/chat/clear', {})
     if filereadable(s:cookie_jar) | call delete(s:cookie_jar) | endif
+    let s:session_ready  = 0
     let s:turn_active    = 0
+    let s:sub_depth      = 0
     let s:agent_text_buf = []
     let s:tool_lnums     = {}
     call s:panel_clear()
@@ -889,10 +1117,14 @@ function! oocode#switch_agent(agent_id) abort
         echo 'OOCode: uso: :OOCodeSwitch <agent_id>'
         return
     endif
+    call s:cancel_watchdog()
     call s:sse_stop()
     let g:oocode_agent = trim(a:agent_id)
     call s:post('/api/chat/clear', {})
     if filereadable(s:cookie_jar) | call delete(s:cookie_jar) | endif
+    let s:session_ready = 0
+    let s:turn_active   = 0
+    let s:sub_depth     = 0
     call s:panel_clear()
     call s:panel_append('  🔄 Agente → ' . g:oocode_agent)
     call s:sse_ensure_running()
@@ -966,6 +1198,41 @@ function! oocode#doctor() abort
     endif
 endfunction
 
+" ── Interrupción del turno (paridad con el botón Kill del WebUI) ──────────────
+
+function! oocode#kill() abort
+    if !s:turn_active
+        echo 'OOCode: no hay turno activo'
+        return
+    endif
+    call s:post('/api/chat/kill', {})
+    " El servidor emite un evento 'done' por el stream; el watchdog y el handler
+    " 'done' cierran el turno. Forzamos el cierre local por si el stream no responde.
+    call s:cancel_watchdog()
+    call s:panel_hide_thinking()
+    call s:panel_append('  ⛔ Turno interrumpido')
+    call s:panel_end_turn()
+    echo 'OOCode: turno interrumpido'
+endfunction
+
+" ── Modo elevated (paridad con el badge elevated del WebUI) ───────────────────
+
+function! oocode#elevated(...) abort
+    let l:mode = a:0 >= 1 ? trim(a:1) : ''
+    let l:resp = s:post('/api/chat/elevated', empty(l:mode) ? {} : {'mode': l:mode})
+    if empty(l:resp)
+        echohl WarningMsg | echo 'OOCode: servidor no responde' | echohl None
+        return
+    endif
+    try
+        let l:data = json_decode(l:resp)
+        echo 'OOCode: elevated → ' . get(l:data, 'elevated', '?')
+            \ . '  (' . get(l:data, 'desc', '') . ')'
+    catch
+        echo 'OOCode: elevated actualizado'
+    endtry
+endfunction
+
 function! oocode#status() abort
     " Re-detectar si necesario
     call oocode#check_server_on_start()
@@ -1024,7 +1291,8 @@ function! oocode#webserver(cmd) abort
         call timer_start(4000, {-> s:sse_ensure_running()})
     elseif a:cmd ==# 'stop'
         call s:sse_stop()
-        let s:server_alive = 0
+        let s:server_alive  = 0
+        let s:session_ready = 0
     endif
 endfunction
 

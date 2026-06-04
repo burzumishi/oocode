@@ -6,11 +6,15 @@ La configuración de OOCode reside en `~/.oocode/oocode.json`. Se genera automá
 
 ```json
 {
-  "ollama": {
-    "host":            "http://localhost:11434",
-    "extraHosts":      [],
-    "embedHost":       "",
-    "subagentRouting": "round-robin"
+  "api": {
+    "type":             "ollama",
+    "key":              "",
+    "host":             "http://localhost:11434",
+    "extraHosts":       [],
+    "embedHost":        "",
+    "subagentRouting":  "round-robin",
+    "ollamaRetryCount": 2,
+    "ollamaRetryDelay": 3.0
   },
 
   "agents": {
@@ -231,14 +235,40 @@ La configuración de OOCode reside en `~/.oocode/oocode.json`. Se genera automá
 
 ## Secciones
 
-### `ollama`
+### `api` *(nuevo en v0.4.0)*
+
+Selecciona el backend LLM. OOCode soporta tres tipos:
+
+Un único bloque `api` define el backend LLM **y** todos los parámetros del servidor.
 
 | Campo | Tipo | Defecto | Descripción |
 |-------|------|---------|-------------|
-| `host` | string | `"http://localhost:11434"` | Servidor Ollama principal — agente interactivo y fallback de subagentes |
-| `extraHosts` | list[string] | `[]` | Servidores adicionales para subagentes (round-robin). Cada subagente nuevo recibe el siguiente host de la lista |
-| `embedHost` | string | `""` | Servidor dedicado para embeddings. Vacío = usa `host` |
-| `subagentRouting` | string | `"round-robin"` | Política de distribución: `"round-robin"` rota entre todos los hosts disponibles; `"primary-only"` usa siempre el host principal |
+| `type` | string | `"ollama"` | Backend: `"ollama"` \| `"openai"` \| `"anthropic"` |
+| `key` | string | `""` | API key (necesaria para OpenAI cloud y Anthropic; vacía para Ollama o servidores locales) |
+| `host` | string | `"http://localhost:11434"` | URL del servidor. Con `type: "ollama"` es el host de Ollama; con `type: "openai"` es el `baseUrl` (p.ej. `"http://localhost:8080/v1"` para llama.cpp; vacío usa la URL oficial de OpenAI). Con `type: "anthropic"` se ignora |
+| `extraHosts` | list[string] | `[]` | **(solo Ollama)** Servidores adicionales para subagentes (round-robin). Cada subagente nuevo recibe el siguiente host de la lista |
+| `embedHost` | string | `""` | Servidor Ollama dedicado para embeddings (memoria/RAG, siempre protocolo Ollama). Vacío: con `type: "ollama"` usa `host`; con `type: "openai"`/`"anthropic"` cae a `http://localhost:11434` (v0.4.1) en vez de `host` (que apunta al servidor de chat) |
+| `subagentRouting` | string | `"round-robin"` | **(solo Ollama)** Política de distribución: `"round-robin"` rota entre todos los hosts disponibles; `"primary-only"` usa siempre el host principal |
+| `ollamaRetryCount` | int | `2` | **(solo Ollama)** Reintentos automáticos en timeout (0 = sin retry) |
+| `ollamaRetryDelay` | float | `3.0` | **(solo Ollama)** Segundos de espera base entre reintentos (se duplica con backoff) |
+
+**Ejemplos de backend:**
+
+```json
+// Ollama local (default)
+{ "api": { "type": "ollama", "host": "http://localhost:11434" } }
+
+// llama.cpp / LM Studio / vLLM (OpenAI-compatible local)
+{ "api": { "type": "openai", "host": "http://localhost:8080/v1" } }
+
+// OpenAI cloud
+{ "api": { "type": "openai", "key": "sk-...", "host": "https://api.openai.com/v1" } }
+
+// Anthropic (Claude cloud)
+{ "api": { "type": "anthropic", "key": "sk-ant-..." } }
+```
+
+Ver `doc/25_api_backends.md` para referencia completa de backends.
 
 #### Multi-servidor Ollama
 
@@ -247,7 +277,8 @@ Cuando tienes varias GPUs o varias máquinas con Ollama, OOCode puede distribuir
 **Ejemplo: 3 GPUs locales**
 ```json
 {
-  "ollama": {
+  "api": {
+    "type":            "ollama",
     "host":            "http://localhost:11434",
     "extraHosts":      ["http://localhost:11435", "http://localhost:11436"],
     "subagentRouting": "round-robin"
@@ -258,7 +289,8 @@ Cuando tienes varias GPUs o varias máquinas con Ollama, OOCode puede distribuir
 **Ejemplo: 2 máquinas en red + servidor CPU para embeddings**
 ```json
 {
-  "ollama": {
+  "api": {
+    "type":            "ollama",
     "host":            "http://gpu-server-1:11434",
     "extraHosts":      ["http://gpu-server-2:11434"],
     "embedHost":       "http://cpu-server:11434",
@@ -270,16 +302,17 @@ Cuando tienes varias GPUs o varias máquinas con Ollama, OOCode puede distribuir
 **Ejemplo: un servidor, deshabilitar distribución**
 ```json
 {
-  "ollama": {
+  "api": {
+    "type":            "ollama",
     "host":            "http://localhost:11434",
     "subagentRouting": "primary-only"
   }
 }
 ```
 
-La propiedad `embedHost` también se aplica a los subagentes: cada subagente que necesita crear su propio `EmbeddingClient` usará `embedHost` (o `host` si está vacío), independientemente del host asignado por el round-robin para las inferencias LLM.
+La propiedad `embedHost` también se aplica a los subagentes: cada subagente que necesita crear su propio `EmbeddingClient` usa el host de embeddings efectivo (`config.effective_embed_host`), independientemente del host asignado por el round-robin para las inferencias LLM.
 
-El `/doctor` verifica la conectividad de todos los hosts configurados y muestra cuántos modelos tiene cada uno.
+El `/doctor` (adaptado al backend) verifica la conectividad del backend de chat y del host de embeddings, y con Ollama muestra cuántos modelos tiene cada host.
 
 ### `agents`
 
@@ -615,7 +648,7 @@ Los hooks se activan/desactivan con `/hooks builtin <nombre>` en el REPL. Ver `d
 
 ```bash
 python oocode.py \
-  --host http://192.168.1.100:11434 \   # sobreescribe ollama.host
+  --host http://192.168.1.100:11434 \   # sobreescribe api.host
   --model qwen3.5:9b \                  # sobreescribe model del agente
   --agent coding \                      # selecciona agente por ID
   --new                                 # fuerza nueva sesión

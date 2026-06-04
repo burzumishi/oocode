@@ -6,7 +6,6 @@ Optimizaciones:
 - Cachea vectores de memoria en RAM (evita disco en búsquedas repetidas).
 - Cachea la lista de ficheros de memoria con TTL de 5 s.
 """
-import re
 import time
 from pathlib import Path
 from typing import Optional, TYPE_CHECKING
@@ -206,39 +205,6 @@ class MemorySystem:
         if not index.strip() or "Sin recuerdos" in index:
             return ""
         return f"\n\n## Memoria persistente\n{index}"
-
-    def _auto_suggest_memories(self, current_query: str) -> list[str]:
-        """Sugiere memorias relevantes automáticamente basándose en el query actual.
-
-        Analiza el query para detectar patrones y sugiere memorias relacionadas.
-        Útil para auto-generación de memoria similar a Claude Code.
-        """
-        if not self._embed or not self._embed.is_available():
-            return []
-
-        # Detectar patrones en el query
-        patterns = [
-            (r"(TODO|FIXME|HACK|BUG|XXX)", "task_management"),
-            (r"(configuración|config|setup)", "configuration"),
-            (r"(docker|container|compose)", "docker"),
-            (r"(git|commit|push|pull)", "git_workflow"),
-            (r"(error|exception|bug|fail)", "error_handling"),
-            (r"(test|pytest|unittest)", "testing"),
-            (r"(lsp|clangd|pylsp)", "lsp_integration"),
-            (r"(mcp|model context protocol)", "mcp_servers"),
-        ]
-
-        suggestions = []
-        for pattern, slug in patterns:
-            if re.search(pattern, current_query, re.IGNORECASE):
-                # Buscar memoria relacionada
-                query = f"{slug} memory"
-                hits = self.search(query, top_k=1)
-                if hits:
-                    score, slug, snippet = hits[0]
-                    suggestions.append(f"\n### Sugerencia: {slug}\n{snippet}")
-
-        return suggestions
 
     # ── Índice ────────────────────────────────────────────────────────────────
 

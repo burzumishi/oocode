@@ -118,14 +118,56 @@ class AgentTeam:
         def _worker(st_id: str, desc: str, agent_id: str) -> None:
             if sem is not None:
                 sem.acquire()
+            # Registrar el miembro del equipo como subagente activo con su propia
+            # kill_event para que /kill (kill_all) pueda matarlo: antes Team.execute
+            # llamaba runner.run() sin kill_event ni registro, así que los miembros
+            # de equipo eran INMATABLES (no estaban en _registry y _ext_kill=None).
+            sub = None
+            kill_ev = None
             try:
-                result = runner.run(agent_id, desc, silent=True)
+                import uuid as _uuid
+                import queue as _q
+                from agent.subagent import ActiveSubAgent, _register
+                _tgt = next(
+                    (a for a in getattr(runner.config, "agents", []) if a.id == agent_id),
+                    None,
+                )
+                kill_ev = threading.Event()
+                sub = ActiveSubAgent(
+                    run_id      = _uuid.uuid4().hex,
+                    agent_id    = agent_id,
+                    agent_name  = (_tgt.name if _tgt else agent_id),
+                    agent_emoji = (_tgt.emoji if _tgt else "🤖"),
+                    task        = desc,
+                    thread      = threading.current_thread(),
+                    kill_event  = kill_ev,
+                    steer_queue = _q.SimpleQueue(),
+                    status      = "running",
+                )
+                _register(sub)
+            except Exception:
+                sub, kill_ev = None, None
+            # Solo pasamos kill_event/sub_ref si el registro tuvo éxito (runner real
+            # con .config). Runners duck-typed sin esos kwargs (tests) usan la firma
+            # mínima run(agent_id, task, silent).
+            run_kwargs = {"kill_event": kill_ev, "sub_ref": sub} if sub is not None else {}
+            try:
+                result = runner.run(agent_id, desc, silent=True, **run_kwargs)
                 with lock:
                     results_map[st_id] = result or ""
+                if sub is not None and sub.status not in ("killed",):
+                    sub.status = "done"
+                    sub.result = result or ""
             except Exception as exc:
                 with lock:
                     errors_map[st_id] = str(exc)
+                if sub is not None and sub.status not in ("killed",):
+                    sub.status = "error"
+                    sub.error = str(exc)
             finally:
+                if sub is not None:
+                    import time as _time
+                    sub.finished_at = _time.time()
                 if sem is not None:
                     sem.release()
 

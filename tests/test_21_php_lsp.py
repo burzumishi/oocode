@@ -151,7 +151,7 @@ class TestFormatCodePhp:
         return f
 
     def test_format_code_auto_detects_php_cs_fixer(self, php_file):
-        from mcp_servers.oocode_assistant import _tool_format_code
+        from mcp_servers.devops_assistant import _tool_format_code
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
             result = _tool_format_code({"path": str(php_file), "tool": "auto"})
@@ -161,7 +161,7 @@ class TestFormatCodePhp:
         assert "php-cs-fixer" in cmd
 
     def test_format_code_php_check_mode(self, php_file):
-        from mcp_servers.oocode_assistant import _tool_format_code
+        from mcp_servers.devops_assistant import _tool_format_code
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
             _tool_format_code({"path": str(php_file), "tool": "php-cs-fixer", "check": True})
@@ -169,13 +169,13 @@ class TestFormatCodePhp:
         assert "--dry-run" in cmd
 
     def test_format_code_php_not_installed(self, php_file):
-        from mcp_servers.oocode_assistant import _tool_format_code
+        from mcp_servers.devops_assistant import _tool_format_code
         with patch("subprocess.run", side_effect=FileNotFoundError):
             result = _tool_format_code({"path": str(php_file), "tool": "php-cs-fixer"})
         assert "no está instalado" in result or "Error" in result
 
     def test_format_code_php_uses_psr12(self, php_file):
-        from mcp_servers.oocode_assistant import _tool_format_code
+        from mcp_servers.devops_assistant import _tool_format_code
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
             _tool_format_code({"path": str(php_file), "tool": "php-cs-fixer"})

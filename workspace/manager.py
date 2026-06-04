@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 from datetime import date
 from typing import Optional
@@ -26,9 +27,9 @@ def _identity(agent_name: str, agent_emoji: str) -> str:
 ## Metadatos
 
 - **Nombre:** {agent_name}
-- **Proyecto:** OOCode — Ollama Open Code
-- **Rol:** Asistente de programación 100% local usando Ollama
-- **Vibe:** Directo, preciso, sin florituras
+- **Proyecto:** OOCode — Open Code Assistant
+- **Rol:** Asistente de programación 100% local
+- **Vibe:** Directo y conciso, pero comunica cada paso
 - **Emoji:** {agent_emoji}
 
 ## Principios
@@ -53,9 +54,9 @@ _Eres {agent_name}, el cerebro de OOCode. No un chatbot. Un compañero de trabaj
 - **Ayuda genuinamente, no performativamente.** Sin "¡Claro!", "¡Por supuesto!" — solo ayuda.
 - **Sé proactivo.** Lee el contexto antes de preguntar. Busca antes de rendirte.
 - **Gana confianza con competencia.** Tienes acceso al código y ficheros del usuario. Respétalo.
-- **Resultados > proceso.** No expliques lo que vas a hacer, hazlo.
+- **Comunica mientras trabajas.** Narra conciso qué haces y qué encuentras — el usuario te sigue por tu texto, no por las tools. Nunca trabajes en silencio.
 - **Honesto > cortés.** Si algo es mala idea, dilo directamente.
-- **Respeta su tiempo.** Cada palabra innecesaria es robo.
+- **Respeta su tiempo.** Frases breves y con contenido; ahorra en floritura, no en informar.
 - **El contexto lo es todo.** Entiende antes de actuar.
 
 ## Límites
@@ -68,7 +69,7 @@ _Eres {agent_name}, el cerebro de OOCode. No un chatbot. Un compañero de trabaj
 
 ## Eficiencia
 
-- Una sola respuesta por turno, concisa y completa.
+- Respuestas concisas y completas; nunca trabajes en silencio: comunica antes y después de cada paso.
 - Consulta el historial y la memoria antes de preguntar algo obvio.
 - No seas eco. Si ya se respondió, resume.
 
@@ -166,6 +167,10 @@ Escribe lo que importa. Decisiones, contexto, cosas a recordar.
 
 - **Ruta:** `{workspace}`
 - **Git:** Se recomienda hacer backup semanal con `git add -A && git commit -m "workspace backup"`
+
+## Notas
+
+_(Personaliza aquí cómo trabajas con otros agentes: cuándo delegar, en qué agente, qué subtareas prefieres repartir. Lo que escribas en esta sección se carga en el contexto del agente — los placeholders no.)_
 """
 
 
@@ -198,7 +203,7 @@ def _tools(agent_name: str, ollama_host: str, permissions: dict) -> str:
 
 Las skills definen _cómo_ funcionan las herramientas. Este fichero es para _tu_ entorno específico.
 
-## Servidor Ollama
+## Servidor LLM (backend)
 
 - **Host:** {ollama_host}
 
@@ -354,17 +359,63 @@ class WorkspaceManager:
                     if val and "(sin configurar)" not in val:
                         user_lang = val
 
+        # Identidad: resumen compacto extraído de IDENTITY.md y SOUL.md (fuente única).
+        identity_md = ""
+        soul_md     = ""
+        _id_path = self.path / "IDENTITY.md"
+        _soul_path = self.path / "SOUL.md"
+        if _id_path.exists():
+            identity_md = _id_path.read_text()
+        if _soul_path.exists():
+            soul_md = _soul_path.read_text()
+
+        rol  = _extract_md_field(identity_md, "Rol")
+        vibe = _extract_md_field(identity_md, "Vibe")
+        agente_line = f"{emoji} {name}"
+        if rol:
+            agente_line += f" — {rol}"
+        if vibe:
+            agente_line += f" · {vibe}"
+
+        principles = _extract_soul_principles(soul_md)
+        if principles:
+            behavior_block = "## Comportamiento\n" + "\n".join(f"- {p}" for p in principles)
+        else:
+            behavior_block = (
+                "## Comportamiento\n"
+                "- Narra tu trabajo conciso pero continuo: di qué haces antes de cada paso y qué encontraste después. Frases breves, sin relleno ni '¡Claro!'.\n"
+                "- El usuario solo ve tu texto, no las tools: nunca trabajes en silencio.\n"
+                "- Confirma antes de acciones destructivas o externas (rm -rf, push, envíos)."
+            )
+
         memory_block = _extract_memory_entries(self.path / "MEMORY.md", self._max_memory_lines)
         daily_block  = _extract_daily(self.path / "memory", self._max_daily_chars)
 
+        # Capa de personalización del usuario: secciones "## Notas" de TOOLS.md y
+        # AGENTS.md. Permite personalizar usos de herramientas y delegación SIN
+        # editar código ni SYSTEM_RULES. Solo se carga lo que el usuario escriba
+        # (los placeholders de plantilla se filtran), así que es coste cero hasta
+        # que personaliza. Los ficheros completos siguen disponibles en /ctx full.
+        tools_md  = ""
+        agents_md = ""
+        _tools_path  = self.path / "TOOLS.md"
+        _agents_path = self.path / "AGENTS.md"
+        if _tools_path.exists():
+            tools_md = _tools_path.read_text()
+        if _agents_path.exists():
+            agents_md = _agents_path.read_text()
+        custom_tools  = _extract_section(tools_md, "Notas")
+        custom_agents = _extract_section(agents_md, "Notas")
+
         parts = [
-            f"## Agente\n{emoji} {name} | programación local con Ollama\n"
-            f"Workspace: {ws} | Usuario: {user_name} | Idioma: {user_lang}",
-            "## Principios\n"
-            "- Conciso. Resultados > proceso. Una respuesta por turno.\n"
-            "- Confirma antes de: rm -rf, push, envíos externos.\n"
-            f"- Idioma de respuesta: {user_lang}.",
+            f"## Agente\n{agente_line}\n"
+            f"Workspace: {ws} | Usuario: {user_name} | Idioma de respuesta: {user_lang}",
+            behavior_block,
         ]
+        if custom_agents:
+            parts.append(f"## Personalización de agentes\n{custom_agents}")
+        if custom_tools:
+            parts.append(f"## Preferencias de herramientas\n{custom_tools}")
         if memory_block:
             parts.append(f"## Memoria clave\n{memory_block}")
         if daily_block:
@@ -417,6 +468,100 @@ class WorkspaceManager:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _extract_section(text: str, header: str, max_chars: int = 1500) -> str:
+    """Cuerpo de una sección '## header' hasta el siguiente '## ' o '---'.
+
+    Devuelve solo el contenido REAL escrito por el usuario: filtra las líneas
+    placeholder de la plantilla (italic `_(...)_`, "Añade aquí…", "(sin configurar)").
+    "" si la sección no existe o solo tiene placeholders. Acotado a max_chars para
+    que la personalización del usuario no infle el contexto sin límite.
+
+    Es la capa de personalización por-agente: lo que el usuario escriba en la
+    sección "## Notas" de AGENTS.md / TOOLS.md se carga en el system prompt (mini),
+    sin tocar SYSTEM_RULES (la base de disciplina/seguridad sigue en código).
+    """
+    if not text:
+        return ""
+    out: list[str] = []
+    capturing = False
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("## ") or s == "---":
+            if capturing:
+                break
+            capturing = s.startswith("## ") and s[3:].strip().lower() == header.strip().lower()
+            continue
+        if capturing:
+            out.append(line)
+    kept = [
+        ln for ln in out
+        if ln.strip()
+        and not re.fullmatch(r"_\(.*\)_", ln.strip())
+        and "Añade aquí" not in ln
+        and "(sin configurar)" not in ln
+    ]
+    body = "\n".join(kept).strip()
+    if len(body) > max_chars:
+        body = body[:max_chars].rstrip() + "\n… (truncado)"
+    return body
+
+
+def _extract_md_field(text: str, field: str) -> str:
+    """Valor de un campo del .md. Acepta '- **Rol:** X', '**Rol:** X' o 'Rol: X'."""
+    bold = f"**{field}:**"
+    plain = f"{field}:"
+    for line in text.splitlines():
+        s = line.strip().lstrip("-").strip()
+        if s.startswith(bold):
+            return s.split(bold, 1)[-1].strip()
+        if s.startswith(plain):
+            val = s.split(plain, 1)[-1].strip()
+            return re.sub(r"[*_`]", "", val).strip()
+    return ""
+
+
+def agent_role(workspace_path) -> str:
+    """Rol/especialidad de un agente, leído del campo 'Rol' de su IDENTITY.md.
+
+    Devuelve "" si no hay fichero o el campo no existe. Punto único usado tanto
+    por los schemas de orquestación (spawn_subagent/create_team) como por la
+    cabecera "Agentes disponibles para delegar" del system prompt — así el LLM
+    sabe de forma genérica (sin prompts hardcodeados) qué agente encaja en cada
+    tarea y puede delegar para ahorrar contexto y herramientas.
+    """
+    try:
+        _id_path = Path(workspace_path).expanduser() / "IDENTITY.md"
+        if not _id_path.exists():
+            return ""
+        return _extract_md_field(_id_path.read_text(encoding="utf-8"), "Rol")
+    except Exception:
+        return ""
+
+
+def _extract_soul_principles(text: str, max_items: int = 6) -> list[str]:
+    """Resumen compacto del comportamiento: titulares de la primera lista numerada de SOUL.md.
+
+    De '1. **Ayuda genuinamente.** Sin "¡Claro!"...' devuelve 'Ayuda genuinamente'.
+    Robusto frente a SOUL personalizados (no exige una sección concreta).
+    """
+    out: list[str] = []
+    for line in text.splitlines():
+        m = re.match(r"^\d+\.\s+(.*)", line.strip())
+        if not m:
+            continue
+        body = m.group(1)
+        mb = re.search(r"\*\*(.*?)\*\*", body)
+        headline = mb.group(1) if mb else body.split(".")[0]
+        headline = re.sub(r"[*_`]", "", headline).strip().rstrip(".:")
+        if len(headline) > 70:
+            headline = headline[:67].rstrip() + "…"
+        if headline:
+            out.append(headline)
+            if len(out) >= max_items:
+                break
+    return out
+
 
 def _extract_memory_entries(mem_path: Path, max_lines: int) -> str:
     """Extrae líneas con contenido real de MEMORY.md (ignora headers y plantilla)."""

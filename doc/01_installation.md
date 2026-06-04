@@ -111,11 +111,13 @@ flask                  # WebUI (puerto 4000)
 ### Dependencias opcionales — Office (home-office-assistant MCP)
 
 ```bash
-pip install python-docx>=1.0 python-pptx>=1.0 openpyxl>=3.1 matplotlib pillow docxtpl
+pip install python-docx>=1.0 python-pptx>=1.0 openpyxl>=3.1 pillow docxtpl
 
 # Verificar:
-python -c "import docx, openpyxl, pptx, matplotlib, docxtpl; print('OK')"
+python -c "import docx, openpyxl, pptx, docxtpl; print('OK')"
 ```
+
+> Las gráficas son OOXML nativas (DrawingML); el MCP home-office ya **no** requiere matplotlib.
 
 ### Dependencias opcionales — Vault cifrado
 

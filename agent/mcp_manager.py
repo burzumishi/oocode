@@ -130,13 +130,38 @@ def remove_server(name: str,
     return True
 
 
+# Mapeo de nombre de servidor bundled → clave JSON en mcp.{}
+_BUNDLED_SERVER_MAP: dict[str, str] = {
+    "oocode-assistant":      "oocodeAssistant",
+    "system-assistant":      "systemAssistant",
+    "devops-assistant":      "devopsAssistant",
+    "database-assistant":    "databaseAssistant",
+    "home-office-assistant": "homeOfficeAssistant",
+    "security-assistant":    "securityAssistant",
+    "iot-assistant":         "iotAssistant",
+    "http-client-assistant": "httpClientAssistant",
+}
+
+
 def set_server_enabled(name: str, enabled: bool,
                        config_file: Optional[Path] = None) -> bool:
-    """Activa/desactiva un servidor en oocode.json. Devuelve True si se encontró."""
+    """Activa/desactiva un servidor en oocode.json. Devuelve True si se encontró.
+
+    Soporta tanto servidores externos (mcp.servers[]) como bundled (mcp.<key>.enabled).
+    """
     f = config_file or _CONFIG_FILE
     if not f.exists():
         return False
     cfg = _load_config(f)
+
+    # Bundled servers — actualizados vía mcp.<key>.enabled
+    bundled_key = _BUNDLED_SERVER_MAP.get(name)
+    if bundled_key is not None:
+        cfg.setdefault("mcp", {}).setdefault(bundled_key, {})["enabled"] = enabled
+        _save_config(cfg, f)
+        return True
+
+    # Servidores externos — almacenados en mcp.servers[]
     servers = cfg.get("mcp", {}).get("servers", [])
     found = False
     for s in servers:

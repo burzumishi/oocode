@@ -71,6 +71,21 @@ import os
 import platform
 import re
 import subprocess
+
+# Límite de truncado de salida (configurable: tools.mcpMaxOutputChars en oocode.json)
+def _mcp_max_output(default: int = 4000) -> int:
+    try:
+        from pathlib import Path as _P
+        import json as _j
+        _f = _P.home() / ".oocode" / "oocode.json"
+        if _f.exists():
+            return int(_j.loads(_f.read_text()).get("tools", {}).get("mcpMaxOutputChars", default))
+    except Exception:
+        pass
+    return default
+
+
+_MAX_OUTPUT = _mcp_max_output()
 import sys
 from pathlib import Path
 from typing import Any, Optional
@@ -261,7 +276,7 @@ def _tool_apt_upgrade(args: dict) -> str:
     cmd = ["apt-get", "upgrade", "-y", "--dry-run"] if dry_run else ["apt-get", "upgrade", "-y"]
     rc, out = _run(cmd, timeout=120)
     suffix = " (simulación)" if dry_run else ""
-    return f"apt upgrade{suffix}: {'OK' if rc == 0 else 'rc=' + str(rc)}\n{out[:4000]}"
+    return f"apt upgrade{suffix}: {'OK' if rc == 0 else 'rc=' + str(rc)}\n{out[:_MAX_OUTPUT]}"
 
 
 def _tool_apt_install(args: dict) -> str:
@@ -272,7 +287,7 @@ def _tool_apt_install(args: dict) -> str:
         return err
     pkgs = packages.split()
     rc, out = _run(["apt-get", "install", "-y"] + pkgs, timeout=180)
-    return f"apt install {packages}: {'OK' if rc == 0 else 'ERROR rc=' + str(rc)}\n{out[:4000]}"
+    return f"apt install {packages}: {'OK' if rc == 0 else 'ERROR rc=' + str(rc)}\n{out[:_MAX_OUTPUT]}"
 
 
 def _tool_apt_remove(args: dict) -> str:
@@ -329,7 +344,7 @@ def _tool_dnf_update(args: dict) -> str:
         return "Error: ni dnf ni yum disponibles."
     rc, out = _run([bin_, "check-update"], timeout=60)
     # check-update devuelve 100 cuando hay actualizaciones — no es error
-    return f"{bin_} check-update:\n{out[:4000]}"
+    return f"{bin_} check-update:\n{out[:_MAX_OUTPUT]}"
 
 
 def _tool_dnf_install(args: dict) -> str:
@@ -338,7 +353,7 @@ def _tool_dnf_install(args: dict) -> str:
         return "Error: 'packages' requerido."
     bin_ = "dnf" if _which("dnf") else "yum"
     rc, out = _run([bin_, "install", "-y"] + packages.split(), timeout=180)
-    return f"{bin_} install {packages}: {'OK' if rc == 0 else 'ERROR rc=' + str(rc)}\n{out[:4000]}"
+    return f"{bin_} install {packages}: {'OK' if rc == 0 else 'ERROR rc=' + str(rc)}\n{out[:_MAX_OUTPUT]}"
 
 
 def _tool_dnf_remove(args: dict) -> str:

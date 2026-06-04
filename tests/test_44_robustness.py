@@ -269,6 +269,7 @@ class TestStructuredCompaction:
 
     def test_state_section_present_with_modified_files(self):
         """Con ficheros modificados, el prompt de compactación los incluye."""
+        from api.base import Response
         loop = _make_loop()
         loop._session_reads = [("/project/loop.py", None, True), ("/project/config.py", None, True)]
         loop._task_last_test = ""
@@ -276,17 +277,14 @@ class TestStructuredCompaction:
 
         captured = {}
 
-        def fake_chat(**kwargs):
-            captured["prompt"] = kwargs.get("messages", [{}])[-1].get("content", "")
-            r = MagicMock()
-            r.message.content = "• resumen"
-            return r
+        def fake_chat_sync(model, messages, tools, model_params, timeout=0):
+            captured["prompt"] = (messages or [{}])[-1].get("content", "")
+            return Response(text="• resumen")
 
         loop.client = MagicMock()
-        loop.client.chat = fake_chat
+        loop.client.chat_sync = fake_chat_sync
         loop._active_model = lambda: "test-model"
         loop._build_options = lambda: {}
-        loop._chat_kwargs = lambda opts: {}
         loop.ws = MagicMock()
         loop._all_plan_tasks_done = lambda: True
 
@@ -301,6 +299,7 @@ class TestStructuredCompaction:
 
     def test_state_section_includes_test_result(self):
         """Con resultado de tests, el prompt lo incluye."""
+        from api.base import Response
         loop = _make_loop()
         loop._session_reads = [("/project/main.py", None, True)]
         loop._task_last_test = "100 passed, 0 failed"
@@ -308,17 +307,14 @@ class TestStructuredCompaction:
 
         captured = {}
 
-        def fake_chat(**kwargs):
-            captured["prompt"] = kwargs.get("messages", [{}])[-1].get("content", "")
-            r = MagicMock()
-            r.message.content = "• resumen"
-            return r
+        def fake_chat_sync(model, messages, tools, model_params, timeout=0):
+            captured["prompt"] = (messages or [{}])[-1].get("content", "")
+            return Response(text="• resumen")
 
         loop.client = MagicMock()
-        loop.client.chat = fake_chat
+        loop.client.chat_sync = fake_chat_sync
         loop._active_model = lambda: "test-model"
         loop._build_options = lambda: {}
-        loop._chat_kwargs = lambda opts: {}
         loop.ws = MagicMock()
         loop._all_plan_tasks_done = lambda: True
 
@@ -339,17 +335,16 @@ class TestStructuredCompaction:
 
         captured = {}
 
-        def fake_chat(**kwargs):
-            captured["prompt"] = kwargs.get("messages", [{}])[-1].get("content", "")
-            r = MagicMock()
-            r.message.content = "• resumen"
-            return r
+        from api.base import Response
+
+        def fake_chat_sync(model, messages, tools, model_params, timeout=0):
+            captured["prompt"] = (messages or [{}])[-1].get("content", "")
+            return Response(text="• resumen")
 
         loop.client = MagicMock()
-        loop.client.chat = fake_chat
+        loop.client.chat_sync = fake_chat_sync
         loop._active_model = lambda: "test-model"
         loop._build_options = lambda: {}
-        loop._chat_kwargs = lambda opts: {}
         loop.ws = MagicMock()
         loop._all_plan_tasks_done = lambda: True
 

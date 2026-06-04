@@ -43,7 +43,6 @@ from mcp_servers.home_office_assistant import (
     _tool_notes_list,
     _tool_notes_search,
     _tool_notes_save,
-    _tool_markdown_to_html,
     _tool_contact_search,
     _tool_doc_read_template_fields,
     _tool_doc_fill_template,
@@ -68,7 +67,7 @@ from mcp_servers.home_office_assistant import (
 
 class TestToolSchemas:
     def test_tool_count(self):
-        assert len(_TOOLS) == 78  # 77 previous + doc_fill_corporate_template
+        assert len(_TOOLS) == 66  # 78 − 12 (charts fusionados en insert_chart; PNG matplotlib y markdown eliminados)
 
     def test_all_tools_have_name_and_description(self):
         for t in _TOOLS:
@@ -112,7 +111,7 @@ class TestPromptSchemas:
 
 class TestResourceSchemas:
     def test_resource_count(self):
-        assert len(_RESOURCES) == 15
+        assert len(_RESOURCES) == 13  # diagram_templates + flowchart_shapes eliminados (sin tool de diagramas)
 
     def test_resources_have_required_keys(self):
         for r in _RESOURCES:
@@ -472,34 +471,6 @@ class TestDocumentTools:
     def test_doc_word_count_missing_param(self):
         result = _tool_doc_word_count({})
         assert "requerido" in result.lower()
-
-
-# ── Markdown to HTML ─────────────────────────────────────────────────────────
-
-class TestMarkdownToHTML:
-    def test_heading_converted(self):
-        result = _tool_markdown_to_html({"content": "# Título principal"})
-        assert "<h1>" in result or "Título principal" in result
-
-    def test_bold_converted(self):
-        result = _tool_markdown_to_html({"content": "**negrita**"})
-        assert "negrita" in result
-
-    def test_from_file(self, tmp_path):
-        f = tmp_path / "doc.md"
-        f.write_text("## Sección\n\nTexto normal.")
-        result = _tool_markdown_to_html({"path": str(f)})
-        assert "Sección" in result
-
-    def test_missing_content_and_path(self):
-        result = _tool_markdown_to_html({})
-        assert "requerido" in result.lower()
-
-    def test_output_file(self, tmp_path):
-        out = tmp_path / "out.html"
-        _tool_markdown_to_html({"content": "# Test", "output": str(out)})
-        assert out.exists()
-        assert "Test" in out.read_text()
 
 
 # ── Contact search ───────────────────────────────────────────────────────────

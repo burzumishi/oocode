@@ -10,12 +10,41 @@ from flask import Blueprint, Response, jsonify, request
 
 from webui.sessions import _WEBUI_SESSIONS, _SESSIONS_LOCK, _ensure_session_entry, _get_or_create_session
 from webui.helpers import _get_or_create_sid
+from agent.session import append_input_history, load_input_history
 
 bp = Blueprint("api_chat", __name__)
 
 # ── Slash commands de estado ──────────────────────────────────────────────────
 
 _ELEVATED_MODES = ("off", "on", "ask", "full")
+
+
+def _restore_webui_session(loop, sess: dict, prefix: str) -> tuple[int, Optional[str]]:
+    """Restaura una sesión pasada en el WebUI: contexto del LLM + historial mostrado.
+
+    Reutiliza `AgentLoop.restore_session` (igual que el TUI) y repuebla `sess["history"]`
+    desde la sesión JSONL para que el navegador pueda re-renderizar la conversación.
+    Devuelve (n_mensajes, error|None). Acepta prefijo de session_id (como el TUI).
+    """
+    from agent.session import find_session_by_prefix
+    agent_id = getattr(getattr(loop, "config", None), "agent_id", "main")
+    full_id  = find_session_by_prefix(agent_id, prefix)
+    if not full_id:
+        return 0, f"Sesión '{prefix}' no encontrada. Usa el panel 📚 Sesiones."
+    try:
+        count = loop.restore_session(full_id)
+        # Repoblar el historial mostrado en el navegador desde el JSONL
+        restored = loop.session.load_messages(full_id)
+        sess["history"].clear()
+        for msg in restored:
+            sess["history"].append({
+                "role": msg.get("role", "assistant"),
+                "text": msg.get("content", ""),
+                "ts":   time.time(), "id": os.urandom(4).hex(),
+            })
+        return count, None
+    except Exception as exc:
+        return 0, f"Error restaurando sesión: {exc}"
 
 
 def _handle_webui_slash(message: str, sess: dict) -> Optional[str]:
@@ -29,6 +58,23 @@ def _handle_webui_slash(message: str, sess: dict) -> Optional[str]:
     parts    = stripped.split(maxsplit=1)
     cmd      = parts[0].lower()
     args     = parts[1].strip() if len(parts) > 1 else ""
+
+    if cmd == "/session":
+        if not args:
+            try:
+                sid_cur = loop.session.session_id[:8]
+                return f"Sesión activa: {sid_cur}…  ·  usa /session <id> o el panel 📚 Sesiones para restaurar"
+            except Exception:
+                return "Usa /session <id> o el panel 📚 Sesiones para restaurar una sesión."
+        _t = sess.get("thread")
+        if _t and _t.is_alive():
+            return "⚠  El agente está activo — espera a que termine o usa /kill."
+        count, err = _restore_webui_session(loop, sess, args)
+        if err:
+            return f"⚠ {err}"
+        # El navegador re-renderiza la conversación restaurada al recibir 'done'
+        # (flag _pendingSessionReload), por eso no se emite evento extra aquí.
+        return f"✓  Sesión {args} restaurada — {count} mensajes en contexto"
 
     if cmd in ("/elevated", "/elev"):
         if not args:
@@ -99,6 +145,11 @@ def api_chat_send():
         "role": "user", "text": message,
         "ts": time.time(), "id": os.urandom(4).hex(),
     })
+    
+    # Guardar SOLO el input del usuario en el historial compartido con el TUI
+    # (~/.oocode/history, formato prompt_toolkit). La respuesta del agente NO se
+    # escribe aquí — es conversación, no input del prompt.
+    append_input_history(message)
 
     # Interceptar slash commands de estado (no van al LLM)
     if message.startswith('/'):
@@ -252,6 +303,46 @@ def api_chat_history():
     return jsonify({"history": sess["history"], "sid": sid})
 
 
+# ── GET /api/chat/input_history ───────────────────────────────────────────────
+
+@bp.route('/api/chat/input_history')
+def api_chat_input_history():
+    """Historial de input del prompt (flecha arriba), COMPARTIDO con el TUI.
+
+    Lee ~/.oocode/history en formato prompt_toolkit, así el recall del WebUI muestra
+    las mismas indicaciones que el TUI (y sobrevive a recargas de página).
+    """
+    try:
+        limit = int(request.args.get("limit", 200))
+    except (TypeError, ValueError):
+        limit = 200
+    return jsonify({"history": load_input_history(limit)})
+
+
+# ── POST /api/chat/load_session ───────────────────────────────────────────────
+
+@bp.route('/api/chat/load_session', methods=['POST'])
+def api_chat_load_session():
+    """Restaura una sesión pasada (panel 📚 Sesiones): contexto + conversación mostrada."""
+    sid      = _get_or_create_sid()
+    data     = request.get_json(silent=True) or {}
+    agent_id = data.get("agent_id", "main") or "main"
+    session_id = (data.get("session_id") or "").strip()
+    if not session_id:
+        return jsonify({"error": "session_id requerido"}), 400
+    sess = _get_or_create_session(sid, agent_id)
+    loop = sess.get("loop")
+    if loop is None:
+        return jsonify({"error": "Agente no disponible — reintenta en unos segundos"}), 503
+    with sess["lock"]:
+        if sess.get("thread") and sess["thread"].is_alive():
+            return jsonify({"error": "El agente está procesando otra petición"}), 409
+    count, err = _restore_webui_session(loop, sess, session_id)
+    if err:
+        return jsonify({"error": err}), 404
+    return jsonify({"ok": True, "count": count, "history": sess["history"], "sid": sid})
+
+
 # ── GET /api/chat/status ──────────────────────────────────────────────────────
 
 @bp.route('/api/chat/status')
@@ -367,10 +458,11 @@ def api_chat_clear():
 
 @bp.route('/api/chat/kill', methods=['POST'])
 def api_chat_kill():
-    """Interrumpe el turno activo del AgentLoop (equivale a /kill en TUI).
+    """Interrumpe el turno activo del AgentLoop — equivale a `/kill all` en TUI.
 
-    Pone _kill_requested=True en el loop activo. El agente para entre iteraciones.
-    También cancela todos los subagentes en ejecución lanzados por este loop.
+    Pone _kill_requested=True, aborta la llamada LLM en curso, mata todos los
+    subagentes/equipos, y además deshabilita los jobs activos del scheduler y resetea
+    las tareas wip→todo (paridad con `/kill all`).
     """
     sid = _get_or_create_sid()
     if sid not in _WEBUI_SESSIONS:
@@ -380,16 +472,30 @@ def api_chat_kill():
     if not loop:
         return jsonify({"ok": False, "error": "Loop no disponible"}), 503
 
-    # Interrumpir el loop principal
-    loop._kill_requested = True
-
-    # Cancelar subagentes activos lanzados desde esta sesión
+    # request_kill: marca _kill_requested, aborta la llamada LLM en curso cerrando a
+    # la fuerza el socket (también el de los subagentes, que comparten el pool del
+    # padre) y mata todos los subagentes/equipos activos vía kill_all(). Antes solo
+    # ponía el flag + kill_event, sin abortar el LLM en vuelo (seguía generando).
+    summary = {"subagents": 0}
+    extras  = {"jobs": 0, "wip": 0}
     try:
-        from agent.subagent import list_running
-        for sub in list_running():
-            if sub.status == "running":
-                sub.kill_event.set()
-                sub.status = "killed"
+        summary = loop.request_kill()
+    except Exception:
+        # Fallback defensivo si request_kill no estuviera disponible
+        loop._kill_requested = True
+        try:
+            from agent.subagent import list_running
+            for sub in list_running():
+                if sub.status == "running":
+                    sub.kill_event.set()
+                    sub.status = "killed"
+        except Exception:
+            pass
+
+    # Extras de /kill all: deshabilitar jobs del scheduler + resetear tareas wip→todo
+    # (mismo helper que usa el comando /kill all del TUI).
+    try:
+        extras = loop.kill_all_extras()
     except Exception:
         pass
 
@@ -399,7 +505,12 @@ def api_chat_kill():
     except Exception:
         pass
 
-    return jsonify({"ok": True})
+    return jsonify({
+        "ok": True,
+        "subagents": summary.get("subagents", 0),
+        "jobs": extras.get("jobs", 0),
+        "wip": extras.get("wip", 0),
+    })
 
 
 # ── POST /api/chat/elevated ──────────────────────────────────────────────────
@@ -472,6 +583,8 @@ def api_chat_send_sync():
         "role": "user", "text": message,
         "ts": time.time(), "id": os.urandom(4).hex(),
     })
+    # Input del usuario al historial compartido con el TUI (mismo helper/formato)
+    append_input_history(message)
 
     # Interceptar slash commands de estado
     if message.startswith('/'):

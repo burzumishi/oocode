@@ -1,5 +1,7 @@
 {
-  "ollama": {
+  "api": {
+    "type": "ollama",
+    "key": "",
     "host": "http://192.168.1.33:11434",
     "extraHosts": [
       "http://192.168.1.42:11434"
@@ -20,40 +22,35 @@
         "name": "OOCode",
         "emoji": "🤖",
         "model": "aratan/qwen3.5-agent-multimodal:9b",
-        "workspace": "~/.oocode/workspace/main",
-        "instructions": "Eres el asistente general de OOCode. TU MISIÓN: ser el punto central de coordinación entre todos los agentes especializados.\n\nREGLAS:\n1. Coordina tareas entre subagentes (coding, home_office, reasoning, webcrawler)\n2. Usa spawn_subagent para delegar tareas complejas\n3. Usa AgentTeam para orquestar equipos de agentes\n4. Usa BackgroundSession para control de recursos en tareas paralelas\n5. Mantén el contexto de la conversación y delega cuando sea necesario\n6. Presenta informes estructurados con hallazgos clave\n\nESPECIALIZACIÓN:\n- Coordinación multi-agente\n- Gestión de equipos de subagentes\n- Orquestación de tareas complejas\n- Integración de resultados de múltiples agentes\n"
+        "workspace": "~/.oocode/workspace/main"
       },
       {
         "id": "coding",
         "name": "OOCode Coder",
         "emoji": "💻",
         "model": "aratan/qwen3.5-agent-multimodal:9b",
-        "workspace": "~/.oocode/workspace/coding",
-        "instructions": "Eres un especialista en desarrollo de software con Ollama. TU MISIÓN: desarrollo, refactorización, pruebas y optimización de código.\n\nREGLAS DE DESARROLLO:\n1. Antes de editar: lsp_symbols → lsp_hover → grep_code → edit_file → lsp_diagnostics\n2. Para ficheros >1000 líneas: code_outline → read_sections\n3. Tests obligatorios: run_tests o test_file antes de declarar completado\n4. Usa LSP para navegación: lsp_definition, lsp_references, lsp_call_hierarchy\n5. Linting obligatorio: lint_file después de cada edición\n6. Git workflow: git_status → git_diff → git_commit → git_push\n7. Docker: compose_up → docker_ps → docker_logs → docker_exec\n8. Subagentes: usa spawn_subagent para análisis read-only intensivo\n\nESPECIALIZACIÓN:\n- Desarrollo de software moderno (C17, Python 3.13, TypeScript)\n- Refactoring de código legacy\n- Pruebas unitarias y de integración\n- Optimización de rendimiento\n- Debugging avanzado con LSP\n- Gestión de dependencias (pip, npm, cargo)\n- CI/CD básico con GitHub Actions\n"
+        "workspace": "~/.oocode/workspace/coding"
       },
       {
         "id": "reasoning",
         "name": "OOCode Brain",
         "emoji": "🧠",
         "model": "aratan/qwen3.5-agent-multimodal:9b",
-        "workspace": "~/.oocode/workspace/reasoning",
-        "instructions": "Eres un especialista en análisis lógico, debugging profundo y optimización. TU MISIÓN: resolver problemas complejos, analizar errores y optimizar código.\n\nREGLAS DE ANÁLISIS:\n1. Analiza errores con lsp_diagnostics antes de proponer soluciones\n2. Usa lsp_call_hierarchy para entender flujo de llamadas\n3. Usa code_compare para comparar implementaciones\n4. Usa affected_files antes de renombrar símbolos\n5. Usa lsp_implementation para ver implementaciones de interfaces\n6. Usa lsp_type_definition para entender tipos\n7. Usa code_search para encontrar patrones en el código\n8. Usa semantic_search para búsquedas semánticas\n\nESPECIALIZACIÓN:\n- Debugging profundo con LSP\n- Análisis de errores y excepciones\n- Optimización de algoritmos\n- Análisis de complejidad temporal/espacial\n- Refactoring seguro con LSP\n- Análisis de rendimiento con profiling\n- Resolución de race conditions y deadlocks\n"
+        "workspace": "~/.oocode/workspace/reasoning"
       },
       {
         "id": "home_office",
         "name": "OOCode Office",
         "emoji": "📋",
         "model": "aratan/qwen3.5-agent-multimodal:9b",
-        "workspace": "~/.oocode/workspace/home_office",
-        "instructions": "Eres un asistente de oficina IT especializado en documentación corporativa. REGLAS:\n- Genera documentos formales (RFC, informes, actas, planes, incidencias) en formato .docx por defecto usando doc_create_rfc o doc_project_save.\n- Usa pandoc o python-docx para la conversión; si no están disponibles, cae a .md e informa al usuario.\n- Para rellenar plantillas existentes, usa doc_fill_template (respeta el formato original .docx/.xlsx).\n- Para informes Excel (tablas, registros, CMDB), usa xlsx_create_report o xlsx_fill_range.\n- Activa el servidor MCP home_office con '/mcp builtin home-office-assistant' si no está activo.\n- Lee el contexto del proyecto con project_context_read antes de crear documentos.\n- Aplica siempre la naming convention del proyecto (lee OOCODE.md)."
+        "workspace": "~/.oocode/workspace/home_office"
       },
       {
         "id": "webcrawler",
         "name": "WebCrawler",
         "emoji": "🕷️",
         "model": "aratan/qwen3.5-agent-multimodal:9b",
-        "workspace": "~/.oocode/workspace/webcrawler",
-        "instructions": "Eres un especialista en búsqueda web con SearXNG. TU MISIÓN: realizar búsquedas web efectivas y presentar informes bien analizados y resumidos.\n\nREGLAS DE BÚSQUEDA WEB:\n1. Usa web_search con SearXNG (http://192.168.1.33:8888) para búsquedas privadas y offline\n2. Clasifica los resultados por relevancia, fiabilidad y actualidad\n3. Presenta informes estructurados con:\n   - Resumen ejecutivo (3-5 líneas)\n   - Hallazgos clave (lista numerada)\n   - Fuentes principales (con enlaces)\n   - Análisis crítico (puntos fuertes/debilidades)\n   - Conclusiones y recomendaciones\n4. Si la búsqueda requiere múltiples pasos, usa plan_create para organizar la tarea\n5. Verifica la fiabilidad de las fuentes (prioriza .gov, .edu, documentación oficial)\n6. Usa web_fetch para leer contenido completo de URLs relevantes\n7. Presenta resultados en español técnico y claro\n\nINSTRUCCIONES ESPECÍFICAS:\n- Para búsquedas técnicas: usa categorías 'it' o 'science'\n- Para noticias recientes: usa categoría 'news'\n- Para documentación: usa categorías 'files' o 'general'\n- Siempre limita resultados a max_results=5-10 para informes concisos\n- Si los resultados son insuficientes (<3), informa al usuario y sugiere reformular la búsqueda\n\nFORMATO DE INFORME:\n```markdown\n## 🔍 Informe de Búsqueda Web: [TÍTULO]\n\n### 📌 Resumen Ejecutivo\n[Breve resumen de 3-5 líneas]\n\n### 🎯 Hallazgos Clave\n1. [Hallazgo 1]\n2. [Hallazgo 2]\n3. [Hallazgo 3]\n\n### 📚 Fuentes Principales\n- [Fuentes relevantes con enlaces]\n\n### 🧠 Análisis Crítico\n**Puntos Fuertes:**\n- [Punto 1]\n- [Punto 2]\n\n**Puntos Débiles:**\n- [Punto 1]\n- [Punto 2]\n\n### ✅ Conclusiones y Recomendaciones\n[Conclusiones claras y recomendaciones de acción]\n```\n\n⚠️ **NUNCA inventes resultados de búsqueda** — siempre usa web_search y web_fetch\n⚠️ **Siempre presenta informes estructurados** — nunca solo una lista de enlaces\n⚠️ **Verifica la fiabilidad** — prioriza fuentes oficiales y documentación\n"
+        "workspace": "~/.oocode/workspace/webcrawler"
       }
     ]
   },
@@ -68,6 +65,8 @@
     "searxng_search": "auto",
     "spawn_subagent": "ask",
     "explore": "auto",
+    "create_team": "ask",
+    "run_team": "ask",
     "lint_file": "auto",
     "lint_project": "auto",
     "git_status": "auto",
@@ -328,19 +327,123 @@
     "ssh_key_audit": "auto",
     "sudoers_review": "auto",
     "file_integrity_check": "auto",
+    "http_request": "auto",
+    "http_auth": "auto",
+    "http_upload": "ask",
+    "response_diff": "auto",
+    "openapi_validate": "auto",
+    "curl_import": "ask",
+    "websocket_send": "auto",
+    "sse_listen": "auto",
+    "mock_server_start": "ask",
+    "mock_server_stop": "ask",
+    "http_health_check": "auto",
+    "graphql_query": "auto",
+    "http_batch": "ask",
+    "http_history": "auto",
+    "csv_to_sqlite": "ask",
+    "db_connect": "auto",
+    "db_explain": "auto",
+    "db_export": "auto",
+    "db_import": "ask",
+    "db_indices": "auto",
+    "db_migrate_check": "auto",
+    "db_query": "ask",
+    "db_schema": "auto",
+    "db_stats": "auto",
+    "db_tables": "auto",
+    "mysql_explain": "auto",
+    "mysql_query": "ask",
+    "mysql_schema": "auto",
+    "pg_explain": "auto",
+    "pg_query": "ask",
+    "pg_schema": "auto",
+    "sql_format": "auto",
+    "sqlite_backup": "ask",
+    "sqlite_bulk_insert": "ask",
+    "sqlite_create_table": "ask",
+    "sqlite_delete": "ask",
+    "sqlite_explain": "auto",
+    "sqlite_export": "auto",
+    "sqlite_fts_search": "auto",
+    "sqlite_indices": "auto",
+    "sqlite_insert": "ask",
+    "sqlite_query": "ask",
+    "sqlite_schema": "auto",
+    "sqlite_tables": "auto",
+    "sqlite_to_csv": "auto",
+    "sqlite_update": "ask",
+    "sqlite_vacuum": "ask",
+    "apply_cell_formatting": "ask",
+    "apply_document_theme": "ask",
+    "asset_register_add": "ask",
+    "cal_add": "ask",
+    "cal_list": "auto",
+    "cal_search": "auto",
+    "cmdb_search": "auto",
+    "cmdb_update": "ask",
+    "contact_search": "auto",
+    "csv_analyze": "auto",
+    "doc_add_content_block": "ask",
+    "doc_add_header_footer": "ask",
+    "doc_add_toc": "ask",
+    "doc_apply_style": "ask",
+    "doc_compare": "auto",
     "doc_convert": "auto",
+    "doc_create": "ask",
+    "doc_create_from_template": "ask",
+    "doc_create_rfc": "auto",
+    "doc_embed_image": "ask",
+    "doc_extract_metadata": "auto",
+    "doc_fill_corporate_template": "auto",
+    "doc_fill_template": "auto",
+    "doc_list_templates": "auto",
     "doc_project_save": "auto",
     "doc_read": "auto",
-    "xlsx_create_report": "auto",
-    "doc_fill_template": "auto",
-    "doc_fill_corporate_template": "auto",
     "doc_read_template_fields": "auto",
+    "doc_set_page_layout": "ask",
+    "doc_set_table_style": "ask",
     "doc_update_section": "auto",
-    "doc_create_rfc": "auto"
+    "doc_version_bump": "ask",
+    "doc_word_count": "auto",
+    "email_list": "auto",
+    "email_read": "auto",
+    "email_search": "auto",
+    "email_send": "ask",
+    "image_to_text": "auto",
+    "insert_chart": "ask",
+    "notes_list": "auto",
+    "notes_save": "ask",
+    "notes_search": "auto",
+    "pdf_extract_text": "auto",
+    "pptx_add_notes": "ask",
+    "pptx_add_slide": "ask",
+    "pptx_create": "ask",
+    "pptx_create_from_template": "ask",
+    "pptx_insert_chart": "ask",
+    "pptx_read": "auto",
+    "pptx_set_background": "ask",
+    "project_context_read": "auto",
+    "project_init_office": "ask",
+    "set_paragraph_format": "ask",
+    "xlsx_add_data_validation": "ask",
+    "xlsx_add_sheet": "ask",
+    "xlsx_append_row": "ask",
+    "xlsx_apply_conditional_format": "ask",
+    "xlsx_create_report": "auto",
+    "xlsx_create_table": "ask",
+    "xlsx_fill_range": "ask",
+    "xlsx_freeze_panes": "ask",
+    "xlsx_insert_chart": "ask",
+    "xlsx_merge_cells": "ask",
+    "xlsx_protect_sheet": "ask",
+    "xlsx_read": "auto",
+    "xlsx_set_column_width": "ask",
+    "xlsx_write": "ask"
   },
   "context": {
     "minKeep": 12,
-    "compactThreshold": 0.8,
+    "compactThreshold": 0.82,
     "maxSummaryChars": 20000,
     "maxToolResultTokens": 16000,
     "autoContinueMax": 12,
@@ -350,7 +453,10 @@
     "context_window_configurable": true,
     "context_window_default": 131072,
     "context_window_min": 8192,
-    "context_window_max": 131072
+    "context_window_max": 131072,
+    "highWater": 0.7,
+    "toolMaxChars": 3000,
+    "ctxMode": "full"
   },
   "embeddings": {
     "model": "nomic-embed-text-v2-moe:latest",
@@ -361,12 +467,13 @@
     "memoryEmbedEnabled": true,
     "diskCacheEnabled": true,
     "diskCacheDir": "~/.oocode/cache",
-    "diskCacheMaxEntries": 2000
+    "diskCacheMaxEntries": 2000,
+    "ramCacheMax": 256
   },
   "tools": {
-    "readFileLinesDefault": 5000,
-    "readFileLinesWarnLarge": 10000,
-    "webFetchMaxChars": 80000,
+    "readFileLinesDefault": 8000,
+    "readFileLinesWarnLarge": 15000,
+    "webFetchMaxChars": 100000,
     "webFetchTimeout": 20,
     "webSearchMaxResults": 10,
     "bashMaxOutputChars": 800000,
@@ -374,11 +481,12 @@
     "codeSearchContextLines": 2000,
     "codeSearchMaxFilesize": "2M",
     "toolCacheEnabled": true,
-    "toolCacheMaxSize": 2400
+    "toolCacheMaxSize": 2400,
+    "mcpMaxOutputChars": 4000
   },
   "workspace": {
-    "maxMemoryLines": 600,
-    "maxDailyChars": 16000
+    "maxMemoryLines": 800,
+    "maxDailyChars": 20000
   },
   "searxng": {
     "url": "http://192.168.1.33:8888",
@@ -442,7 +550,8 @@
         ".html",
         ".xml",
         ".md",
-        ".spec"
+        ".spec",
+        ".lua"
       ]
     },
     "linter": {
@@ -456,19 +565,19 @@
     }
   },
   "models": {
-    "systemOverhead": 15000,
+    "systemOverhead": 20000,
     "repeatPenalty": 0.1,
     "seed": -1,
     "configs": {
       "qwen3.5:9b": {
         "contextWindow": 131072,
-        "maxTokens": 40000,
+        "maxTokens": 32768,
         "params": {
           "num_ctx": 131072,
           "temperature": 0.5,
           "top_k": 20,
           "top_p": 0.95,
-          "num_predict": 40000
+          "num_predict": 32768
         },
         "timeoutSeconds": 900,
         "thinking": {
@@ -483,10 +592,10 @@
       },
       "nexuz/qwen3.5-agent:4b": {
         "contextWindow": 131072,
-        "maxTokens": 40000,
+        "maxTokens": 32768,
         "params": {
           "num_ctx": 131072,
-          "num_predict": 40000,
+          "num_predict": 32768,
           "repeat_penalty": 1.15,
           "temperature": 0.4,
           "top_k": 20,
@@ -500,13 +609,13 @@
       },
       "qwen3.5:4b": {
         "contextWindow": 131072,
-        "maxTokens": 40000,
+        "maxTokens": 32768,
         "params": {
           "num_ctx": 131072,
           "temperature": 0.4,
           "top_k": 20,
           "top_p": 0.95,
-          "num_predict": 40000
+          "num_predict": 32768
         },
         "timeoutSeconds": 900,
         "input": [
@@ -531,13 +640,13 @@
       },
       "batiai/qwen3.5-9b:latest": {
         "contextWindow": 131072,
-        "maxTokens": 40000,
+        "maxTokens": 32768,
         "params": {
           "num_ctx": 131072,
           "top_p": 0.95,
           "temperature": 0.5,
           "top_k": 20,
-          "num_predict": 40000
+          "num_predict": 32768
         },
         "input": [
           "text"
@@ -551,10 +660,10 @@
       },
       "carstenuhlig/omnicoder-9b:latest": {
         "contextWindow": 131072,
-        "maxTokens": 40000,
+        "maxTokens": 32768,
         "params": {
           "num_ctx": 131072,
-          "num_predict": 40000,
+          "num_predict": 32768,
           "top_k": 20,
           "top_p": 0.95,
           "repeat_penalty": 1.0,
@@ -572,10 +681,10 @@
       },
       "aratan/qwen3.5-agent-multimodal:9b": {
         "contextWindow": 131072,
-        "maxTokens": 40000,
+        "maxTokens": 32768,
         "params": {
           "num_ctx": 131072,
-          "num_predict": 40000,
+          "num_predict": 32768,
           "temperature": 0.5,
           "top_k": 20,
           "top_p": 0.95
@@ -593,10 +702,10 @@
       },
       "x/flux2-klein:4b": {
         "contextWindow": 131072,
-        "maxTokens": 40000,
+        "maxTokens": 32768,
         "params": {
           "num_ctx": 131072,
-          "num_predict": 40000,
+          "num_predict": 32768,
           "temperature": 0.7,
           "top_k": 20,
           "top_p": 0.95
@@ -614,10 +723,10 @@
       },
       "x/flux2-klein:9b": {
         "contextWindow": 131072,
-        "maxTokens": 40000,
+        "maxTokens": 32768,
         "params": {
           "num_ctx": 131072,
-          "num_predict": 40000,
+          "num_predict": 32768,
           "temperature": 0.7,
           "top_k": 20,
           "top_p": 0.95
@@ -657,6 +766,15 @@
     },
     "iotAssistant": {
       "enabled": true
+    },
+    "devopsAssistant": {
+      "enabled": true
+    },
+    "databaseAssistant": {
+      "enabled": true
+    },
+    "httpClientAssistant": {
+      "enabled": true
     }
   },
   "hooks": {
@@ -688,13 +806,18 @@
   },
   "rag": {
     "enabled": true,
-    "topK": 12,
+    "topK": 15,
     "similarityThreshold": 0.38,
     "maxSnippetChars": 20000,
     "indexInterval": 300.0,
-    "topKComplex": 25,
+    "topKComplex": 30,
     "thresholdComplex": 0.3,
-    "complexMinChars": 150
+    "complexMinChars": 150,
+    "maxFileChars": 6000,
+    "chunkChars": 512,
+    "chunkOverlap": 64,
+    "maxFiles": 2000,
+    "minSlotChars": 200
   },
   "vision": {
     "enabled": true,
@@ -706,7 +829,7 @@
     "maxSizeMb": 10
   },
   "webui": {
-    "enabled": true,
+    "enabled": false,
     "host": "0.0.0.0",
     "port": 4000,
     "logFile": "~/.oocode/logs/webui.log",
@@ -717,7 +840,10 @@
     "maxTeams": 1,
     "maxTeamSize": 2,
     "recentTtl": 1800,
-    "defaultPriority": 0
+    "defaultPriority": 0,
+    "autoContMax": 16,
+    "inferenceTimeout": 0,
+    "defaultTimeout": 600
   },
   "backup": {
     "enabled": true,

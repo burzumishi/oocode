@@ -342,6 +342,11 @@ class TestChatKillButtonSubagentInteraction(unittest.TestCase):
         return _app.test_client()
 
     def _inject_session(self, sid, loop, q):
+        # /api/chat/kill serializa el retorno de request_kill()/kill_all_extras(); los
+        # mocks deben devolver dicts reales (un MagicMock no es JSON-serializable).
+        if isinstance(loop, MagicMock):
+            loop.request_kill.return_value    = {"subagents": 0}
+            loop.kill_all_extras.return_value = {"jobs": 0, "wip": 0}
         from webui.sessions import _WEBUI_SESSIONS
         import threading
         _WEBUI_SESSIONS[sid] = {
@@ -364,50 +369,33 @@ class TestChatKillButtonSubagentInteraction(unittest.TestCase):
         self.assertIn("'none'", src)
 
     def test_kill_cancels_multiple_subagents(self):
-        """El endpoint kill debe iterar sobre list_running() para cancelar todos."""
+        """El endpoint delega en request_kill(), que mata todos los subagentes/equipos
+        vía kill_all() (comportamiento real cubierto en test_80_kill_all)."""
         from webui.sessions import _WEBUI_SESSIONS
-        from agent.subagent import ActiveSubAgent
         sid  = "test_kill_multi_001"
         q    = queue.SimpleQueue()
         loop = MagicMock()
-        loop._kill_requested = False
         self._inject_session(sid, loop, q)
 
-        ev1 = threading.Event()
-        ev2 = threading.Event()
-        subs = [
-            ActiveSubAgent(run_id="r1", agent_id="coding",  agent_name="Coding",
-                           agent_emoji="💻", task="T1", thread=MagicMock(),
-                           kill_event=ev1, steer_queue=queue.SimpleQueue(), status="running"),
-            ActiveSubAgent(run_id="r2", agent_id="reasoning", agent_name="Reasoning",
-                           agent_emoji="🧠", task="T2", thread=MagicMock(),
-                           kill_event=ev2, steer_queue=queue.SimpleQueue(), status="running"),
-        ]
         with self._make_client() as c:
-            with patch("webui.api_chat._get_or_create_sid", return_value=sid), \
-                 patch("agent.subagent.list_running", return_value=subs):
+            with patch("webui.api_chat._get_or_create_sid", return_value=sid):
                 resp = c.post("/api/chat/kill")
         data = json.loads(resp.data)
         self.assertTrue(data.get("ok"))
-        self.assertTrue(ev1.is_set(), "Subagente 1 no fue cancelado")
-        self.assertTrue(ev2.is_set(), "Subagente 2 no fue cancelado")
-        self.assertEqual(subs[0].status, "killed")
-        self.assertEqual(subs[1].status, "killed")
+        loop.request_kill.assert_called_once()
         _WEBUI_SESSIONS.pop(sid, None)
 
     def test_kill_main_loop_kill_requested(self):
-        """kill siempre setea _kill_requested en el loop principal."""
+        """kill siempre invoca request_kill() (que marca _kill_requested + aborta LLM)."""
         from webui.sessions import _WEBUI_SESSIONS
         sid  = "test_kill_main_001"
         q    = queue.SimpleQueue()
         loop = MagicMock()
-        loop._kill_requested = False
         self._inject_session(sid, loop, q)
         with self._make_client() as c:
-            with patch("webui.api_chat._get_or_create_sid", return_value=sid), \
-                 patch("agent.subagent.list_running", return_value=[]):
+            with patch("webui.api_chat._get_or_create_sid", return_value=sid):
                 c.post("/api/chat/kill")
-        self.assertTrue(loop._kill_requested)
+        loop.request_kill.assert_called_once()
         _WEBUI_SESSIONS.pop(sid, None)
 
     def test_kill_chat_interruption_message(self):

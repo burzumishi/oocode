@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "oocode"
-version = "1.1.0"
-description = "OOCode — Asistente de programación local con Ollama"
+version = "0.4.1"
+description = "OOCode — Asistente de programación local con soporte multi-backend (Ollama, OpenAI-compat, Anthropic)"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
@@ -25,9 +25,12 @@ dependencies = [
 oocode = "oocode:main"
 
 [tool.setuptools]
-py-modules = ["oocode", "config"]
+py-modules = ["oocode"]
 packages   = [
+    "config",
+    "config.blocks",
     "agent",
+    "api",
     "tools",
     "ui",
     "plugins",

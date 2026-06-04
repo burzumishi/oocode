@@ -106,6 +106,14 @@ def bash_execute(
     max_output_chars: int = _DEFAULT_MAX_OUTPUT_CHARS,
 ) -> str:
     try:
+        # Normaliza el workdir: expande '~'/variables y, si la ruta no existe,
+        # cae a None (cwd del proceso) en vez de hacer crashear a Popen con
+        # "[Errno 2] No such file or directory: '~/...'". Defensa frente a rutas
+        # mal formadas (p.ej. un '~' sin expandir heredado de la config).
+        if workdir:
+            _wd = os.path.expanduser(os.path.expandvars(workdir))
+            workdir = _wd if os.path.isdir(_wd) else None
+
         # Envolver con nice -n 10 en plataformas POSIX para reducir prioridad de CPU
         if _NICE_CMD:
             actual_cmd: str | list[str] = [_NICE_CMD, "-n", "10", "bash", "-c", command]

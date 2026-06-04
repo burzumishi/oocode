@@ -45,9 +45,10 @@ def _handle_exit(sig, frame) -> None:
 
 
 def run(host: str = _DEFAULT_HOST, port: int = _DEFAULT_PORT,
-        log_file: str = "") -> None:
+        log_file: str = "", log_max_size_mb: int = 5) -> None:
     """Arranca Flask y registra estado; limpia al salir."""
     import logging as _logging
+    import logging.handlers as _logging_handlers
 
     _project_root = str(Path(__file__).parent.parent)
     if _project_root not in sys.path:
@@ -62,7 +63,11 @@ def run(host: str = _DEFAULT_HOST, port: int = _DEFAULT_PORT,
 
     wz = _logging.getLogger("werkzeug")
     wz.handlers.clear()
-    fh = _logging.FileHandler(str(log_path), encoding="utf-8")
+    fh = _logging_handlers.RotatingFileHandler(
+        str(log_path), encoding="utf-8",
+        maxBytes=max(1, int(log_max_size_mb)) * 1024 * 1024,
+        backupCount=3,
+    )
     fh.setFormatter(_logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     wz.addHandler(fh)
     wz.propagate = False
@@ -87,4 +92,5 @@ if __name__ == "__main__":
     _host     = sys.argv[1] if len(sys.argv) > 1 else _DEFAULT_HOST
     _port     = int(sys.argv[2]) if len(sys.argv) > 2 else _DEFAULT_PORT
     _log_file = sys.argv[3] if len(sys.argv) > 3 else ""
-    run(_host, _port, _log_file)
+    _log_max  = int(sys.argv[4]) if len(sys.argv) > 4 else 5
+    run(_host, _port, _log_file, _log_max)

@@ -6,7 +6,7 @@ OOCode incluye extensiones para VIM/Neovim y VSCode que conectan con el WebUI vi
 
 ## Extensión VIM / Neovim
 
-**Versión:** 3.0.0  
+**Versión:** 3.1.0  
 **Ubicación:** `extensions/vim/`  
 **Requisito:** el WebUI debe estar corriendo (`/webserver start` o `python oocode.py --webserver start`)
 
@@ -60,6 +60,13 @@ let g:oocode_verbose = 0
 " Inyectar ruta del fichero + línea + filetype en cada mensaje
 let g:oocode_inject_file_hint = 1
 
+" Modo streaming SSE (1) — paridad TUI/WebUI: texto, tools, plan y subagentes
+" en vivo. Con 0 usa send_sync bloqueante (respuesta completa de una vez).
+let g:oocode_stream = 1
+
+" Timeout del turno en streaming (s): cierra el turno si el stream enmudece
+let g:oocode_turn_timeout = 360
+
 " Desactivar mappings de teclado por defecto
 " let g:oocode_no_mappings = 1
 ```
@@ -78,6 +85,8 @@ let g:oocode_inject_file_hint = 1
 | `:OOCodeOpen` | Abre el panel lateral de respuestas |
 | `:OOCodeClose` | Cierra el panel lateral |
 | `:OOCodeToggle` | Alterna visibilidad del panel lateral |
+| `:OOCodeKill` | Interrumpe el turno activo (= botón Kill del WebUI, `/kill` en TUI) |
+| `:OOCodeElevated [modo]` | Cicla/establece elevated: `ask`\|`off`\|`on`\|`full` |
 | `:OOCodeStatus` | Muestra estado del agente (modelo, contexto %, hooks) |
 | `:OOCodeConnect` | Fuerza re-detección del servidor WebUI |
 | `:OOCodeWebUI` | Abre el WebUI en el navegador por defecto |
@@ -115,13 +124,17 @@ Los mappings se asignan automáticamente si `g:oocode_no_mappings` no está defi
 | `<Leader>ou` | Normal | `:OOCodeTUI` — abrir TUI completo |
 | `<Leader>on` | Normal | `:OOCodeNew` — nueva sesión |
 | `<Leader>ok` | Normal | `:OOCodeConnect` — reconectar servidor |
+| `<Leader>oK` | Normal | `:OOCodeKill` — interrumpir el turno activo |
+| `<Leader>oe` | Normal | `:OOCodeElevated` — ciclar modo elevated |
 
 ### Características del panel lateral
 
-- **Streaming en tiempo real** via SSE: el texto aparece mientras el LLM lo genera
-- **Markdown renderizado**: cabeceras, código, listas, tablas con resaltado de sintaxis
-- **Indicador "Pensando"** durante la ejecución de herramientas
-- **Inyección de contexto automática**: cuando `g:oocode_inject_file_hint = 1`, cada mensaje incluye automáticamente `[fichero: ruta, línea: N, tipo: python]`
+- **Streaming en tiempo real** via SSE: texto, tools, plan, progreso del plan y subagentes aparecen mientras el agente trabaja (mismo flujo que el WebUI)
+- **Sesión compartida con el envío**: el plugin establece la cookie de sesión antes de abrir el stream, de modo que el SSE y el POST `/api/chat/send` comparten `sid` y los eventos llegan a la cola correcta (ver más abajo)
+- **Subagentes**: la cabecera del subagente y sus líneas (texto + tools) se muestran prefijadas con `│`, igual que el bloque dedicado del TUI/WebUI
+- **Indicador "Pensando"** y frase *preflight* mientras el modelo piensa
+- **Inyección de contexto automática**: cuando `g:oocode_inject_file_hint = 1`, cada mensaje incluye automáticamente `[Vim: fichero=ruta L:col ft=tipo]`
+- **Watchdog del turno**: si el stream enmudece más de `g:oocode_turn_timeout` segundos, el turno se cierra para que el prompt no quede colgado
 - **Auto-detección del servidor**: al arrancar VIM, el plugin verifica si el WebUI está disponible en el puerto configurado; si no, muestra un aviso
 
 ### Archivo de autoload
@@ -185,17 +198,32 @@ En `settings.json`:
 
 ## Flujo de comunicación
 
+El VIM (modo streaming, por defecto) replica el flujo del navegador WebUI:
+
 ```
-Editor (VIM / VSCode)
+Editor (VIM, g:oocode_stream=1)
   │
-  ├── REST POST /api/chat/send_sync    — mensaje usuario
-  │         ↓ respuesta completa
-  │
-  └── SSE  GET  /api/chat/stream       — streaming en tiempo real
-         │ chunk text
-         │ tool_start event
-         │ tool_done event
-         └── done event
+  ├── 1. GET  /api/chat/status   — establece la cookie de sesión (jar)   ┐
+  │                                 (petición que COMPLETA → curl la vuelca)│ mismo
+  ├── 2. GET  /api/chat/stream   — SSE persistente (curl -sN -b jar)      ├ sid /
+  │         ↑ text · tool_start · tool_done · plan · subagent · done       │ cola
+  └── 3. POST /api/chat/send     — dispara el turno (fire-and-forget)     ┘
+            (los eventos del turno llegan por el stream del paso 2)
+```
+
+**Por qué el paso 1 es imprescindible:** un curl SSE persistente nunca escribe
+el cookie jar (libcurl lo vuelca al terminar la transferencia, y el stream no
+termina). Sin establecer antes la cookie con una petición que completa, el POST
+del paso 3 iría sin cookie, Flask crearía una sesión distinta, y los eventos
+caerían en otra cola — el panel se quedaría mudo. Este era el bug del flujo
+anterior, que mezclaba `send_sync` y un SSE en sesiones distintas.
+
+Modo fallback (`g:oocode_stream=0` o VIM sin `+job`):
+
+```
+Editor (VIM)
+  └── POST /api/chat/send_sync   — bloquea/espera; devuelve respuesta + tool_events
+                                    (sin SSE en paralelo; sin streaming)
 ```
 
 El WebUI mantiene un `AgentLoop` persistente: la conversación sobrevive entre reconexiones del editor.

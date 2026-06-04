@@ -1,6 +1,6 @@
 " OOCode VIM Plugin — Wrapper completo del TUI OOCode local
 " Repositorio: https://github.com/burzumishi/oocode
-" Versión:     3.0.0
+" Versión:     3.1.0
 "
 " INSTALACIÓN (vim-plug):
 "   Plug 'burzumishi/oocode', { 'rtp': 'extensions/vim' }
@@ -27,6 +27,8 @@
 "   :OOCodeReview            — Pide revisión de la selección
 "   :OOCodeTUI               — Abre el TUI completo embebido en terminal
 "   :OOCodeOpen/Close/Toggle — Gestiona el panel de respuestas
+"   :OOCodeKill              — Interrumpe el turno activo del agente
+"   :OOCodeElevated [modo]   — Cicla/establece elevated (ask|off|on|full)
 "   :OOCodeStatus            — Estado del agente (modelo, ctx%, hooks)
 "   :OOCodeConnect           — Fuerza re-detección del servidor
 "   :OOCodeWebUI             — Abre el WebUI en el navegador
@@ -51,6 +53,11 @@ let g:oocode_auto_open        = get(g:, 'oocode_auto_open',        0)
 let g:oocode_verbose          = get(g:, 'oocode_verbose',          0)
 " Inyectar fichero activo en cada mensaje (ruta + línea del cursor). Desactiva con 0.
 let g:oocode_inject_file_hint = get(g:, 'oocode_inject_file_hint', 1)
+" Modo streaming SSE (1) — paridad TUI/WebUI: text/tools/plan/subagentes en vivo.
+" Con 0 usa send_sync bloqueante (respuesta completa de una vez, sin streaming).
+let g:oocode_stream           = get(g:, 'oocode_stream',           1)
+" Timeout del turno en streaming (s): si el stream enmudece, se cierra el turno.
+let g:oocode_turn_timeout     = get(g:, 'oocode_turn_timeout',     360)
 
 " ── Comandos públicos ──────────────────────────────────────────────────────
 
@@ -69,6 +76,10 @@ command! -nargs=0 OOCodeToggle     call oocode#toggle_panel()
 
 " TUI completo embebido (acceso a todos los slash commands, streaming nativo)
 command! -nargs=0 OOCodeTUI        call oocode#tui()
+
+" Control del turno activo
+command! -nargs=0 OOCodeKill       call oocode#kill()
+command! -nargs=? OOCodeElevated   call oocode#elevated(<q-args>)
 
 " Estado y conexión
 command! -nargs=0 OOCodeStatus     call oocode#status()
@@ -89,6 +100,7 @@ command! -nargs=+ -complete=customlist,s:SlashComplete OOCodeCmd call oocode#tui
 function! s:SlashComplete(A, L, P) abort
     let l:cmds = [
         \ '/new', '/switch', '/doctor', '/compact', '/compact fast',
+        \ '/elevated', '/elevated on', '/elevated off', '/elevated full',
         \ '/hooks', '/hooks list', '/agents', '/subagents',
         \ '/model', '/models', '/rag', '/rag reindex',
         \ '/mcp', '/lsp', '/context', '/ctx', '/checkpoint',
@@ -122,6 +134,10 @@ if !get(g:, 'oocode_no_mappings', 0)
     nnoremap <Leader>on :OOCodeNew<CR>
     " <Leader>ok  — Conectar / re-detectar servidor
     nnoremap <Leader>ok :OOCodeConnect<CR>
+    " <Leader>oK  — Interrumpir el turno activo (Kill)
+    nnoremap <Leader>oK :OOCodeKill<CR>
+    " <Leader>oe  — Ciclar modo elevated (ask→off→on→full)
+    nnoremap <Leader>oe :OOCodeElevated<CR>
 endif
 
 " ── Statusline ────────────────────────────────────────────────────────────

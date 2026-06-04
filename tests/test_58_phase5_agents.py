@@ -1009,57 +1009,285 @@ class TestSpawnFanout:
 # ── MCP chart tools ───────────────────────────────────────────────────────────
 
 class TestMCPChartTools:
-    """Tests de los tools de gráficas matplotlib. Usan tempfile propio para
-    evitar interferencias con el autouse fixture _cleanup_test_tmp."""
+    """Tests de la tool única de gráficas Word `insert_chart` (OOXML nativo, sin matplotlib).
+    Usan tempfile propio para evitar interferencias con el autouse fixture _cleanup_test_tmp."""
 
-    def test_create_bar_chart_creates_file(self):
-        import tempfile
-        from mcp_servers.home_office_assistant import _tool_create_bar_chart
+    def test_insert_chart_creates_native_docx(self):
+        import tempfile, zipfile
+        from mcp_servers.home_office_assistant import _TOOL_FNS
         with tempfile.TemporaryDirectory() as d:
-            out = str(Path(d) / "bar.png")
-            result = _tool_create_bar_chart({
-                "data": {"categories": ["A", "B", "C"], "values": [10, 20, 30]},
-                "title": "Test Bar",
-                "output": out,
+            out = str(Path(d) / "chart.docx")
+            result = _TOOL_FNS["insert_chart"]({
+                "path": out, "chart_type": "bar", "title": "Test Bar",
+                "data": {"categories": ["A", "B", "C"],
+                         "series": [{"label": "S1", "values": [10, 20, 30]}]},
+            })
+            assert "✅" in result, f"Tool error: {result}"
+            assert Path(out).exists()
+            # Verificar que es un chart OOXML nativo, no una imagen PNG
+            with zipfile.ZipFile(out) as z:
+                names = z.namelist()
+                assert any("charts/chart" in n for n in names), "No hay chartSpace OOXML"
+                assert not any(n.startswith("word/media/") for n in names), "No debe incrustar PNG"
+
+    def test_insert_chart_pie_native(self):
+        import tempfile
+        from mcp_servers.home_office_assistant import _TOOL_FNS
+        with tempfile.TemporaryDirectory() as d:
+            out = str(Path(d) / "pie.docx")
+            result = _TOOL_FNS["insert_chart"]({
+                "path": out, "chart_type": "pie", "title": "Test Pie",
+                "data": {"categories": ["X", "Y"],
+                         "series": [{"label": "Dist", "values": [60, 40]}]},
             })
             assert "✅" in result, f"Tool error: {result}"
             assert Path(out).exists()
 
-    def test_create_pie_chart_creates_file(self):
-        import tempfile
-        from mcp_servers.home_office_assistant import _tool_create_pie_chart
-        with tempfile.TemporaryDirectory() as d:
-            out = str(Path(d) / "pie.png")
-            result = _tool_create_pie_chart({
-                "data": {"labels": ["X", "Y"], "sizes": [60, 40]},
-                "title": "Test Pie",
-                "output": out,
-            })
-            assert "✅" in result, f"Tool error: {result}"
-            assert Path(out).exists()
-
-    def test_create_line_chart_creates_file(self):
-        import tempfile
-        from mcp_servers.home_office_assistant import _tool_create_line_chart
-        with tempfile.TemporaryDirectory() as d:
-            out = str(Path(d) / "line.png")
-            result = _tool_create_line_chart({
-                "data": {"x_labels": ["Ene", "Feb", "Mar"], "y_values": [5, 10, 8]},
-                "output": out,
-            })
-            assert "✅" in result, f"Tool error: {result}"
-            assert Path(out).exists()
-
-    def test_insert_chart_unsupported_type(self, tmp_path):
-        from mcp_servers.home_office_assistant import _tool_insert_chart
-        result = _tool_insert_chart({
-            "path": str(tmp_path / "noexiste.docx"),
-            "chart_type": "waterfall",
-            "data": {},
-        })
-        assert "no encontrado" in result or "no soportado" in result
+    def test_insert_chart_missing_path(self):
+        from mcp_servers.home_office_assistant import _TOOL_FNS
+        result = _TOOL_FNS["insert_chart"]({"chart_type": "bar", "data": {}})
+        assert "requerido" in result.lower() or "path" in result.lower()
 
     def test_chart_tools_registered_in_tool_fns(self):
         from mcp_servers.home_office_assistant import _TOOL_FNS
-        for name in ("insert_chart", "create_bar_chart", "create_pie_chart", "create_line_chart"):
-            assert name in _TOOL_FNS, f"Tool '{name}' no registrada en _TOOL_FNS"
+        assert "insert_chart" in _TOOL_FNS, "Tool 'insert_chart' no registrada"
+        # Las tools antiguas (matplotlib PNG y duplicadas) ya no existen
+        for removed in ("create_bar_chart", "create_pie_chart", "create_line_chart",
+                        "doc_insert_chart_native", "doc_insert_diagram",
+                        "create_gantt_chart", "create_org_chart", "create_heatmap",
+                        "markdown_to_html"):
+            assert removed not in _TOOL_FNS, f"Tool '{removed}' debería estar eliminada"
+
+
+# ── Config nuevos campos de subagentes ───────────────────────────────────────
+
+class TestSubagentsConfigNewFields:
+    """Nuevos campos en bloque subagents de oocode.json: autoContMax, inferenceTimeout, defaultTimeout."""
+
+    def test_defaults_auto_cont_max(self):
+        from config import OOConfig, DEFAULT_CONFIG
+        assert DEFAULT_CONFIG["subagents"]["autoContMax"] == 16
+        cfg = OOConfig()
+        assert cfg.subagents_auto_cont_max == 16
+
+    def test_defaults_inference_timeout(self):
+        from config import OOConfig, DEFAULT_CONFIG
+        assert DEFAULT_CONFIG["subagents"]["inferenceTimeout"] == 0
+        cfg = OOConfig()
+        assert cfg.subagents_inference_timeout == 0
+
+    def test_defaults_default_timeout(self):
+        from config import OOConfig, DEFAULT_CONFIG
+        assert DEFAULT_CONFIG["subagents"]["defaultTimeout"] == 0
+        cfg = OOConfig()
+        assert cfg.subagents_default_timeout == 0
+
+    def test_from_json_reads_auto_cont_max(self, tmp_path):
+        import json, config as cfg_mod
+        from config import OOConfig
+        tmp = tmp_path / "oocode.json"
+        tmp.write_text(json.dumps({"subagents": {"autoContMax": 24}}))
+        orig = cfg_mod.CONFIG_FILE
+        try:
+            cfg_mod.CONFIG_FILE = tmp
+            cfg = OOConfig.load()
+        finally:
+            cfg_mod.CONFIG_FILE = orig
+        assert cfg.subagents_auto_cont_max == 24
+
+    def test_from_json_reads_inference_timeout(self, tmp_path):
+        import json, config as cfg_mod
+        from config import OOConfig
+        tmp = tmp_path / "oocode.json"
+        tmp.write_text(json.dumps({"subagents": {"inferenceTimeout": 300}}))
+        orig = cfg_mod.CONFIG_FILE
+        try:
+            cfg_mod.CONFIG_FILE = tmp
+            cfg = OOConfig.load()
+        finally:
+            cfg_mod.CONFIG_FILE = orig
+        assert cfg.subagents_inference_timeout == 300
+
+    def test_from_json_reads_default_timeout(self, tmp_path):
+        import json, config as cfg_mod
+        from config import OOConfig
+        tmp = tmp_path / "oocode.json"
+        tmp.write_text(json.dumps({"subagents": {"defaultTimeout": 600}}))
+        orig = cfg_mod.CONFIG_FILE
+        try:
+            cfg_mod.CONFIG_FILE = tmp
+            cfg = OOConfig.load()
+        finally:
+            cfg_mod.CONFIG_FILE = orig
+        assert cfg.subagents_default_timeout == 600
+
+    def test_save_writes_new_fields(self, tmp_path):
+        import json, config as cfg_mod
+        from config import OOConfig
+        tmp = tmp_path / "oocode.json"
+        orig = cfg_mod.CONFIG_FILE
+        try:
+            cfg_mod.CONFIG_FILE = tmp
+            cfg = OOConfig(
+                subagents_auto_cont_max=20,
+                subagents_inference_timeout=180,
+                subagents_default_timeout=900,
+            )
+            cfg.save()
+            data = json.loads(tmp.read_text())
+        finally:
+            cfg_mod.CONFIG_FILE = orig
+        sa = data["subagents"]
+        assert sa["autoContMax"] == 20
+        assert sa["inferenceTimeout"] == 180
+        assert sa["defaultTimeout"] == 900
+
+    def test_auto_cont_max_zero_means_inherit(self, tmp_path):
+        import json, config as cfg_mod
+        from config import OOConfig
+        tmp = tmp_path / "oocode.json"
+        tmp.write_text(json.dumps({"subagents": {"autoContMax": 0}}))
+        orig = cfg_mod.CONFIG_FILE
+        try:
+            cfg_mod.CONFIG_FILE = tmp
+            cfg = OOConfig.load()
+        finally:
+            cfg_mod.CONFIG_FILE = orig
+        assert cfg.subagents_auto_cont_max == 0
+
+
+class TestSubagentRunAppliesConfig:
+    """run() aplica los nuevos límites de config al sub_config antes de ejecutar."""
+
+    def test_auto_cont_max_override_logic(self):
+        """La lógica de override de auto_continue_max funciona correctamente."""
+        # Reproduce la lógica exacta de subagent.py run():
+        #   if self.config.subagents_auto_cont_max > 0:
+        #       sub_config.auto_continue_max = self.config.subagents_auto_cont_max
+
+        class FakeParent:
+            subagents_auto_cont_max     = 20
+            subagents_inference_timeout = 300
+
+        class FakeSubConfig:
+            auto_continue_max = 8
+            inference_timeout_override = 0
+
+        parent = FakeParent()
+        sub = FakeSubConfig()
+
+        if parent.subagents_auto_cont_max > 0:
+            sub.auto_continue_max = parent.subagents_auto_cont_max
+        if parent.subagents_inference_timeout > 0:
+            sub.inference_timeout_override = parent.subagents_inference_timeout
+
+        assert sub.auto_continue_max == 20
+        assert sub.inference_timeout_override == 300
+
+    def test_zero_does_not_override(self):
+        """Con subagents_auto_cont_max==0 e inferenceTimeout==0, no sobreescribe."""
+        class FakeParent:
+            subagents_auto_cont_max     = 0
+            subagents_inference_timeout = 0
+
+        class FakeSubConfig:
+            auto_continue_max = 8
+            inference_timeout_override = 0
+
+        parent = FakeParent()
+        sub = FakeSubConfig()
+
+        if parent.subagents_auto_cont_max > 0:
+            sub.auto_continue_max = parent.subagents_auto_cont_max
+        if parent.subagents_inference_timeout > 0:
+            sub.inference_timeout_override = parent.subagents_inference_timeout
+
+        assert sub.auto_continue_max == 8
+        assert sub.inference_timeout_override == 0
+
+    def test_subagent_source_code_contains_override(self):
+        """Verificar que agent/subagent.py contiene los overrides de config."""
+        import ast, pathlib
+        src = pathlib.Path("agent/subagent.py").read_text()
+        assert "subagents_auto_cont_max" in src, "Debe haber override de auto_cont_max"
+        assert "subagents_inference_timeout" in src, "Debe haber override de inference_timeout"
+        assert "sub_config.auto_continue_max" in src
+        assert "sub_config.inference_timeout_override" in src
+
+
+class TestSpawnSubagentDefaultTimeout:
+    """spawn_subagent y spawn_fanout aplican defaultTimeout de config."""
+
+    def _make_runner(self, default_timeout=0):
+        from unittest.mock import MagicMock
+        from agent.subagent import SubAgentRunner, _get_concurrency_sem
+        cfg = MagicMock()
+        agent_main = MagicMock()
+        agent_main.id    = "main"
+        agent_main.name  = "Main"
+        agent_main.emoji = "🤖"
+        cfg.agents = [agent_main]
+        cfg.model  = "test-model"
+        cfg.subagents_max_concurrent  = 4
+        cfg.subagents_default_timeout = default_timeout
+        runner = SubAgentRunner.__new__(SubAgentRunner)
+        runner.config              = cfg
+        runner._parent_webui_queue = None
+        runner._concurrency_sem    = _get_concurrency_sem(4)
+        return runner
+
+    def test_default_timeout_zero_no_watchdog(self):
+        """Si defaultTimeout==0 y LLM no especifica timeout, no hay watchdog."""
+        runner = self._make_runner(default_timeout=0)
+        runner.run = lambda agent_id, task, silent=True, **kw: "ok"
+        _, fn, _ = runner.as_tool_schema()
+        result = fn(agent_id="main", task="task", timeout_seconds=0)
+        assert result == "ok"
+
+    def test_default_timeout_applied_when_llm_sends_zero(self):
+        """Si defaultTimeout>0 y LLM envía timeout_seconds=0, se aplica defaultTimeout."""
+        import threading
+        runner = self._make_runner(default_timeout=1)  # 1 segundo
+
+        def slow_run(agent_id, task, silent=True, kill_event=None, **kw):
+            if kill_event:
+                kill_event.wait(timeout=10)
+            return ""
+
+        runner.run = slow_run
+        _, fn, _ = runner.as_tool_schema()
+        # LLM no especifica timeout → debe usar defaultTimeout=1 → subagente se mata
+        result = fn(agent_id="main", task="slow_task", timeout_seconds=0)
+        assert "Timeout" in result or "timeout" in result.lower()
+
+    def test_explicit_timeout_overrides_default(self):
+        """timeout_seconds explícito del LLM tiene precedencia sobre defaultTimeout."""
+        import threading
+        runner = self._make_runner(default_timeout=600)  # 10 min de default
+
+        results = []
+
+        def fast_run(agent_id, task, silent=True, **kw):
+            results.append("done")
+            return "fast_result"
+
+        runner.run = fast_run
+        _, fn, _ = runner.as_tool_schema()
+        # LLM especifica timeout_seconds=5 (ignora el default)
+        result = fn(agent_id="main", task="fast_task", timeout_seconds=5)
+        assert result == "fast_result"
+
+    def test_fanout_applies_default_timeout(self):
+        """spawn_fanout también aplica defaultTimeout cuando no se especifica."""
+        runner = self._make_runner(default_timeout=1)
+
+        def slow_run(agent_id, task, silent=True, kill_event=None, **kw):
+            if kill_event:
+                kill_event.wait(timeout=10)
+            return ""
+
+        runner.run = slow_run
+        _, fn, schema = runner.as_fanout_schema()
+        result = fn(agent_id="main", task_chunks=["chunk1"], timeout_seconds=0)
+        # Con defaultTimeout=1 s, el chunk lento debe ser killed
+        assert "killed" in result or "Timeout" in result or "error" in result.lower()

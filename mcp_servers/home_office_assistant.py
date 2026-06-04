@@ -14,9 +14,9 @@ Tools (77):
   email_send          — envía un email (SMTP)
   email_search        — busca emails por criterio (IMAP SEARCH)
   ── Documentos O365 (núcleo) ──
-  doc_create          — ★ NUEVA: crea .docx/.xlsx/.pptx con estilos O365 reales desde cero
+  doc_create          — crea .docx/.xlsx/.pptx con estilos O365 reales desde cero
                          Calibri/Calibri Light, colores Office theme, tablas nativas, TOC,
-                         firma, bullets, heading hierarchy; markdown o content_blocks
+                         firma, bullets, heading hierarchy; usa content_blocks (nativo)
   doc_fill_template   — rellena plantillas .docx/.xlsx/.pptx con campos
                          Motor primario: docxtpl/Jinja2 ({{ campo }}, loops, condicionales)
                          Preserva 100% los estilos originales de la plantilla de empresa
@@ -31,16 +31,14 @@ Tools (77):
   doc_add_content_block — añade bloques a un .docx existente sin borrar contenido
   doc_set_page_layout — configura tamaño de página, orientación y márgenes
   doc_embed_image           — incrusta imagen en .docx con ancho configurable
-  doc_insert_diagram        — inserta diagramas y gráficas en documentos .docx (PNG)
-  doc_insert_chart_native   — ★ NUEVA: gráfica de alta calidad multi-series en .docx
-                               (bar/line/pie/doughnut/area/scatter, estilos Office)
+  insert_chart              — gráfica OOXML nativa multi-series en .docx (editable):
+                               bar/column/line/area/pie/doughnut/scatter/stacked/radar
   doc_extract_metadata — extrae metadatos de .docx/.pptx/.pdf
   doc_compare         — diff unificado entre dos documentos
   doc_read_template_fields — extrae campos {{CAMPO}} de una plantilla
   doc_list_templates  — lista plantillas disponibles (.docx/.xlsx/.md)
   doc_convert         — convierte documentos con pandoc (md→pdf, docx→md, etc.)
   doc_word_count      — cuenta palabras, líneas y caracteres de un documento
-  markdown_to_html    — convierte markdown a HTML
   pdf_extract_text    — extrae texto de un PDF (pdftotext o pdfplumber)
   doc_read            — lee contenido de .docx/.md; extrae sección opcional
   doc_update_section  — reemplaza contenido de una sección en .md/.docx
@@ -108,6 +106,21 @@ import json
 import os
 import re
 import smtplib
+
+# Límite de truncado de salida (configurable: tools.mcpMaxOutputChars en oocode.json)
+def _mcp_max_output(default: int = 4000) -> int:
+    try:
+        from pathlib import Path as _P
+        import json as _j
+        _f = _P.home() / ".oocode" / "oocode.json"
+        if _f.exists():
+            return int(_j.loads(_f.read_text()).get("tools", {}).get("mcpMaxOutputChars", default))
+    except Exception:
+        pass
+    return default
+
+
+_MAX_OUTPUT = _mcp_max_output()
 import subprocess
 import sys
 from pathlib import Path
@@ -336,7 +349,6 @@ def _tool_email_list(args: dict) -> str:
         lines = [f"📬 {mailbox} — {len(uids)} emails (mostrando {len(uids)})\n"]
         for uid in uids:
             _, msg_data = client.fetch(uid, "(RFC822.SIZE ENVELOPE)")
-            raw = msg_data[0][1].decode("utf-8", errors="replace") if msg_data and msg_data[0] else ""
             # Parse ENVELOPE para extraer subject/from/date
             _, msg_data2 = client.fetch(uid, "(RFC822.HEADER)")
             if msg_data2 and msg_data2[0]:
@@ -405,7 +417,7 @@ def _tool_email_read(args: dict) -> str:
             payload = msg.get_payload(decode=True)
             if payload:
                 body = payload.decode(msg.get_content_charset() or "utf-8", errors="replace")
-        lines.append(body[:4000] if body else "(sin cuerpo)")
+        lines.append(body[:_MAX_OUTPUT] if body else "(sin cuerpo)")
         return "\n".join(lines)
     except Exception as exc:
         return f"Error leyendo email {uid}: {exc}"
@@ -506,7 +518,6 @@ def _tool_doc_embed_image(args: dict) -> str:
     caption     = args.get("caption", "")
     width_in    = args.get("width_inches", 5.0)
     output_path = args.get("output_path", "")
-    position    = args.get("position", "end")   # end | after_paragraph_N
 
     if not path.exists():
         return f"Fichero no encontrado: {path}"
@@ -537,164 +548,6 @@ def _tool_doc_embed_image(args: dict) -> str:
         return "python-docx no disponible. Instala con: pip install python-docx"
     except Exception as exc:
         return f"Error insertando imagen: {exc}"
-
-
-def _tool_insert_chart(args: dict) -> str:
-    """Inserta una gráfica OOXML nativa en un documento .docx (editable, vectorial).
-
-    Usa DrawingML nativo como primera opción; cae a PNG matplotlib solo si falla.
-    chart_type: bar | column | line | area | pie | doughnut | scatter | stacked_bar |
-                stacked_column | line_markers | radar
-    data:
-      - categories: ["Ene","Feb","Mar"]
-      - series: [{"label":"Ventas","values":[100,200,150]}, ...]
-      - (legacy) values, sizes, y_values, x_labels también aceptados
-    """
-    path        = Path(args.get("path", "")).expanduser()
-    chart_type  = args.get("chart_type", "bar").lower()
-    data        = args.get("data", {})
-    title       = args.get("title", "")
-    output_path = args.get("output_path", "")
-    width_in    = float(args.get("width_inches", 6.0))
-    height_in   = float(args.get("height_inches", 3.5))
-
-    if not path:
-        return "Parámetro requerido: path"
-    if not path.exists():
-        return f"Fichero no encontrado: {path}"
-
-    try:
-        from docx import Document
-        from docx.shared import Inches, Pt, RGBColor
-        from docx.enum.text import WD_ALIGN_PARAGRAPH
-
-        doc = Document(str(path))
-
-        # Normalise into categories + series_list
-        categories  = data.get("categories", [])
-        series_list = data.get("series", [])
-        if not series_list:
-            if chart_type in ("bar", "column", "stacked_bar", "stacked_column",
-                              "area", "stacked_area", "line", "line_markers",
-                              "radar", "doughnut"):
-                vals   = data.get("values", [])
-                labels = data.get("labels", categories)
-                if vals:
-                    series_list = [{"label": title or "Serie 1", "values": vals}]
-                    if not categories:
-                        categories = labels
-            elif chart_type == "pie":
-                sizes  = data.get("sizes", data.get("values", []))
-                labels = data.get("labels", categories)
-                if sizes:
-                    series_list = [{"label": title or "Serie 1", "values": sizes}]
-                    if not categories:
-                        categories = labels
-            elif chart_type == "scatter":
-                xv = data.get("x_values", [])
-                yv = data.get("y_values", [])
-                if xv and yv:
-                    series_list = [{"label": title or "Serie 1",
-                                    "x_values": xv, "values": yv}]
-            else:
-                vals = data.get("values", data.get("y_values", []))
-                cats = data.get("x_labels", data.get("categories", []))
-                if vals:
-                    series_list = [{"label": title or "Serie 1", "values": vals}]
-                    if not categories:
-                        categories = cats
-
-        if not series_list:
-            return "Sin datos. Especifica data.series=[{label, values}] o data.values=[...]"
-
-        # ── Primary: native OOXML DrawingML chart ─────────────────────────────
-        chart_xml = _build_word_chart_xml(chart_type, categories, series_list, title)
-        ok = _embed_word_chart_native(doc, chart_xml,
-                                      int(width_in * 914400), int(height_in * 914400))
-        if ok:
-            if title:
-                cap = doc.add_paragraph()
-                cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                r = cap.add_run(title)
-                r.font.size = Pt(9)
-                r.font.italic = True
-                r.font.color.rgb = RGBColor(0x60, 0x60, 0x60)
-            dest = output_path or str(path)
-            doc.save(dest)
-            return (
-                f"✅ Gráfica OOXML nativa '{chart_type}' insertada en: {dest}\n"
-                f"   Series: {len(series_list)}  Categorías: {len(categories)}  "
-                f"Vectorial — editable en Word/LibreOffice."
-            )
-
-        # ── Fallback: matplotlib PNG (raster) ──────────────────────────────────
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import tempfile
-
-        office_colors = ["#4472C4", "#ED7D31", "#A9D18E", "#FFC000", "#5B9BD5", "#70AD47"]
-        fig, ax = plt.subplots(figsize=(width_in, height_in))
-        cats = categories or [f"Cat {i+1}" for i in range(
-            len(series_list[0].get("values", [])) if series_list else 0)]
-
-        if chart_type in ("bar", "column", "stacked_bar", "stacked_column"):
-            x = range(len(cats))
-            for idx, ser in enumerate(series_list):
-                vals = ser.get("values", [])
-                ax.bar([xi + idx * 0.8/max(len(series_list), 1) for xi in x],
-                       vals, width=0.8/max(len(series_list), 1),
-                       label=ser.get("label", ""), color=office_colors[idx % 6], alpha=0.85)
-            ax.set_xticks(range(len(cats)))
-            ax.set_xticklabels(cats, rotation=15, ha="right")
-        elif chart_type == "pie":
-            vals = series_list[0].get("values", [])
-            ax.pie(vals, labels=cats[:len(vals)], colors=office_colors[:len(vals)],
-                   autopct="%1.1f%%", startangle=90)
-            ax.axis("equal")
-        elif chart_type in ("line", "line_markers"):
-            for idx, ser in enumerate(series_list):
-                vals = ser.get("values", [])
-                ax.plot(cats[:len(vals)], vals, marker="o",
-                        color=office_colors[idx % 6], linewidth=2,
-                        label=ser.get("label", ""))
-        elif chart_type == "scatter":
-            for idx, ser in enumerate(series_list):
-                xv = ser.get("x_values", ser.get("values", []))
-                yv = ser.get("y_values", xv)
-                ax.scatter(xv, yv, color=office_colors[idx % 6], s=60, alpha=0.8,
-                           label=ser.get("label", ""))
-        else:
-            vals = series_list[0].get("values", []) if series_list else []
-            ax.bar(cats[:len(vals)], vals, color=office_colors[0])
-
-        if title:
-            ax.set_title(title, fontsize=13, fontweight="bold")
-        if len(series_list) > 1:
-            ax.legend()
-        if chart_type not in ("pie", "doughnut"):
-            ax.grid(True, alpha=0.3, linestyle="--")
-        plt.tight_layout()
-
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-            tmp_path = tmp.name
-        plt.savefig(tmp_path, dpi=200, bbox_inches="tight")
-        plt.close(fig)
-
-        doc.add_picture(tmp_path, width=Inches(width_in))
-        try:
-            Path(tmp_path).unlink(missing_ok=True)
-        except Exception:
-            pass
-
-        dest = output_path or str(path)
-        doc.save(dest)
-        return f"✅ Gráfica {chart_type} insertada (PNG raster — OOXML no disponible) en: {dest}"
-
-    except ImportError as e:
-        return f"Dependencia no disponible: {e}\nInstala: pip install python-docx"
-    except Exception as exc:
-        return f"Error generando gráfica: {exc}"
 
 
 def _build_word_chart_xml(chart_type: str, categories: list, series_list: list,
@@ -1325,17 +1178,29 @@ def _tool_doc_insert_chart_native(args: dict) -> str:
     height_inches: alto en pulgadas (default 3.5)
     output_path: si se omite, sobreescribe path
     """
-    path        = Path(args.get("path", "")).expanduser()
+    raw_path    = (args.get("path") or args.get("doc_path") or "").strip()
+    path        = Path(raw_path).expanduser()
     chart_type  = args.get("chart_type", "bar").lower()
     data        = args.get("data", {})
     title       = args.get("title", "")
-    style_nm    = args.get("style", "office")
-    width_in    = float(args.get("width_inches", 5.5))
-    height_in   = float(args.get("height_inches", 3.5))
+    width_in    = float(args.get("width_inches", args.get("width", 5.5)))
+    height_in   = float(args.get("height_inches", args.get("height", 3.5)))
     output_path = args.get("output_path", "")
 
+    if not raw_path:
+        return "Parámetro requerido: path (ruta al .docx donde insertar la gráfica)."
+    # Auto-crear el .docx con estilos O365 si no existe todavía
     if not path.exists():
-        return f"Documento no encontrado: {path}"
+        if raw_path.lower().endswith(".docx"):
+            try:
+                from docx import Document as _D
+                _d = _D()
+                _apply_o365_styles_to_new_doc(_d)
+                _d.save(str(path))
+            except Exception as _e:
+                return f"No se pudo crear el documento {path}: {_e}"
+        else:
+            return f"Documento no encontrado: {path}"
 
     categories  = data.get("categories", [])
     series_list = data.get("series", [])
@@ -1352,7 +1217,7 @@ def _tool_doc_insert_chart_native(args: dict) -> str:
 
     try:
         from docx import Document
-        from docx.shared import Inches, Pt, RGBColor, Emu
+        from docx.shared import Pt, RGBColor
         from docx.enum.text import WD_ALIGN_PARAGRAPH
 
         doc = Document(str(path))
@@ -1381,788 +1246,19 @@ def _tool_doc_insert_chart_native(args: dict) -> str:
                 f"Editable en Word/LibreOffice — vectorial sin pérdida de calidad."
             )
 
-        # ── Fallback: matplotlib PNG de alta resolución ─────────────────────
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        plt.switch_backend("Agg")
-        import tempfile, numpy as np
-
-        st     = _CHART_STYLES.get(style_nm, _CHART_STYLES["office"])
-        colors = st["colors"]
-        fig, ax = plt.subplots(figsize=(width_in, height_in))
-        fig.patch.set_facecolor(st["bg"])
-        ax.set_facecolor(st["bg"])
-
-        ct = chart_type
-        if ct in ("bar", "column"):
-            x   = np.arange(len(categories)) if categories else np.arange(len(series_list[0].get("values", [])))
-            n_s = len(series_list)
-            bar_w = 0.8 / max(n_s, 1)
-            for i, serie in enumerate(series_list):
-                vals   = serie.get("values", [])
-                label  = serie.get("label", f"Serie {i+1}")
-                color  = colors[i % len(colors)]
-                offset = (i - n_s / 2 + 0.5) * bar_w
-                bars = ax.bar(x + offset, vals, bar_w, label=label, color=color, alpha=0.88)
-                ax.bar_label(bars, fmt="%.0f", padding=2, fontsize=8, color=st["text_c"])
-            if categories:
-                ax.set_xticks(x)
-                ax.set_xticklabels(categories, rotation=20, ha="right", fontsize=9)
-            if n_s > 1:
-                ax.legend(fontsize=8, facecolor=st["bg"], labelcolor=st["text_c"])
-        elif ct == "line":
-            x = list(range(len(series_list[0].get("values", []))))
-            for i, serie in enumerate(series_list):
-                vals  = serie.get("values", [])
-                col   = colors[i % len(colors)]
-                ax.plot(x, vals, marker="o", color=col, linewidth=2.2,
-                        label=serie.get("label", f"Serie {i+1}"), markersize=5)
-                ax.fill_between(x, vals, alpha=0.06, color=col)
-            if categories:
-                ax.set_xticks(x)
-                ax.set_xticklabels(categories, rotation=20, ha="right", fontsize=9)
-            if len(series_list) > 1:
-                ax.legend(fontsize=8, facecolor=st["bg"], labelcolor=st["text_c"])
-        elif ct in ("pie", "doughnut"):
-            vals   = series_list[0].get("values", [])
-            labels = categories or [f"Item {i+1}" for i in range(len(vals))]
-            wp = {"width": 0.55} if ct == "doughnut" else {}
-            ax.pie(vals, labels=labels, colors=colors[:len(vals)],
-                   autopct="%1.1f%%", startangle=90,
-                   wedgeprops=wp if wp else {})
-            ax.axis("equal")
-        elif ct == "area":
-            x = list(range(len(series_list[0].get("values", []))))
-            for i, serie in enumerate(series_list):
-                vals  = serie.get("values", [])
-                col   = colors[i % len(colors)]
-                ax.fill_between(x, vals, alpha=0.45, color=col,
-                                label=serie.get("label", f"Serie {i+1}"))
-                ax.plot(x, vals, color=col, linewidth=1.5)
-            if categories:
-                ax.set_xticks(x)
-                ax.set_xticklabels(categories, rotation=20, ha="right", fontsize=9)
-            if len(series_list) > 1:
-                ax.legend(fontsize=8, facecolor=st["bg"], labelcolor=st["text_c"])
-        elif ct == "scatter":
-            for i, serie in enumerate(series_list):
-                xv = serie.get("x_values", serie.get("values", []))
-                yv = serie.get("y_values", [])
-                ax.scatter(xv, yv, color=colors[i % len(colors)],
-                           label=serie.get("label", f"Serie {i+1}"),
-                           s=55, alpha=0.85, edgecolors="white", linewidths=0.5)
-            if len(series_list) > 1:
-                ax.legend(fontsize=8, facecolor=st["bg"], labelcolor=st["text_c"])
-        else:
-            plt.close("all")
-            return f"Tipo de gráfica no soportado: {chart_type}. Usa: bar, line, pie, doughnut, area, scatter"
-
-        if title:
-            ax.set_title(title, fontsize=11, fontweight="bold", color=st["text_c"], pad=8)
-        _apply_chart_style(fig, ax, style_nm, is_pie=ct in ("pie", "doughnut"))
-        plt.tight_layout(pad=0.4)
-
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
-            tmp_path = tf.name
-        plt.savefig(tmp_path, dpi=st["dpi"], bbox_inches="tight", facecolor=st["bg"])
-        plt.close("all")
-
-        p = doc.add_paragraph()
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = p.add_run()
-        run.add_picture(tmp_path, width=Inches(width_in))
-
-        if title:
-            cap = doc.add_paragraph()
-            cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            r = cap.add_run(title)
-            r.font.size = Pt(9)
-            r.font.italic = True
-            r.font.color.rgb = RGBColor(0x60, 0x60, 0x60)
-
-        try:
-            Path(tmp_path).unlink(missing_ok=True)
-        except Exception:
-            pass
-
-        dest = output_path or str(path)
-        doc.save(dest)
+        # Native-only: si python-docx no pudo embeber el chartSpace OOXML, no caemos a PNG.
         return (
-            f"✅ Gráfica '{chart_type}' (PNG DPI:{st['dpi']}) insertada en {Path(dest).name}\n"
-            f"   Series: {len(series_list)}  Categorías: {len(categories)}  Estilo: {style_nm}"
+            f"No se pudo generar la gráfica OOXML nativa '{chart_type}'. "
+            f"Verifica python-docx y que chart_type sea válido "
+            f"(bar, column, line, line_markers, area, pie, doughnut, scatter, "
+            f"stacked_bar, stacked_column, radar)."
         )
 
     except ImportError as e:
-        return f"Dependencia no disponible: {e}\nInstala: pip install python-docx matplotlib"
+        return f"Dependencia no disponible: {e}\nInstala: pip install python-docx"
     except Exception as exc:
         return f"Error generando gráfica Word: {exc}"
 
-
-def _tool_doc_insert_diagram(args: dict) -> str:
-    """Inserta un diagrama o gráfica en un documento .docx existente.
-
-    diagram_type: flowchart | bar_chart | pie_chart | line_chart | table | org_chart | scatter
-    content: datos del diagrama en texto plano:
-      - bar_chart/pie_chart/line_chart: "Label1,Label2,Label3\\nVal1,Val2,Val3"
-      - table:  "Col1|Col2|Col3\\nFila1a|Fila1b|Fila1c"
-      - flowchart: "Paso 1\\nPaso 2\\nPaso 3" (uno por línea)
-      - org_chart: "CEO → CTO → Dev\\nCEO → CFO"
-    title: título de la gráfica (opcional)
-    style: office | dark | minimal | presentation
-    width_inches: ancho en pulgadas (default: 5.5)
-    output_path: ruta de salida (default: sobreescribe path)
-    """
-    _path_str   = args.get("path", "")
-    diagram_type = args.get("diagram_type", "bar_chart").lower()
-    content     = args.get("content", "")
-    title       = args.get("title", "")
-    style_nm    = args.get("style", "office")
-    width_in    = float(args.get("width_inches", 5.5))
-    output_path = args.get("output_path", "")
-
-    if not _path_str:
-        return "Error insertando diagrama: parámetro 'path' requerido"
-    path = Path(_path_str).expanduser()
-    if not path.exists():
-        return f"Documento no encontrado: {path}"
-
-    try:
-        from docx import Document
-        from docx.shared import Inches
-        from docx.enum.text import WD_ALIGN_PARAGRAPH
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        plt.switch_backend("Agg")
-        import tempfile
-
-        st = _CHART_STYLES.get(style_nm, _CHART_STYLES["office"])
-        colors = st["colors"]
-
-        doc = Document(str(path))
-        tmp_img = None
-
-        # ── Table diagram ─────────────────────────────────────────────────
-        if diagram_type == "table":
-            # Parse pipe-separated or CSV table
-            lines = [l for l in content.strip().splitlines() if l.strip()]
-            if not lines:
-                dest = output_path or str(path)
-                doc.save(dest)
-                return f"✅ Diagrama insertado (table): {dest}"
-            sep = "|" if "|" in lines[0] else ","
-            rows = [[c.strip() for c in l.split(sep)] for l in lines]
-            n_cols = max(len(r) for r in rows)
-            tbl = doc.add_table(rows=len(rows), cols=n_cols)
-            try:
-                tbl.style = doc.styles["Table Grid"]
-            except Exception:
-                pass
-            from docx.shared import RGBColor
-            from docx.oxml.ns import qn
-            from docx.oxml import OxmlElement
-            for r_i, row in enumerate(rows):
-                for c_i, val in enumerate(row[:n_cols]):
-                    cell = tbl.rows[r_i].cells[c_i]
-                    cell.text = ""
-                    p = cell.paragraphs[0]
-                    run = p.add_run(val)
-                    if r_i == 0:
-                        run.bold = True
-                        run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-                        try:
-                            tcPr = cell._tc.get_or_add_tcPr()
-                            shd = OxmlElement("w:shd")
-                            shd.set(qn("w:val"), "clear")
-                            shd.set(qn("w:color"), "auto")
-                            shd.set(qn("w:fill"), "2F5496")
-                            tcPr.append(shd)
-                        except Exception:
-                            pass
-                    elif r_i % 2 == 0:
-                        try:
-                            tcPr = cell._tc.get_or_add_tcPr()
-                            shd = OxmlElement("w:shd")
-                            shd.set(qn("w:val"), "clear")
-                            shd.set(qn("w:color"), "auto")
-                            shd.set(qn("w:fill"), "EEF3FB")
-                            tcPr.append(shd)
-                        except Exception:
-                            pass
-            dest = output_path or str(path)
-            doc.save(dest)
-            return f"✅ Diagrama insertado (table): {dest}"
-
-        # ── Flowchart diagram — nativo Word (tabla O365 por pasos) ───────
-        elif diagram_type == "flowchart":
-            steps = [l.strip() for l in content.strip().splitlines() if l.strip()]
-            if not steps:
-                dest = output_path or str(path)
-                doc.save(dest)
-                return f"✅ Diagrama insertado (flowchart): {dest}"
-            from docx.shared import Pt, RGBColor
-            from docx.oxml.ns import qn as _qn2
-            from docx.oxml import OxmlElement as _OE2
-            step_colors = ["2F5496", "4472C4", "5B9BD5", "70AD47", "ED7D31", "FFC000"]
-            if title:
-                tp = doc.add_paragraph()
-                try:
-                    tp.style = doc.styles["Heading 3"]
-                except Exception:
-                    pass
-                tp.add_run(title)
-            for i, step in enumerate(steps):
-                is_decision = step.rstrip(".").endswith("?")
-                color       = "FFC000" if is_decision else step_colors[i % len(step_colors)]
-                s_tbl       = doc.add_table(rows=1, cols=1)
-                s_tbl.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                cell = s_tbl.rows[0].cells[0]
-                cell.text = ""
-                sp = cell.paragraphs[0]
-                sp.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                sp.paragraph_format.space_before = Pt(5)
-                sp.paragraph_format.space_after  = Pt(5)
-                run = sp.add_run(step)
-                run.bold = True
-                run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-                run.font.size = Pt(11)
-                try:
-                    tcPr = cell._tc.get_or_add_tcPr()
-                    shd  = _OE2("w:shd")
-                    shd.set(_qn2("w:val"),   "clear")
-                    shd.set(_qn2("w:color"), "auto")
-                    shd.set(_qn2("w:fill"),  color)
-                    tcPr.append(shd)
-                except Exception:
-                    pass
-                if i < len(steps) - 1:
-                    arr = doc.add_paragraph()
-                    arr.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    arr.paragraph_format.space_before = Pt(0)
-                    arr.paragraph_format.space_after  = Pt(0)
-                    try:
-                        pPr  = arr._p.get_or_add_pPr()
-                        pBdr = _OE2("w:pBdr")
-                        bot  = _OE2("w:bottom")
-                        bot.set(_qn2("w:val"),   "single")
-                        bot.set(_qn2("w:sz"),    "12")
-                        bot.set(_qn2("w:space"), "1")
-                        bot.set(_qn2("w:color"), "4472C4")
-                        pBdr.append(bot)
-                        pPr.append(pBdr)
-                    except Exception:
-                        pass
-            dest = output_path or str(path)
-            doc.save(dest)
-            return f"✅ Diagrama insertado (flowchart): {dest}"
-
-        # ── Org chart diagram — nativo Word (tabla O365) ──────────────────
-        elif diagram_type == "org_chart":
-            lines_oc = [l.strip() for l in content.strip().splitlines() if l.strip()]
-            edges_oc: list = []
-            all_nodes_oc: list = []
-            for line_oc in lines_oc:
-                parts_oc = [p.strip() for p in re.split(r'→|->|–>', line_oc) if p.strip()]
-                for idx_oc in range(len(parts_oc) - 1):
-                    if parts_oc[idx_oc] not in all_nodes_oc:
-                        all_nodes_oc.append(parts_oc[idx_oc])
-                    if parts_oc[idx_oc+1] not in all_nodes_oc:
-                        all_nodes_oc.append(parts_oc[idx_oc+1])
-                    edges_oc.append((parts_oc[idx_oc], parts_oc[idx_oc+1]))
-            if not all_nodes_oc:
-                all_nodes_oc = [content.strip()[:30] or "Nodo"]
-            roots_oc = [n for n in all_nodes_oc if not any(b == n for _, b in edges_oc)]
-            if not roots_oc:
-                roots_oc = [all_nodes_oc[0]]
-            from collections import deque as _dq2
-            nl_oc: dict = {}
-            q_oc = _dq2()
-            for r in roots_oc:
-                nl_oc[r] = 0; q_oc.append(r)
-            while q_oc:
-                cur = q_oc.popleft()
-                for a, b in edges_oc:
-                    if a == cur and b not in nl_oc:
-                        nl_oc[b] = nl_oc[cur] + 1; q_oc.append(b)
-            for n in all_nodes_oc:
-                if n not in nl_oc:
-                    nl_oc[n] = 0
-            bl_oc: dict = {}
-            for n, lv in nl_oc.items():
-                bl_oc.setdefault(lv, []).append(n)
-            ml_oc    = max(nl_oc.values()) if nl_oc else 0
-            mpr_oc   = max(len(v) for v in bl_oc.values()) if bl_oc else 1
-            lv_cols  = ["2F5496", "4472C4", "5B9BD5", "9DC3E6", "BDD7EE", "DEEAF1"]
-            from docx.shared import Pt, RGBColor, Cm as _Cm
-            from docx.oxml.ns import qn as _qn3
-            from docx.oxml import OxmlElement as _OE3
-            if title:
-                tp3 = doc.add_paragraph()
-                try:
-                    tp3.style = doc.styles["Heading 3"]
-                except Exception:
-                    pass
-                tp3.add_run(title)
-            oc_tbl = doc.add_table(rows=ml_oc + 1, cols=max(mpr_oc, 1))
-            try:
-                oc_tbl.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            except Exception:
-                pass
-
-            def _shade_oc(cell, hx: str) -> None:
-                try:
-                    tcPr = cell._tc.get_or_add_tcPr()
-                    shd  = _OE3("w:shd")
-                    shd.set(_qn3("w:val"), "clear")
-                    shd.set(_qn3("w:color"), "auto")
-                    shd.set(_qn3("w:fill"), hx)
-                    tcPr.append(shd)
-                except Exception:
-                    pass
-
-            for lv_oc, lv_nodes in bl_oc.items():
-                cpn_oc = max(1, max(mpr_oc, 1) // max(len(lv_nodes), 1))
-                c_oc   = lv_cols[lv_oc % len(lv_cols)]
-                for ni_oc, nid_oc in enumerate(lv_nodes):
-                    sc_oc = ni_oc * cpn_oc
-                    ec_oc = min(sc_oc + cpn_oc - 1, max(mpr_oc, 1) - 1)
-                    try:
-                        cell = (oc_tbl.rows[lv_oc].cells[sc_oc].merge(oc_tbl.rows[lv_oc].cells[ec_oc])
-                                if ec_oc > sc_oc else oc_tbl.rows[lv_oc].cells[min(sc_oc, max(mpr_oc,1)-1)])
-                    except Exception:
-                        cell = oc_tbl.rows[lv_oc].cells[0]
-                    cell.text = ""
-                    cp = cell.paragraphs[0]
-                    cp.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    cp.paragraph_format.space_before = Pt(5)
-                    cp.paragraph_format.space_after  = Pt(5)
-                    run_oc = cp.add_run(nid_oc)
-                    run_oc.bold = True
-                    run_oc.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-                    run_oc.font.size = Pt(max(8, 11 - lv_oc))
-                    _shade_oc(cell, c_oc)
-                used_oc = len(lv_nodes) * cpn_oc
-                for ci_oc in range(used_oc, max(mpr_oc, 1)):
-                    try:
-                        _shade_oc(oc_tbl.rows[lv_oc].cells[ci_oc], "F5F5F5")
-                    except Exception:
-                        pass
-            oc_cw = _Cm(max(0.5, 16.0 / max(mpr_oc, 1)))
-            for row in oc_tbl.rows:
-                for cell in row.cells:
-                    try:
-                        cell.width = oc_cw
-                    except Exception:
-                        pass
-            dest = output_path or str(path)
-            doc.save(dest)
-            return f"✅ Diagrama insertado (org_chart): {dest}"
-
-        # ── Bar chart — native OOXML (with matplotlib fallback) ──────────
-        elif diagram_type == "bar_chart":
-            raw_lines = [l.strip() for l in content.strip().splitlines() if l.strip()]
-            sep = "," if raw_lines and "," in raw_lines[0] else "|"
-            cats = [c.strip() for c in raw_lines[0].split(sep)] if raw_lines else []
-            values: list = []
-            if len(raw_lines) > 1:
-                try:
-                    values = [float(v.strip()) for v in raw_lines[1].split(sep)]
-                except ValueError:
-                    values = list(range(len(cats)))
-            # Multiple series: row0=labels, row1=series1, row2=series2 …
-            series_list = []
-            for si, row in enumerate(raw_lines[1:]):
-                try:
-                    row_vals = [float(v.strip()) for v in row.split(sep)]
-                    series_list.append({"label": f"Serie {si+1}", "values": row_vals})
-                except ValueError:
-                    pass
-            if not series_list and values:
-                series_list = [{"label": title or "Serie 1", "values": values}]
-
-            cxml = _build_word_chart_xml("bar", cats, series_list, title)
-            ok = _embed_word_chart_native(doc, cxml,
-                                          int(width_in * 914400), int(int(width_in * 0.6) * 914400))
-            if ok:
-                if title:
-                    from docx.shared import Pt, RGBColor
-                    cap = doc.add_paragraph(title)
-                    cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    for run in cap.runs:
-                        run.font.size = Pt(9); run.font.italic = True
-                        run.font.color.rgb = RGBColor(0x60, 0x60, 0x60)
-                dest = output_path or str(path)
-                doc.save(dest)
-                return f"✅ Diagrama bar_chart OOXML insertado: {dest}"
-            # matplotlib fallback
-            fig, ax = plt.subplots(figsize=(width_in, width_in * 0.6))
-            fig.patch.set_facecolor(st["bg"]); ax.set_facecolor(st["bg"])
-            ax.bar(cats[:len(values)], values, color=colors[:len(values)],
-                   edgecolor="white", linewidth=0.8)
-            if title:
-                ax.set_title(title, color=st["text_c"], fontsize=12, fontweight="bold", pad=10)
-            _apply_chart_style(fig, ax, style_nm)
-            plt.tight_layout()
-
-        # ── Pie chart — native OOXML (with matplotlib fallback) ──────────
-        elif diagram_type == "pie_chart":
-            raw_lines = [l.strip() for l in content.strip().splitlines() if l.strip()]
-            sep = "," if raw_lines and "," in raw_lines[0] else "|"
-            cats = [c.strip() for c in raw_lines[0].split(sep)] if raw_lines else []
-            values = []
-            if len(raw_lines) > 1:
-                try:
-                    values = [float(v.strip()) for v in raw_lines[1].split(sep)]
-                except ValueError:
-                    values = [1.0] * len(cats)
-            series_list = [{"label": title or "Serie 1", "values": values}] if values else []
-
-            cxml = _build_word_chart_xml("pie", cats, series_list, title)
-            ok = _embed_word_chart_native(doc, cxml,
-                                          int(width_in * 914400), int(width_in * 0.8 * 914400))
-            if ok:
-                if title:
-                    from docx.shared import Pt, RGBColor
-                    cap = doc.add_paragraph(title)
-                    cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    for run in cap.runs:
-                        run.font.size = Pt(9); run.font.italic = True
-                        run.font.color.rgb = RGBColor(0x60, 0x60, 0x60)
-                dest = output_path or str(path)
-                doc.save(dest)
-                return f"✅ Diagrama pie_chart OOXML insertado: {dest}"
-            fig, ax = plt.subplots(figsize=(width_in, width_in * 0.8))
-            fig.patch.set_facecolor(st["bg"])
-            ax.pie(values[:len(cats)], labels=cats[:len(values)],
-                   colors=colors[:len(values)], autopct="%1.1f%%",
-                   startangle=140, wedgeprops={"edgecolor": st["bg"], "linewidth": 1.5})
-            if title:
-                ax.set_title(title, color=st["text_c"], fontsize=12, fontweight="bold", pad=10)
-            _apply_chart_style(fig, ax, style_nm, is_pie=True)
-            plt.tight_layout()
-
-        # ── Line chart — native OOXML (with matplotlib fallback) ─────────
-        elif diagram_type in ("line_chart", "line"):
-            raw_lines = [l.strip() for l in content.strip().splitlines() if l.strip()]
-            sep = "," if raw_lines and "," in raw_lines[0] else "|"
-            cats = [c.strip() for c in raw_lines[0].split(sep)] if raw_lines else []
-            values = []
-            if len(raw_lines) > 1:
-                try:
-                    values = [float(v.strip()) for v in raw_lines[1].split(sep)]
-                except ValueError:
-                    values = list(range(len(cats)))
-            series_list: list = []
-            for si, row in enumerate(raw_lines[1:]):
-                try:
-                    row_vals = [float(v.strip()) for v in row.split(sep)]
-                    series_list.append({"label": f"Serie {si+1}", "values": row_vals})
-                except ValueError:
-                    pass
-            if not series_list and values:
-                series_list = [{"label": title or "Serie 1", "values": values}]
-
-            cxml = _build_word_chart_xml("line", cats, series_list, title)
-            ok = _embed_word_chart_native(doc, cxml,
-                                          int(width_in * 914400), int(width_in * 0.6 * 914400))
-            if ok:
-                if title:
-                    from docx.shared import Pt, RGBColor
-                    cap = doc.add_paragraph(title)
-                    cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    for run in cap.runs:
-                        run.font.size = Pt(9); run.font.italic = True
-                        run.font.color.rgb = RGBColor(0x60, 0x60, 0x60)
-                dest = output_path or str(path)
-                doc.save(dest)
-                return f"✅ Diagrama line_chart OOXML insertado: {dest}"
-            fig, ax = plt.subplots(figsize=(width_in, width_in * 0.6))
-            fig.patch.set_facecolor(st["bg"]); ax.set_facecolor(st["bg"])
-            ax.plot(cats[:len(values)], values, color=colors[0], marker="o",
-                    linewidth=2, markersize=6)
-            if title:
-                ax.set_title(title, color=st["text_c"], fontsize=12, fontweight="bold", pad=10)
-            _apply_chart_style(fig, ax, style_nm)
-            plt.tight_layout()
-
-        # ── Unknown type ─────────────────────────────────────────────────
-        else:
-            return (f"Tipo de diagrama no soportado: {diagram_type}. "
-                    f"Usa: flowchart, bar_chart, pie_chart, line_chart, table, org_chart")
-
-        # Save chart image and embed in docx (for flowchart/org_chart matplotlib paths)
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
-            tmp_img = tf.name
-        plt.savefig(tmp_img, dpi=st["dpi"], bbox_inches="tight", facecolor=st["bg"])
-        plt.close("all")
-
-        doc.add_picture(tmp_img, width=Inches(width_in))
-        doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
-        if title:
-            cap = doc.add_paragraph(title)
-            cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            try:
-                from docx.shared import Pt, RGBColor
-                for run in cap.runs:
-                    run.font.size = Pt(9)
-                    run.font.italic = True
-                    run.font.color.rgb = RGBColor(0x60, 0x60, 0x60)
-            except Exception:
-                pass
-
-        dest = output_path or str(path)
-        doc.save(dest)
-        return f"✅ Diagrama insertado ({diagram_type}): {dest}"
-
-    except ImportError as exc:
-        return f"Dependencia no disponible: {exc}. Instala: pip install matplotlib python-docx"
-    except Exception as exc:
-        return f"Error insertando diagrama: {exc}"
-    finally:
-        if tmp_img:
-            try:
-                Path(tmp_img).unlink(missing_ok=True)
-            except Exception:
-                pass
-
-
-def _tool_create_bar_chart(args: dict) -> str:
-    """Inserta gráfica de barras OOXML nativa en .docx (editable), o PNG como respaldo.
-
-    Si 'path' apunta a un .docx, inserta un gráfico DrawingML nativo.
-    Si solo se da 'output' (sin .docx), genera PNG con matplotlib.
-    """
-    doc_path = (args.get("path") or args.get("doc_path", "")).strip()
-    if doc_path and Path(doc_path).expanduser().suffix.lower() == ".docx":
-        p = Path(doc_path).expanduser()
-        if not p.exists():
-            try:
-                from docx import Document as _D
-                _d = _D()
-                _apply_o365_styles_to_new_doc(_d)
-                _d.save(str(p))
-            except Exception:
-                pass
-        ct = "bar_horiz" if args.get("horizontal") else ("stacked_bar" if args.get("stacked") else "bar")
-        return _tool_doc_insert_chart_native({**args, "path": str(p), "chart_type": ct})
-    return _save_chart_image(args, "bar")
-
-
-def _tool_create_pie_chart(args: dict) -> str:
-    """Inserta gráfica circular OOXML nativa en .docx (editable), o PNG como respaldo."""
-    doc_path = (args.get("path") or args.get("doc_path", "")).strip()
-    if doc_path and Path(doc_path).expanduser().suffix.lower() == ".docx":
-        p = Path(doc_path).expanduser()
-        if not p.exists():
-            try:
-                from docx import Document as _D
-                _d = _D()
-                _apply_o365_styles_to_new_doc(_d)
-                _d.save(str(p))
-            except Exception:
-                pass
-        ct = "doughnut" if args.get("donut") else "pie"
-        return _tool_doc_insert_chart_native({**args, "path": str(p), "chart_type": ct})
-    return _save_chart_image(args, "pie")
-
-
-def _tool_create_line_chart(args: dict) -> str:
-    """Inserta gráfica de líneas OOXML nativa en .docx (editable), o PNG como respaldo."""
-    doc_path = (args.get("path") or args.get("doc_path", "")).strip()
-    if doc_path and Path(doc_path).expanduser().suffix.lower() == ".docx":
-        p = Path(doc_path).expanduser()
-        if not p.exists():
-            try:
-                from docx import Document as _D
-                _d = _D()
-                _apply_o365_styles_to_new_doc(_d)
-                _d.save(str(p))
-            except Exception:
-                pass
-        ct = "line_markers" if args.get("markers") else ("area" if args.get("fill_area") else "line")
-        return _tool_doc_insert_chart_native({**args, "path": str(p), "chart_type": ct})
-    return _save_chart_image(args, "line")
-
-
-_CHART_STYLES: dict[str, dict] = {
-    "office": {
-        "colors":    ["#4472C4", "#ED7D31", "#A9D18E", "#FFC000", "#5B9BD5", "#70AD47", "#FF0000", "#7030A0"],
-        "bg":        "white",
-        "grid_c":    "#DDDDDD",
-        "text_c":    "#404040",
-        "spine_c":   "#CCCCCC",
-        "dpi":       200,
-    },
-    "dark": {
-        "colors":    ["#5B9BD5", "#ED7D31", "#A9D18E", "#FF8C00", "#B4C7E7", "#70AD47", "#FF6347", "#DDA0DD"],
-        "bg":        "#1F1F1F",
-        "grid_c":    "#444444",
-        "text_c":    "#E0E0E0",
-        "spine_c":   "#555555",
-        "dpi":       200,
-    },
-    "minimal": {
-        "colors":    ["#2C5F8A", "#5AA0C8", "#8BBFD4", "#B8D8E8", "#D6EAF2", "#92B4C8", "#4A7FA5", "#6EA0BE"],
-        "bg":        "white",
-        "grid_c":    "#EEEEEE",
-        "text_c":    "#555555",
-        "spine_c":   "white",
-        "dpi":       200,
-    },
-    "presentation": {
-        "colors":    ["#2F5496", "#ED7D31", "#70AD47", "#FFC000", "#FF0000", "#7030A0", "#00B0F0", "#92D050"],
-        "bg":        "#F2F2F2",
-        "grid_c":    "#DDDDDD",
-        "text_c":    "#262626",
-        "spine_c":   "#CCCCCC",
-        "dpi":       250,
-    },
-}
-
-
-def _apply_chart_style(fig, ax, style_name: str, is_pie: bool = False) -> None:
-    s = _CHART_STYLES.get(style_name, _CHART_STYLES["office"])
-    fig.patch.set_facecolor(s["bg"])
-    ax.set_facecolor(s["bg"])
-    if not is_pie:
-        ax.grid(True, color=s["grid_c"], linestyle="--", linewidth=0.6, alpha=0.8)
-        for spine in ax.spines.values():
-            spine.set_edgecolor(s["spine_c"])
-    ax.tick_params(colors=s["text_c"], labelsize=10)
-    for lbl in ax.get_xticklabels() + ax.get_yticklabels():
-        lbl.set_color(s["text_c"])
-    if ax.get_title():
-        ax.title.set_color(s["text_c"])
-    if ax.get_xlabel():
-        ax.xaxis.label.set_color(s["text_c"])
-    if ax.get_ylabel():
-        ax.yaxis.label.set_color(s["text_c"])
-
-
-def _save_chart_image(args: dict, chart_type: str) -> str:
-    """Helper mejorado: genera imagen de gráfica con matplotlib (multi-series, estilos, ejes)."""
-    output    = args.get("output", f"/tmp/chart_{chart_type}.png")
-    data      = args.get("data", {})
-    title     = args.get("title", "")
-    x_label   = args.get("x_label", "")
-    y_label   = args.get("y_label", "")
-    style_nm  = args.get("style", "office")
-    horizontal= args.get("horizontal", False)
-    stacked   = args.get("stacked", False)
-    donut     = args.get("donut", False)
-    fill_area = args.get("fill_area", False)
-    width     = args.get("width", 8)
-    height    = args.get("height", 5)
-
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import numpy as np
-
-        st     = _CHART_STYLES.get(style_nm, _CHART_STYLES["office"])
-        colors = st["colors"]
-
-        fig, ax = plt.subplots(figsize=(width, height))
-        fig.patch.set_facecolor(st["bg"])
-        ax.set_facecolor(st["bg"])
-
-        if chart_type == "bar":
-            categories  = data.get("categories", [])
-            # Multi-series support: series=[{label, values}] OR single values list
-            series_list = data.get("series", [])
-            if series_list:
-                n_series  = len(series_list)
-                x         = np.arange(len(categories))
-                width_bar = 0.8 / n_series
-                bottoms   = np.zeros(len(categories)) if stacked else None
-                for i, serie in enumerate(series_list):
-                    vals   = serie.get("values", [])
-                    label  = serie.get("label", f"Serie {i+1}")
-                    color  = colors[i % len(colors)]
-                    offset = 0 if stacked else (i - n_series/2 + 0.5) * width_bar
-                    if horizontal:
-                        bars = ax.barh([c + offset for c in x], vals, width_bar,
-                                       label=label, color=color,
-                                       left=bottoms if stacked else None, alpha=0.85)
-                    else:
-                        bars = ax.bar(x + offset, vals, width_bar,
-                                      label=label, color=color,
-                                      bottom=bottoms if stacked else None, alpha=0.85)
-                    if stacked and bottoms is not None:
-                        bottoms = bottoms + np.array(vals, dtype=float)
-                ax.legend(fontsize=9, facecolor=st["bg"], labelcolor=st["text_c"])
-                if horizontal:
-                    ax.set_yticks(x)
-                    ax.set_yticklabels(categories)
-                else:
-                    ax.set_xticks(x)
-                    ax.set_xticklabels(categories)
-            else:
-                values = data.get("values", [])
-                if horizontal:
-                    bars = ax.barh(categories, values, color=colors[:len(values)], alpha=0.85)
-                    ax.bar_label(bars, fmt="%.0f", padding=4, color=st["text_c"])
-                else:
-                    bars = ax.bar(categories, values, color=colors[:len(values)], alpha=0.85)
-                    ax.bar_label(bars, fmt="%.0f", padding=2, color=st["text_c"])
-
-        elif chart_type == "pie":
-            labels  = data.get("labels", [])
-            sizes   = data.get("sizes", [])
-            explode_list = data.get("explode", None)
-            wedge_args: dict = {}
-            if donut:
-                wedge_args["wedgeprops"] = {"width": 0.5}
-            ax.pie(sizes, labels=labels, colors=colors[:len(labels)],
-                   autopct="%1.1f%%", startangle=90,
-                   explode=explode_list, **wedge_args)
-            ax.axis("equal")
-
-        elif chart_type == "line":
-            series_list = data.get("series", [])
-            if series_list:
-                x_labels = data.get("x_labels", list(range(len(series_list[0].get("values", [])))))
-                x_pos    = list(range(len(x_labels)))
-                for i, serie in enumerate(series_list):
-                    vals  = serie.get("values", [])
-                    label = serie.get("label", f"Serie {i+1}")
-                    col   = colors[i % len(colors)]
-                    ax.plot(x_pos, vals, marker="o", color=col, linewidth=2.5, label=label)
-                    if fill_area:
-                        ax.fill_between(x_pos, vals, alpha=0.08, color=col)
-                ax.set_xticks(x_pos)
-                ax.set_xticklabels(x_labels, rotation=30, ha="right")
-                ax.legend(fontsize=9, facecolor=st["bg"], labelcolor=st["text_c"])
-            else:
-                x_labels = data.get("x_labels", [])
-                y_values = data.get("y_values", [])
-                x_pos    = list(range(len(x_labels)))
-                ax.plot(x_pos, y_values, marker="o", color=colors[0], linewidth=2.5)
-                if fill_area:
-                    ax.fill_between(x_pos, y_values, alpha=0.1, color=colors[0])
-                ax.set_xticks(x_pos)
-                ax.set_xticklabels(x_labels, rotation=30, ha="right")
-
-        if title:
-            ax.set_title(title, fontsize=14, fontweight="bold", color=st["text_c"], pad=12)
-        if x_label:
-            ax.set_xlabel(x_label, fontsize=11, color=st["text_c"])
-        if y_label:
-            ax.set_ylabel(y_label, fontsize=11, color=st["text_c"])
-
-        _apply_chart_style(fig, ax, style_nm, is_pie=(chart_type == "pie"))
-        plt.tight_layout()
-        Path(output).parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(output, dpi=st["dpi"], bbox_inches="tight", facecolor=st["bg"])
-        plt.close(fig)
-        return f"✅ Gráfica {chart_type} guardada en: {output}"
-
-    except ImportError as e:
-        return f"matplotlib no disponible: {e}\nInstala: pip install matplotlib"
-    except Exception as exc:
-        return f"Error creando gráfica: {exc}"
 
 
 def _tool_pptx_create(args: dict) -> str:
@@ -2196,7 +1292,6 @@ def _tool_pptx_create(args: dict) -> str:
         from pptx import Presentation
         from pptx.util import Inches, Pt
         from pptx.dml.color import RGBColor
-        from pptx.enum.text import PP_ALIGN
     except ImportError:
         return "python-pptx no disponible. Instala con: pip install python-pptx"
 
@@ -2275,7 +1370,6 @@ def _tool_pptx_add_slide(args: dict) -> str:
     try:
         from pptx import Presentation
         from pptx.util import Pt
-        from pptx.dml.color import RGBColor
         prs = Presentation(str(path))
         layout_idx = {"bullet": 1, "blank": 6, "two_col": 3, "title_only": 5}.get(layout, 1)
         sl = prs.slides.add_slide(prs.slide_layouts[min(layout_idx, len(prs.slide_layouts)-1)])
@@ -2338,8 +1432,7 @@ def _tool_pptx_insert_chart(args: dict) -> str:
         from pptx import Presentation
         from pptx.chart.data import CategoryChartData
         from pptx.enum.chart import XL_CHART_TYPE
-        from pptx.util import Inches, Pt
-        from pptx.dml.color import RGBColor
+        from pptx.util import Inches
     except ImportError:
         return "python-pptx no disponible. Instala con: pip install python-pptx"
 
@@ -2460,7 +1553,6 @@ def _tool_doc_apply_style(args: dict) -> str:
         return f"Fichero no encontrado: {path}"
     try:
         from docx import Document
-        from docx.oxml.ns import qn
         doc = Document(str(path))
         applied = 0
         paras = doc.paragraphs
@@ -2859,7 +1951,6 @@ def _tool_doc_word_count(args: dict) -> str:
 def _tool_xlsx_read(args: dict) -> str:
     path   = Path(args.get("path", "")).expanduser()
     sheet  = args.get("sheet", "")
-    rng    = args.get("range", "")
     limit  = int(args.get("limit", 50))
     if not path:
         return "Parámetro requerido: path"
@@ -3078,7 +2169,6 @@ def _tool_cal_list(args: dict) -> str:
     if not ics_path.exists():
         return f"Fichero de calendario no encontrado: {ics_path}\nConfigura 'calendar_file' en {_CONFIG_PATH}"
     events = _parse_ics_events(ics_path)
-    today = datetime.date.today()
     result_events = []
     for ev in events:
         dt_str = ev.get("DTSTART", "")
@@ -3185,12 +2275,6 @@ def _tool_cal_search(args: dict) -> str:
 
 # ── Notes tools ──────────────────────────────────────────────────────────────
 
-def _notes_dir(cfg: dict) -> Path:
-    d = Path(cfg["notes_dir"]).expanduser()
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
 def _tool_notes_list(args: dict) -> str:
     cfg     = _load_config()
     dirpath = Path(args.get("directory", cfg["notes_dir"])).expanduser()
@@ -3230,10 +2314,8 @@ def _tool_notes_search(args: dict) -> str:
     # ripgrep o grep
     if shutil.which("rg"):
         rc, out, err = _run(["rg", "--color=never", "-l", "-i", query, str(dirpath)], timeout=15)
-        tool = "rg"
     else:
         rc, out, err = _run(["grep", "-r", "-l", "-i", query, str(dirpath)], timeout=15)
-        tool = "grep"
     if rc != 0 and not out:
         return f"Sin resultados para: {query}"
     files = [Path(p) for p in out.strip().splitlines() if p][:limit]
@@ -3347,51 +2429,6 @@ def _tool_contact_search(args: dict) -> str:
         if email_v: lines.append(f"    Email:   {email_v}")
         if tel_v:   lines.append(f"    Tel:     {tel_v}")
     return "\n".join(lines)
-
-
-def _tool_markdown_to_html(args: dict) -> str:
-    import shutil
-    content = args.get("content", "")
-    path    = args.get("path", "")
-    output  = args.get("output", "")
-    if path:
-        p = Path(path).expanduser()
-        if not p.exists():
-            return f"Fichero no encontrado: {p}"
-        content = p.read_text(errors="replace")
-    if not content:
-        return "Parámetro requerido: content (markdown) o path (ruta a fichero .md)"
-    # Intento 1: markdown lib
-    try:
-        import markdown as md_lib
-        html = md_lib.markdown(content, extensions=["tables", "fenced_code", "nl2br"])
-        html = f"<!DOCTYPE html>\n<html>\n<body>\n{html}\n</body>\n</html>"
-        if output:
-            Path(output).expanduser().write_text(html)
-            return f"✅ HTML escrito en: {output}\n{html[:500]}…"
-        return html[:6000]
-    except ImportError:
-        pass
-    # Intento 2: pandoc
-    if shutil.which("pandoc"):
-        cmd = ["pandoc", "-f", "markdown", "-t", "html", "--standalone"]
-        rc, out, err = _run(cmd, timeout=15, input_text=content)
-        if rc == 0:
-            if output:
-                Path(output).expanduser().write_text(out)
-                return f"✅ HTML escrito en: {output}"
-            return out[:6000]
-    # Fallback: conversión básica manual
-    html = content
-    html = re.sub(r"^# (.+)$",  r"<h1>\1</h1>",  html, flags=re.MULTILINE)
-    html = re.sub(r"^## (.+)$", r"<h2>\1</h2>",  html, flags=re.MULTILINE)
-    html = re.sub(r"^### (.+)$",r"<h3>\1</h3>",  html, flags=re.MULTILINE)
-    html = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", html)
-    html = re.sub(r"\*(.+?)\*",     r"<em>\1</em>",         html)
-    html = re.sub(r"`(.+?)`",       r"<code>\1</code>",      html)
-    html = html.replace("\n\n", "</p>\n<p>")
-    html = f"<p>{html}</p>"
-    return html[:6000]
 
 
 # ── Bloque 1: Workspace / Proyecto ───────────────────────────────────────────
@@ -3563,12 +2600,19 @@ def _tool_doc_project_save(args: dict) -> str:
             i += 1
 
     if save_path.suffix.lower() == ".docx":
-        err = _write_docx_from_markdown(content, save_path)
-        if err:
+        # Documento O365 nativo: crea el .docx con estilos y vuelca el texto como
+        # párrafos nativos (énfasis inline). Para estructura rica, usar doc_create.
+        try:
+            from docx import Document as _Doc
+            _d = _Doc()
+            _apply_o365_styles_to_new_doc(_d)
+            _render_native_paragraphs(_d, content)
+            _d.save(str(save_path))
+        except Exception as exc:
             save_path = save_path.with_suffix(".md")
             save_path.write_text(content)
             return (
-                f"⚠ {err}\n✅ Guardado como Markdown: {save_path}\n"
+                f"⚠ No se pudo generar .docx nativo ({exc}); guardado como Markdown: {save_path}\n"
                 f"   Tipo: {doc_type}  |  Tamaño: {save_path.stat().st_size:,} bytes"
             )
     else:
@@ -4018,7 +3062,6 @@ def _tool_asset_register_add(args: dict) -> str:
         return 'Parámetro requerido: asset (objeto JSON con datos del activo, p.ej. {"hostname": "srv-01", "ip": "10.0.0.1"})'
     if "fecha_registro" not in asset:
         asset = {**asset, "fecha_registro": datetime.date.today().isoformat()}
-    cfg = _load_config()
     cwd = Path.cwd()
     path_arg = args.get("register_path", "") or args.get("path", "")
     if path_arg:
@@ -4714,7 +3757,6 @@ def _apply_o365_styles_to_new_doc(doc) -> None:
     from docx.shared import Pt, RGBColor, Cm
     from docx.oxml.ns import qn
     from docx.oxml import OxmlElement
-    import copy
 
     # Office theme accent colors (matches Word default Office theme)
     _H_COLORS = {
@@ -4997,375 +4039,32 @@ def _md_fill_para_inline(para, text: str) -> None:
         para.add_run(text[pos:])
 
 
-def _md_populate_doc(doc, content: str, is_new_doc: bool = False) -> None:
-    """Populate a python-docx Document with rich markdown content using O365 styles.
+def _render_native_paragraphs(doc, text: str) -> int:
+    """Renderiza texto como párrafos nativos de Word (con énfasis inline **/*/`).
 
-    Handles: H1-H6, ATX/setext headings, bold/italic/code/strike/link inline,
-    bullet/numbered lists (nested), GFM tables with header shading, fenced code
-    blocks, blockquotes, horizontal rules, images, page breaks.
-
-    If *is_new_doc* is True, applies O365 default styles before populating.
-    Always preserves styles from a company template if already loaded in *doc*.
+    No es un conversor markdown: separa por líneas en blanco y crea un párrafo
+    nativo por bloque, aplicando solo el formato inline de runs (negrita/cursiva/
+    código) vía _md_fill_para_inline. Pensado para volcar texto plano en O365.
     """
-    import re as _re
-    from docx.shared import Pt, RGBColor, Inches, Cm
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-    from docx.oxml.ns import qn
-    from docx.oxml import OxmlElement
-
-    if is_new_doc:
-        _apply_o365_styles_to_new_doc(doc)
-
-    style_names = {s.name for s in doc.styles}
-
-    def _safe(name: str, fallback: str = "Normal") -> str:
-        return name if name in style_names else fallback
-
-    def _add_h(text: str, level: int):
-        style_nm = f"Heading {level}"
+    n = 0
+    for para_text in str(text or "").split("\n\n"):
+        para_text = para_text.strip()
+        if not para_text:
+            continue
         p = doc.add_paragraph()
-        try:
-            p.style = doc.styles[_safe(style_nm)]
-        except Exception:
-            pass
-        # Strip inline markdown from heading text (headings are plain)
-        clean = _re.sub(r'\*\*(.+?)\*\*', r'\1',
-                _re.sub(r'\*(.+?)\*', r'\1',
-                _re.sub(r'`(.+?)`', r'\1', text)))
-        p.add_run(clean)
-        return p
-
-    def _add_para(text: str, style: str = "Normal") -> object:
-        p = doc.add_paragraph()
-        try:
-            p.style = doc.styles[_safe(style)]
-        except Exception:
-            pass
-        _md_fill_para_inline(p, text)
-        return p
-
-    def _shade_cell(cell, hex_color: str):
-        """Apply background shading to a table cell."""
-        try:
-            tc = cell._tc
-            tcPr = tc.get_or_add_tcPr()
-            shd = OxmlElement("w:shd")
-            shd.set(qn("w:val"), "clear")
-            shd.set(qn("w:color"), "auto")
-            shd.set(qn("w:fill"), hex_color)
-            tcPr.append(shd)
-        except Exception:
-            pass
-
-    def _flush_table(buf: list) -> None:
-        if not buf:
-            return
-        n_cols = max(len(r) for r in buf)
-        tbl = doc.add_table(rows=len(buf), cols=n_cols)
-        try:
-            tbl.style = doc.styles[_safe("Table Grid")]
-        except Exception:
-            pass
-        for r_i, row in enumerate(buf):
-            for c_i, cell_txt in enumerate(row):
-                if c_i < n_cols:
-                    cell = tbl.rows[r_i].cells[c_i]
-                    cell.text = ""
-                    p = cell.paragraphs[0]
-                    p.paragraph_format.space_before = Pt(4)
-                    p.paragraph_format.space_after  = Pt(4)
-                    _md_fill_para_inline(p, cell_txt.strip())
-                    if r_i == 0:
-                        # Header row: bold + blue background
-                        for run in p.runs:
-                            run.bold = True
-                            run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-                        _shade_cell(cell, "2F5496")
-                    elif r_i % 2 == 0:
-                        _shade_cell(cell, "EEF3FB")  # alternate row light blue
-        # Auto-fit columns
-        try:
-            tbl.autofit = True
-        except Exception:
-            pass
-
-    def _add_code_block(code_text: str, lang: str = ""):
-        """Add a code block paragraph with Consolas font and light grey background."""
-        p = doc.add_paragraph()
-        try:
-            p.style = doc.styles[_safe("No Spacing", "Normal")]
-        except Exception:
-            pass
-        # Light grey background via paragraph shading
-        try:
-            pPr = p._p.get_or_add_pPr()
-            shd = OxmlElement("w:shd")
-            shd.set(qn("w:val"), "clear")
-            shd.set(qn("w:color"), "auto")
-            shd.set(qn("w:fill"), "F2F2F2")
-            pPr.append(shd)
-            # Left border (code bar)
-            pBdr = OxmlElement("w:pBdr")
-            left = OxmlElement("w:left")
-            left.set(qn("w:val"), "single")
-            left.set(qn("w:sz"), "18")
-            left.set(qn("w:space"), "4")
-            left.set(qn("w:color"), "4472C4")
-            pBdr.append(left)
-            pPr.append(pBdr)
-            # Indent
-            ind = OxmlElement("w:ind")
-            ind.set(qn("w:left"), "360")
-            pPr.append(ind)
-        except Exception:
-            pass
-        run = p.add_run(code_text)
-        run.font.name = "Consolas"
-        try:
-            run.font.size = Pt(9)
-            run.font.color.rgb = RGBColor(0x26, 0x26, 0x26)
-        except Exception:
-            pass
-        return p
-
-    lines  = content.splitlines()
-    i      = 0
-    tbl_buf: list = []
-    list_stack: list = []  # track nested list levels
-
-    while i < len(lines):
-        line = lines[i]
-
-        # Fenced code block (``` or ~~~)
-        m_fence = _re.match(r"^(`{3,}|~{3,})(\w*)", line.strip())
-        if m_fence:
-            if tbl_buf: _flush_table(tbl_buf); tbl_buf = []
-            fence_char = m_fence.group(1)[0]
-            lang = m_fence.group(2)
-            code_lines: list = []
-            i += 1
-            while i < len(lines) and not _re.match(r"^" + fence_char + r"{3,}", lines[i].strip()):
-                code_lines.append(lines[i])
-                i += 1
-            _add_code_block("\n".join(code_lines), lang)
-            i += 1
-            continue
-
-        # Horizontal rule
-        if _re.match(r"^(\*{3,}|-{3,}|_{3,})\s*$", line.strip()):
-            if tbl_buf: _flush_table(tbl_buf); tbl_buf = []
-            sep = doc.add_paragraph()
-            try:
-                pPr = sep._p.get_or_add_pPr()
-                pBdr = OxmlElement("w:pBdr")
-                bot = OxmlElement("w:bottom")
-                bot.set(qn("w:val"), "single")
-                bot.set(qn("w:sz"), "6")
-                bot.set(qn("w:space"), "1")
-                bot.set(qn("w:color"), "CCCCCC")
-                pBdr.append(bot)
-                pPr.append(pBdr)
-            except Exception:
-                sep.add_run("─" * 72)
-            i += 1
-            continue
-
-        # ATX heading (#, ##, ...)
-        m_h = _re.match(r"^(#{1,6})\s+(.*)", line)
-        if m_h:
-            if tbl_buf: _flush_table(tbl_buf); tbl_buf = []
-            _add_h(m_h.group(2).strip(), len(m_h.group(1)))
-            i += 1
-            continue
-
-        # Setext heading (=== or ---)
-        if i + 1 < len(lines):
-            nxt = lines[i + 1]
-            if _re.match(r"^={3,}\s*$", nxt) and line.strip():
-                if tbl_buf: _flush_table(tbl_buf); tbl_buf = []
-                _add_h(line.strip(), 1); i += 2; continue
-            if _re.match(r"^-{3,}\s*$", nxt) and line.strip() and not _re.match(r"^\|", line.strip()):
-                if tbl_buf: _flush_table(tbl_buf); tbl_buf = []
-                _add_h(line.strip(), 2); i += 2; continue
-
-        # GFM table row
-        if "|" in line and line.strip().startswith("|"):
-            stripped = line.strip()
-            if _re.match(r"^\|[\s\|\-:]+\|?\s*$", stripped):  # separator row
-                i += 1; continue
-            cells = [c.strip() for c in stripped.strip("|").split("|")]
-            tbl_buf.append(cells)
-            i += 1
-            continue
-        else:
-            if tbl_buf: _flush_table(tbl_buf); tbl_buf = []
-
-        # Blockquote (> text or >text)
-        if line.startswith("> ") or (line.startswith(">") and len(line) > 1 and not line.startswith(">>")):
-            bq_text = line[2:] if line.startswith("> ") else line[1:]
-            p_bq = doc.add_paragraph()
-            try:
-                p_bq.style = doc.styles[_safe("Intense Quote", _safe("Quote", "Normal"))]
-            except Exception:
-                pass
-            _md_fill_para_inline(p_bq, bq_text)
-            try:
-                pPr = p_bq._p.get_or_add_pPr()
-                pBdr = OxmlElement("w:pBdr")
-                left = OxmlElement("w:left")
-                left.set(qn("w:val"), "single")
-                left.set(qn("w:sz"), "24")
-                left.set(qn("w:space"), "4")
-                left.set(qn("w:color"), "5B9BD5")
-                pBdr.append(left)
-                pPr.append(pBdr)
-                shd = OxmlElement("w:shd")
-                shd.set(qn("w:val"), "clear")
-                shd.set(qn("w:color"), "auto")
-                shd.set(qn("w:fill"), "F0F4FA")
-                pPr.append(shd)
-                ind = OxmlElement("w:ind")
-                ind.set(qn("w:left"), "720")
-                ind.set(qn("w:right"), "360")
-                pPr.append(ind)
-            except Exception:
-                pass
-            i += 1
-            continue
-
-        # Bullet list (supports -, *, +; nested via indent)
-        m_ul = _re.match(r"^(\s*)([-*+])\s+(.*)", line)
-        if m_ul:
-            indent_spaces = len(m_ul.group(1))
-            level = min(indent_spaces // 2 + 1, 3)
-            style_nm = f"List Bullet{' ' + str(level) if level > 1 else ''}"
-            p = doc.add_paragraph()
-            try:
-                p.style = doc.styles[_safe(style_nm, "List Bullet")]
-            except Exception:
-                pass
-            _md_fill_para_inline(p, m_ul.group(3))
-            i += 1
-            continue
-
-        # Numbered list
-        m_ol = _re.match(r"^(\s*)(\d+)[.)]\s+(.*)", line)
-        if m_ol:
-            indent_spaces = len(m_ol.group(1))
-            level = min(indent_spaces // 3 + 1, 3)
-            style_nm = f"List Number{' ' + str(level) if level > 1 else ''}"
-            p = doc.add_paragraph()
-            try:
-                p.style = doc.styles[_safe(style_nm, "List Number")]
-            except Exception:
-                pass
-            _md_fill_para_inline(p, m_ol.group(3))
-            i += 1
-            continue
-
-        # Inline image on its own line
-        m_img = _re.match(r"^!\[([^\]]*)\]\(([^\)]+)\)\s*$", line.strip())
-        if m_img:
-            img_p = Path(m_img.group(2)).expanduser()
-            if img_p.exists():
-                try:
-                    doc.add_picture(str(img_p), width=Inches(5.5))
-                    doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    # Add caption
-                    alt = m_img.group(1)
-                    if alt:
-                        cap = doc.add_paragraph(alt)
-                        cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                        try:
-                            cap.style = doc.styles[_safe("Caption", "Normal")]
-                        except Exception:
-                            for run in cap.runs:
-                                run.font.size = Pt(9)
-                                run.italic = True
-                except Exception:
-                    doc.add_paragraph(f"[Imagen: {m_img.group(1)}]")
-            else:
-                doc.add_paragraph(f"[Imagen no encontrada: {m_img.group(2)}]")
-            i += 1
-            continue
-
-        # Page break keyword
-        if line.strip().lower() in ("<pagebreak>", "<!-- pagebreak -->", "[pagebreak]", "\\pagebreak"):
-            doc.add_page_break()
-            i += 1
-            continue
-
-        # Empty line — skip (Word handles paragraph spacing via style spacing)
-        if not line.strip():
-            i += 1
-            continue
-
-        # Regular paragraph
-        _add_para(line, "Normal")
-        i += 1
-
-    if tbl_buf:
-        _flush_table(tbl_buf)
-
-
-def _write_docx_from_markdown(content: str, path: Path, reference_doc: str = "") -> str | None:
-    """Convert markdown text to a professional .docx with O365 styles.
-
-    Uses python-docx with _apply_o365_styles_to_new_doc for fresh docs.
-    If *reference_doc* is given (.docx/.dotx company template), inherits
-    all styles, page layout, fonts and branding from it.
-    Falls back to pandoc if python-docx fails.
-    Returns None on success or an error string.
-    """
-    try:
-        from docx import Document as _Doc
-        from docx.oxml.ns import qn
-
-        is_new = not bool(reference_doc)
-        if reference_doc:
-            ref = Path(reference_doc).expanduser()
-            if ref.exists():
-                doc = _Doc(str(ref))
-                if ref.suffix.lower() in (".dotx", ".dot"):
-                    body = doc.element.body
-                    for p in body.findall(qn("w:p"))[:-1]:
-                        body.remove(p)
-                    for t in body.findall(qn("w:tbl")):
-                        body.remove(t)
-            else:
-                doc = _Doc()
-                is_new = True
-        else:
-            doc = _Doc()
-
-        _md_populate_doc(doc, content, is_new_doc=is_new)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        doc.save(str(path))
-        return None
-
-    except ImportError:
-        try:
-            import subprocess as _sp
-            ref_args = ["--reference-doc", reference_doc] if reference_doc and Path(reference_doc).exists() else []
-            r = _sp.run(
-                ["pandoc", "-f", "markdown", "-t", "docx",
-                 "--highlight-style=tango"] + ref_args + ["-o", str(path)],
-                input=content, text=True, capture_output=True, timeout=30,
-            )
-            if r.returncode == 0 and path.exists() and path.stat().st_size > 0:
-                return None
-        except (FileNotFoundError, Exception):
-            pass
-        return "python-docx no disponible — instala con: pip install python-docx"
-    except Exception as exc:
-        return f"Error generando .docx: {exc}"
+        _md_fill_para_inline(p, para_text.replace("\n", " "))
+        n += 1
+    return n
 
 
 def _tool_doc_create(args: dict) -> str:
     """Create a professional Word (.docx) or Excel (.xlsx) or PowerPoint (.pptx) document
     from scratch with O365-quality formatting.
 
-    For .docx: accepts markdown content OR structured content_blocks.
+    Usa SIEMPRE content_blocks (contenido O365 NATIVO). El parámetro `markdown` solo
+    vuelca texto plano como párrafos nativos (con énfasis inline **/*/`) — NO genera
+    estructura (headings, listas, tablas): para eso usa content_blocks.
+
     For .xlsx: creates a formatted workbook with sheets and data.
     For .pptx: creates a presentation with slides.
 
@@ -5384,7 +4083,7 @@ def _tool_doc_create(args: dict) -> str:
       {"type": "image",         "path": "/ruta/img.png", "width_inches": 5.0,
                                 "caption": "Fig 1", "align": "center|left|right"}
       {"type": "code_block",    "code": "...", "language": "python"}
-      {"type": "markdown",      "text": "# H1\\n**bold** párrafo..."}
+      {"type": "markdown",      "text": "Texto plano con **negrita**/*cursiva* inline (NO parsea # ni listas)"}
       {"type": "checklist",     "items": [{"text":"Tarea 1","checked":true}, "Tarea 2"]}
       {"type": "callout",       "callout_type": "info|tip|note|warning|error|success",
                                 "title": "Título opcional", "text": "Mensaje..."}
@@ -5418,14 +4117,40 @@ def _tool_doc_create(args: dict) -> str:
 
     theme: office (default) | modern | professional | minimal | corporate
     """
+    # Coerce args that LLMs sometimes pass as JSON strings instead of native types
+    def _coerce_json(val, default):
+        if isinstance(val, str) and val.strip():
+            try:
+                import json as _json
+                return _json.loads(val)
+            except Exception:
+                return val
+        return val if val else default
+
+    def _norm_blocks(blocks):
+        """Normalize a content_blocks list: wrap plain strings as paragraph blocks
+        and drop entries that are neither str nor dict (avoids 'str'.get errors)."""
+        if isinstance(blocks, dict):
+            blocks = [blocks]
+        out = []
+        for b in (blocks or []):
+            if isinstance(b, str):
+                out.append({"type": "paragraph", "text": b})
+            elif isinstance(b, dict):
+                out.append(b)
+            # else: silently skip non-str/non-dict entries
+        return out
+
     path           = Path(args.get("path", "")).expanduser()
     theme          = args.get("theme", "office")
     fmt            = args.get("format", "").lower() or (path.suffix.lstrip(".").lower() if path.suffix else "docx")
     markdown       = args.get("markdown", "")
-    content_blocks = args.get("content_blocks", [])
+    content_blocks = _norm_blocks(_coerce_json(args.get("content_blocks", []), []))
     title          = args.get("title", "")
     subtitle       = args.get("subtitle", "")
-    metadata       = args.get("metadata", {})  # author, subject, company, keywords
+    metadata       = _coerce_json(args.get("metadata", {}), {})  # author, subject, company, keywords
+    if not isinstance(metadata, dict):
+        metadata = {}
     template_path  = args.get("template_path", args.get("reference_doc", ""))
 
     if not path:
@@ -5441,7 +4166,7 @@ def _tool_doc_create(args: dict) -> str:
     if ext in (".docx", ".dotx"):
         try:
             from docx import Document
-            from docx.shared import Pt, RGBColor, Inches, Cm
+            from docx.shared import Pt, RGBColor, Inches
             from docx.enum.text import WD_ALIGN_PARAGRAPH
             from docx.oxml.ns import qn
             from docx.oxml import OxmlElement
@@ -5473,7 +4198,6 @@ def _tool_doc_create(args: dict) -> str:
                         body.remove(_t)
                 # Use template heading colors for theme overrides
                 try:
-                    from docx.oxml.ns import qn as _qn2
                     _h1 = doc.styles.get("Heading 1") if hasattr(doc.styles, 'get') else None
                     if _h1 and _h1.font.color.rgb:
                         r, g, b = _h1.font.color.rgb.red, _h1.font.color.rgb.green, _h1.font.color.rgb.blue
@@ -5879,7 +4603,7 @@ def _tool_doc_create(args: dict) -> str:
                     cxml = _build_word_chart_xml(c_type, c_cats, c_series, c_title)
                     ok   = _embed_word_chart_native(doc, cxml, int(w_in*914400), int(h_in*914400))
                     if not ok:
-                        doc.add_paragraph(f"[Gráfica '{c_type}' — OOXML no disponible, usa doc_insert_chart_native]")
+                        doc.add_paragraph(f"[Gráfica '{c_type}' — OOXML no disponible, usa insert_chart]")
                     elif c_title:
                         cap = doc.add_paragraph()
                         cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -5891,11 +4615,10 @@ def _tool_doc_create(args: dict) -> str:
                     doc.add_paragraph(f"[Gráfica sin datos: especifica data.series o data.values]")
 
             elif btype == "markdown":
-                _md_populate_doc(doc, block.get("text", ""), is_new_doc=False)
+                _render_native_paragraphs(doc, block.get("text", ""))
 
             elif btype == "code_block":
                 code = block.get("code", block.get("text", ""))
-                lang = block.get("language", block.get("lang", ""))
                 for code_line in (code.splitlines() or [""]):
                     p = doc.add_paragraph()
                     try:
@@ -6089,13 +4812,12 @@ def _tool_doc_create(args: dict) -> str:
 
             n_blocks += 1
 
-        # If only markdown given (no content_blocks)
+        # Texto plano suelto (sin content_blocks): se vuelca como párrafos nativos
         if markdown and not content_blocks:
             if title:
                 _add_cover_title(title, subtitle)
                 doc.add_paragraph()
-            _md_populate_doc(doc, markdown, is_new_doc=False)
-            n_blocks += 1
+            n_blocks += _render_native_paragraphs(doc, markdown)
 
         doc.save(str(path))
         _tpl_note = f"  |  Plantilla: {Path(template_path).name}" if _used_template else ""
@@ -6107,13 +4829,16 @@ def _tool_doc_create(args: dict) -> str:
 
     # ── Excel .xlsx ─────────────────────────────────────────────────────────
     elif ext == ".xlsx":
-        sheets = args.get("sheets", [])
+        sheets = _coerce_json(args.get("sheets", []), [])
+        if isinstance(sheets, dict):
+            sheets = [sheets]
+        sheets = [s for s in (sheets or []) if isinstance(s, dict)]
         if not sheets and args.get("headers"):
             sheets = [{"name": args.get("sheet", "Hoja1"), "headers": args["headers"],
                        "rows": args.get("rows", []), "title": title}]
         try:
             import openpyxl
-            from openpyxl.styles import Font, PatternFill, Alignment, Border, Side, numbers
+            from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
             from openpyxl.utils import get_column_letter
             from openpyxl.worksheet.table import Table, TableStyleInfo
 
@@ -6156,7 +4881,6 @@ def _tool_doc_create(args: dict) -> str:
                 ws.row_dimensions[data_start].height = 22
 
                 # Data rows
-                thin = Side(style="thin", color="CCCCCC")
                 for r_i, row_data in enumerate(rows_data):
                     row_list = list(row_data) if not isinstance(row_data, list) else row_data
                     fill = PatternFill("solid", fgColor="EEF3FB") if r_i % 2 == 0 else PatternFill()
@@ -6252,7 +4976,6 @@ def _tool_doc_create(args: dict) -> str:
                             pct      = cf_def.get("percent", False)
                             bottom   = cf_def.get("bottom", cf_type == "bottom")
                             fc       = cf_def.get("fill_color", "FFD700")
-                            formula  = f'RANK(A1,A$1:A$100)<="{rank}"'
                             rule = Rule(
                                 type="top10",
                                 rank=rank,
@@ -6307,8 +5030,6 @@ def _tool_doc_create(args: dict) -> str:
                         from openpyxl.chart import (BarChart, LineChart, PieChart, AreaChart,
                                                      ScatterChart, DoughnutChart, RadarChart,
                                                      BubbleChart, Reference, Series)
-                        from openpyxl.chart.series import SeriesLabel
-                        from openpyxl.chart.label import DataLabel
                         _CH_TYPE_MAP = {
                             "bar":                 ("bar",     "col", "clustered"),
                             "column":              ("bar",     "col", "clustered"),
@@ -6448,7 +5169,10 @@ def _tool_doc_create(args: dict) -> str:
 
     # ── PowerPoint .pptx ─────────────────────────────────────────────────────
     elif ext == ".pptx":
-        slides_data = args.get("slides", [])
+        slides_data = _coerce_json(args.get("slides", []), [])
+        if isinstance(slides_data, dict):
+            slides_data = [slides_data]
+        slides_data = [s for s in (slides_data or []) if isinstance(s, dict)]
         try:
             from pptx import Presentation
             from pptx.util import Inches, Pt, Emu
@@ -6476,7 +5200,6 @@ def _tool_doc_create(args: dict) -> str:
                     bg_t = bg_override.get("type", "solid")
                     if bg_t == "gradient":
                         try:
-                            from lxml import etree as _et
                             # Build gradient XML directly — python-pptx gradient API
                             bg.fill.gradient()
                             gs = bg.fill.gradient_stops
@@ -6564,7 +5287,7 @@ def _tool_doc_create(args: dict) -> str:
             def _add_pptx_chart_native(slide, ch_def: dict):
                 """Add a native python-pptx chart to a slide."""
                 try:
-                    from pptx.chart.data import ChartData, CategoryChartData
+                    from pptx.chart.data import CategoryChartData
                     from pptx.enum.chart import XL_CHART_TYPE
                     _XL = {
                         "bar":       XL_CHART_TYPE.BAR_CLUSTERED,
@@ -6807,8 +5530,6 @@ def _tool_doc_create(args: dict) -> str:
                         lines = code.splitlines() or [""]
                         h_in = float(blk.get("height", max(0.3 * len(lines), 0.5)))
                         try:
-                            from pptx.util import Pt as _Pt2
-                            from pptx.enum.shapes import MSO_SHAPE_TYPE
                             code_shape = slide.shapes.add_textbox(
                                 Inches(x_in), Inches(y_in), Inches(w_in), Inches(h_in)
                             )
@@ -6896,7 +5617,11 @@ def _tool_doc_create(args: dict) -> str:
 
 
 def _tool_doc_create_rfc(args: dict) -> str:
-    """Generate a structured RFC/Request for Change document (.docx by default, or .md)."""
+    """Genera un RFC/Request for Change como documento O365 nativo (.docx) con content_blocks.
+
+    Construye bloques nativos (title, tablas, headings, párrafos) y delega en doc_create.
+    Sin path se devuelve un resumen de texto plano del RFC.
+    """
     title            = args.get("title", "")
     requester        = args.get("requester", "")
     if not title or not requester:
@@ -6905,14 +5630,14 @@ def _tool_doc_create_rfc(args: dict) -> str:
     date             = args.get("date", datetime.date.today().isoformat())
     priority         = args.get("priority", "Media")
     change_type      = args.get("change_type", "Normal")
-    affected_systems = args.get("affected_systems", "_Por especificar_")
-    description      = args.get("description", "_Por completar_")
-    justification    = args.get("justification", "_Por completar_")
-    risk             = args.get("risk", "_Por analizar_")
+    affected_systems = args.get("affected_systems", "Por especificar")
+    description      = args.get("description", "Por completar")
+    justification    = args.get("justification", "Por completar")
+    risk             = args.get("risk", "Por analizar")
     risk_level       = args.get("risk_level", "Bajo")
-    rollback_plan    = args.get("rollback_plan", "_Por definir_")
-    testing_plan     = args.get("testing_plan", "_Por definir_")
-    impl_steps       = args.get("implementation_steps", "_Por definir_")
+    rollback_plan    = args.get("rollback_plan", "Por definir")
+    testing_plan     = args.get("testing_plan", "Por definir")
+    impl_steps       = args.get("implementation_steps", "Por definir")
     scheduled_date   = args.get("scheduled_date", "Por definir")
     scheduled_window = args.get("scheduled_window", "Por definir")
     approver         = args.get("approver", "Por asignar")
@@ -6920,87 +5645,81 @@ def _tool_doc_create_rfc(args: dict) -> str:
     fmt              = args.get("format", "docx").lower()
 
     rfc_id = f"RFC-{datetime.datetime.now().strftime('%Y%m%d-%H%M')}"
-    doc = f"""# {rfc_id} — {title}
 
-| Campo | Valor |
-|-------|-------|
-| **ID RFC** | {rfc_id} |
-| **Título** | {title} |
-| **Solicitante** | {requester} |
-| **Fecha solicitud** | {date} |
-| **Tipo de cambio** | {change_type} |
-| **Prioridad** | {priority} |
-| **Nivel de riesgo** | {risk_level} |
-| **Fecha programada** | {scheduled_date} |
-| **Ventana de cambio** | {scheduled_window} |
-| **Aprobador** | {approver} |
+    content_blocks = [
+        {"type": "title", "text": f"{rfc_id} — {title}"},
+        {"type": "table", "headers": ["Campo", "Valor"], "rows": [
+            ["ID RFC", rfc_id],
+            ["Título", title],
+            ["Solicitante", requester],
+            ["Fecha solicitud", date],
+            ["Tipo de cambio", change_type],
+            ["Prioridad", priority],
+            ["Nivel de riesgo", risk_level],
+            ["Fecha programada", scheduled_date],
+            ["Ventana de cambio", scheduled_window],
+            ["Aprobador", approver],
+        ]},
+        {"type": "horizontal_rule"},
+        {"type": "heading", "level": 1, "text": "1. Descripción del cambio"},
+        {"type": "paragraph", "text": description},
+        {"type": "heading", "level": 1, "text": "2. Justificación"},
+        {"type": "paragraph", "text": justification},
+        {"type": "heading", "level": 1, "text": "3. Sistemas afectados"},
+        {"type": "paragraph", "text": affected_systems},
+        {"type": "heading", "level": 1, "text": "4. Plan de implementación"},
+        {"type": "paragraph", "text": impl_steps},
+        {"type": "heading", "level": 1, "text": "5. Plan de pruebas y validación"},
+        {"type": "paragraph", "text": testing_plan},
+        {"type": "heading", "level": 1, "text": "6. Análisis de riesgos"},
+        {"type": "paragraph", "text": f"**Nivel de riesgo:** {risk_level}"},
+        {"type": "paragraph", "text": risk},
+        {"type": "heading", "level": 1, "text": "7. Plan de marcha atrás (Rollback)"},
+        {"type": "paragraph", "text": rollback_plan},
+        {"type": "horizontal_rule"},
+        {"type": "heading", "level": 1, "text": "8. Aprobaciones"},
+        {"type": "table", "headers": ["Rol", "Nombre", "Firma", "Fecha"], "rows": [
+            ["Solicitante", requester, "", date],
+            ["Aprobador técnico", approver, "", ""],
+            ["Responsable de negocio", "", "", ""],
+            ["Gestor de cambios", "", "", ""],
+        ]},
+    ]
 
----
+    # Representación de texto plano (para .md/.txt y para retorno inline sin path)
+    text = (
+        f"{rfc_id} — {title}\n\n"
+        f"Solicitante: {requester}    Fecha: {date}    Tipo: {change_type}    "
+        f"Prioridad: {priority}    Riesgo: {risk_level}    Aprobador: {approver}\n\n"
+        f"1. Descripción del cambio\n{description}\n\n"
+        f"2. Justificación\n{justification}\n\n"
+        f"3. Sistemas afectados\n{affected_systems}\n\n"
+        f"4. Plan de implementación\n{impl_steps}\n\n"
+        f"5. Plan de pruebas y validación\n{testing_plan}\n\n"
+        f"6. Análisis de riesgos (Nivel: {risk_level})\n{risk}\n\n"
+        f"7. Plan de marcha atrás (Rollback)\n{rollback_plan}\n\n"
+        f"8. Aprobaciones\n"
+        f"   Solicitante: {requester} ({date})\n"
+        f"   Aprobador técnico: {approver}\n"
+        f"   Responsable de negocio:\n"
+        f"   Gestor de cambios:\n"
+    )
 
-## 1. Descripción del cambio
-
-{description}
-
-## 2. Justificación
-
-{justification}
-
-## 3. Sistemas afectados
-
-{affected_systems}
-
-## 4. Plan de implementación
-
-{impl_steps}
-
-## 5. Plan de pruebas y validación
-
-{testing_plan}
-
-## 6. Análisis de riesgos
-
-**Nivel de riesgo:** {risk_level}
-
-{risk}
-
-## 7. Plan de marcha atrás (Rollback)
-
-{rollback_plan}
-
----
-
-## 8. Aprobaciones
-
-| Rol | Nombre | Firma | Fecha |
-|-----|--------|-------|-------|
-| Solicitante | {requester} | | {date} |
-| Aprobador técnico | {approver} | | |
-| Responsable de negocio | | | |
-| Gestor de cambios | | | |
-
----
-*Documento generado por OOCode Home Office Assistant — {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}*
-"""
     if output_path:
-        try:
-            out = Path(output_path).expanduser()
-            # If path has no extension, apply format preference
-            if not out.suffix:
-                out = out.with_suffix(".docx" if fmt == "docx" else ".md")
-            out.parent.mkdir(parents=True, exist_ok=True)
-            if out.suffix.lower() == ".docx":
-                err = _write_docx_from_markdown(doc, out)
-                if err:
-                    out = out.with_suffix(".md")
-                    out.write_text(doc)
-                    return f"⚠ {err}\n✅ RFC guardado como Markdown: {out}\n   ID: {rfc_id}"
-            else:
-                out.write_text(doc)
-            return f"✅ RFC generado: {out}\n   ID: {rfc_id}"
-        except Exception as exc:
-            return f"Error guardando RFC: {exc}"
-    # No path given: return inline content (compatible with all callers)
-    return f"📋 RFC generado (ID: {rfc_id}):\n\n{doc}"
+        out = Path(output_path).expanduser()
+        if not out.suffix:
+            out = out.with_suffix(".docx" if fmt == "docx" else ".md")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if out.suffix.lower() == ".docx":
+            res = _tool_doc_create({
+                "path":           str(out),
+                "content_blocks": content_blocks,
+                "theme":          args.get("theme", "office"),
+            })
+            return f"{res}\n   ID RFC: {rfc_id}"
+        out.write_text(text)
+        return f"✅ RFC generado: {out}\n   ID: {rfc_id}"
+    return f"📋 RFC generado (ID: {rfc_id}):\n\n{text}"
 
 
 def _tool_xlsx_fill_range(args: dict) -> str:
@@ -7120,7 +5839,6 @@ def _tool_xlsx_create_report(args: dict) -> str:
     title        = args.get("title", "")
     table_style  = args.get("table_style", "TableStyleMedium9")
     freeze_hdr   = args.get("freeze_header", True)
-    summary_row  = args.get("summary_row", False)
 
     if not path:
         return "Parámetro requerido: path"
@@ -7128,7 +5846,7 @@ def _tool_xlsx_create_report(args: dict) -> str:
         return "Parámetro requerido: headers (lista de nombres de columnas)"
     try:
         import openpyxl
-        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.styles import Font, Alignment
         from openpyxl.utils import get_column_letter
         from openpyxl.worksheet.table import Table, TableStyleInfo
 
@@ -7198,519 +5916,6 @@ def _tool_xlsx_create_report(args: dict) -> str:
         return "openpyxl no instalado. Instala con: pip install openpyxl"
     except Exception as exc:
         return f"Error creando informe Excel: {exc}"
-
-
-# ── Nuevas tools matplotlib avanzadas ────────────────────────────────────────
-
-def _tool_create_scatter_chart(args: dict) -> str:
-    """Inserta scatter plot OOXML nativo en .docx (editable), o PNG como respaldo."""
-    doc_path = (args.get("path") or args.get("doc_path", "")).strip()
-    if doc_path and Path(doc_path).expanduser().suffix.lower() == ".docx":
-        p = Path(doc_path).expanduser()
-        if not p.exists():
-            try:
-                from docx import Document as _D
-                _d = _D()
-                _apply_o365_styles_to_new_doc(_d)
-                _d.save(str(p))
-            except Exception:
-                pass
-        return _tool_doc_insert_chart_native({**args, "path": str(p), "chart_type": "scatter"})
-    output    = args.get("output", "/tmp/scatter.png")
-    data      = args.get("data", {})
-    title     = args.get("title", "")
-    x_label   = args.get("x_label", "")
-    y_label   = args.get("y_label", "")
-    trend     = args.get("trend_line", False)
-    style_nm  = args.get("style", "office")
-    width     = args.get("width", 8)
-    height    = args.get("height", 5)
-
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import numpy as np
-
-        st     = _CHART_STYLES.get(style_nm, _CHART_STYLES["office"])
-        colors = st["colors"]
-        fig, ax = plt.subplots(figsize=(width, height))
-
-        series_list = data.get("series", [])
-        if series_list:
-            for i, serie in enumerate(series_list):
-                x_vals = serie.get("x_values", [])
-                y_vals = serie.get("y_values", [])
-                label  = serie.get("label", f"Serie {i+1}")
-                col    = colors[i % len(colors)]
-                ax.scatter(x_vals, y_vals, color=col, s=70, alpha=0.8, label=label, zorder=3)
-                if trend and len(x_vals) >= 2:
-                    xn, yn = np.array(x_vals, float), np.array(y_vals, float)
-                    z = np.polyfit(xn, yn, 1)
-                    p = np.poly1d(z)
-                    ax.plot(sorted(xn), p(sorted(xn)), "--", color=col, linewidth=1.5, alpha=0.6)
-            ax.legend(fontsize=9, facecolor=st["bg"], labelcolor=st["text_c"])
-        else:
-            x_vals = data.get("x_values", [])
-            y_vals = data.get("y_values", [])
-            labels = data.get("point_labels", [])
-            ax.scatter(x_vals, y_vals, color=colors[0], s=70, alpha=0.8, zorder=3)
-            for i, lbl in enumerate(labels):
-                if i < len(x_vals):
-                    ax.annotate(lbl, (x_vals[i], y_vals[i]), textcoords="offset points",
-                                xytext=(5, 5), fontsize=8, color=st["text_c"])
-            if trend and len(x_vals) >= 2:
-                xn, yn = np.array(x_vals, float), np.array(y_vals, float)
-                z = np.polyfit(xn, yn, 1)
-                p = np.poly1d(z)
-                ax.plot(sorted(xn), p(sorted(xn)), "--", color=colors[1], linewidth=1.5, alpha=0.7)
-
-        if title:
-            ax.set_title(title, fontsize=14, fontweight="bold", color=st["text_c"], pad=12)
-        if x_label:
-            ax.set_xlabel(x_label, fontsize=11, color=st["text_c"])
-        if y_label:
-            ax.set_ylabel(y_label, fontsize=11, color=st["text_c"])
-        _apply_chart_style(fig, ax, style_nm)
-        plt.tight_layout()
-        Path(output).parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(output, dpi=st["dpi"], bbox_inches="tight", facecolor=st["bg"])
-        plt.close(fig)
-        return f"✅ Scatter guardado en: {output}"
-    except ImportError as e:
-        return f"matplotlib no disponible: {e}\nInstala: pip install matplotlib"
-    except Exception as exc:
-        return f"Error creando scatter: {exc}"
-
-
-def _tool_create_stacked_bar_chart(args: dict) -> str:
-    """Inserta gráfica de barras apiladas OOXML nativa en .docx, o PNG como respaldo."""
-    doc_path = (args.get("path") or args.get("doc_path", "")).strip()
-    if doc_path and Path(doc_path).expanduser().suffix.lower() == ".docx":
-        p = Path(doc_path).expanduser()
-        if not p.exists():
-            try:
-                from docx import Document as _D
-                _d = _D()
-                _apply_o365_styles_to_new_doc(_d)
-                _d.save(str(p))
-            except Exception:
-                pass
-        ct = "stacked_bar"
-        return _tool_doc_insert_chart_native({**args, "path": str(p), "chart_type": ct})
-    args_copy = {**args, "stacked": True}
-    data = args_copy.get("data", {})
-    if "series" not in data and "categories" in data:
-        return "Se requiere data.series=[{label, values}] para barras apiladas."
-    result = _save_chart_image(args_copy, "bar")
-    return result.replace("Gráfica bar guardada", "Gráfica stacked_bar guardada")
-
-
-def _tool_create_gantt_chart(args: dict) -> str:
-    """Genera un diagrama de Gantt con matplotlib."""
-    output   = args.get("output", "/tmp/gantt.png")
-    tasks    = args.get("tasks", [])
-    title    = args.get("title", "Diagrama de Gantt")
-    style_nm = args.get("style", "office")
-    width    = args.get("width", 12)
-    height   = args.get("height", None)
-
-    if not tasks:
-        return "Se requiere tasks=[{name, start, end, category?}] para el Gantt."
-
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import matplotlib.patches as mpatches
-        from datetime import datetime, date as dt_date
-        import numpy as np
-
-        st     = _CHART_STYLES.get(style_nm, _CHART_STYLES["office"])
-        colors = st["colors"]
-
-        # Parse dates (support strings YYYY-MM-DD or numbers as day offsets)
-        def to_num(d):
-            if isinstance(d, (int, float)):
-                return float(d)
-            try:
-                return (datetime.strptime(str(d), "%Y-%m-%d") - datetime(2000, 1, 1)).days
-            except Exception:
-                return 0.0
-
-        n_tasks  = len(tasks)
-        fig_h    = height or max(4, n_tasks * 0.55 + 1.5)
-        fig, ax  = plt.subplots(figsize=(width, fig_h))
-        fig.patch.set_facecolor(st["bg"])
-        ax.set_facecolor(st["bg"])
-
-        categories = list(dict.fromkeys(t.get("category", "General") for t in tasks))
-        cat_colors = {c: colors[i % len(colors)] for i, c in enumerate(categories)}
-
-        y_ticks  = []
-        y_labels = []
-        for i, task in enumerate(tasks):
-            y      = n_tasks - i - 1
-            start  = to_num(task.get("start", 0))
-            end    = to_num(task.get("end", start + 1))
-            dur    = end - start
-            cat    = task.get("category", "General")
-            col    = cat_colors[cat]
-            ax.barh(y, dur, left=start, height=0.5, color=col, alpha=0.85,
-                    edgecolor=st["spine_c"], linewidth=0.5)
-            ax.text(start + dur / 2, y, task.get("name", ""),
-                    ha="center", va="center", fontsize=8, color="white",
-                    fontweight="bold", clip_on=True)
-            y_ticks.append(y)
-            y_labels.append(task.get("name", f"Tarea {i+1}"))
-
-        ax.set_yticks(y_ticks)
-        ax.set_yticklabels(y_labels, fontsize=9, color=st["text_c"])
-        ax.set_title(title, fontsize=14, fontweight="bold", color=st["text_c"], pad=12)
-        ax.tick_params(colors=st["text_c"])
-        ax.grid(True, axis="x", color=st["grid_c"], linestyle="--", linewidth=0.6, alpha=0.8)
-        for spine in ax.spines.values():
-            spine.set_edgecolor(st["spine_c"])
-        if len(categories) > 1:
-            legend_patches = [mpatches.Patch(color=cat_colors[c], label=c) for c in categories]
-            ax.legend(handles=legend_patches, fontsize=9, loc="lower right",
-                      facecolor=st["bg"], labelcolor=st["text_c"])
-
-        plt.tight_layout()
-        Path(output).parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(output, dpi=st["dpi"], bbox_inches="tight", facecolor=st["bg"])
-        plt.close(fig)
-        return f"✅ Gantt guardado en: {output} ({n_tasks} tareas)"
-    except ImportError as e:
-        return f"matplotlib no disponible: {e}\nInstala: pip install matplotlib"
-    except Exception as exc:
-        return f"Error creando Gantt: {exc}"
-
-
-def _tool_create_org_chart(args: dict) -> str:
-    """Genera un organigrama jerárquico en Word con tabla nativa O365 (editable, sin matplotlib).
-
-    nodes: [{id, label, parent?}]  — parent es el id del nodo padre (omitir para raíz).
-    path/output: ruta del .docx a crear o en el que insertar el organigrama.
-    """
-    doc_path = (args.get("path") or args.get("output", "/tmp/org_chart.docx")).strip()
-    nodes    = args.get("nodes", [])
-    title    = args.get("title", "Organigrama")
-
-    if not nodes:
-        return "Se requiere nodes=[{id, label, parent?}] para el organigrama."
-
-    try:
-        from docx import Document
-        from docx.shared import Pt, RGBColor, Cm
-        from docx.enum.text import WD_ALIGN_PARAGRAPH
-        from docx.oxml.ns import qn
-        from docx.oxml import OxmlElement
-        from collections import deque
-
-        by_id: dict    = {n["id"]: n for n in nodes}
-        children: dict = {n["id"]: [] for n in nodes}
-        roots: list    = []
-        for n in nodes:
-            p_id = n.get("parent")
-            if p_id and p_id in children:
-                children[p_id].append(n["id"])
-            else:
-                roots.append(n["id"])
-
-        levels: dict = {}
-        order:  list = []
-        q = deque()
-        for r in roots:
-            levels[r] = 0
-            q.append(r)
-        while q:
-            nid = q.popleft()
-            order.append(nid)
-            for c in children.get(nid, []):
-                levels[c] = levels[nid] + 1
-                q.append(c)
-        for n in nodes:
-            if n["id"] not in levels:
-                levels[n["id"]] = 0
-                order.append(n["id"])
-
-        by_level: dict = {}
-        for nid in order:
-            lv = levels.get(nid, 0)
-            by_level.setdefault(lv, []).append(nid)
-
-        max_level    = max(levels.values()) if levels else 0
-        max_per_row  = max(len(v) for v in by_level.values()) if by_level else 1
-        level_colors = ["2F5496", "4472C4", "5B9BD5", "9DC3E6", "BDD7EE", "DEEAF1"]
-
-        p_path = Path(doc_path).expanduser()
-        if p_path.exists():
-            doc = Document(str(p_path))
-        else:
-            doc = Document()
-            _apply_o365_styles_to_new_doc(doc)
-
-        if title:
-            h = doc.add_paragraph()
-            try:
-                h.style = doc.styles["Heading 2"]
-            except Exception:
-                pass
-            h.add_run(title)
-
-        def _shade(cell, hex_color: str) -> None:
-            try:
-                tcPr = cell._tc.get_or_add_tcPr()
-                shd  = OxmlElement("w:shd")
-                shd.set(qn("w:val"), "clear")
-                shd.set(qn("w:color"), "auto")
-                shd.set(qn("w:fill"), hex_color)
-                tcPr.append(shd)
-            except Exception:
-                pass
-
-        n_cols = max(max_per_row, 1)
-        n_rows = max_level + 1
-        tbl    = doc.add_table(rows=n_rows, cols=n_cols)
-        try:
-            tbl.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        except Exception:
-            pass
-
-        for level in range(n_rows):
-            row_nodes      = by_level.get(level, [])
-            n_in_row       = len(row_nodes)
-            color          = level_colors[level % len(level_colors)]
-            cells_per_node = max(1, n_cols // max(n_in_row, 1))
-
-            for node_i, nid in enumerate(row_nodes):
-                node_label = by_id.get(nid, {}).get("label", nid)
-                start_col  = node_i * cells_per_node
-                end_col    = min(start_col + cells_per_node - 1, n_cols - 1)
-
-                try:
-                    if end_col > start_col:
-                        cell = tbl.rows[level].cells[start_col].merge(
-                            tbl.rows[level].cells[end_col])
-                    else:
-                        cell = tbl.rows[level].cells[min(start_col, n_cols - 1)]
-                except Exception:
-                    cell = tbl.rows[level].cells[min(start_col, n_cols - 1)]
-
-                cell.text = ""
-                p_cell = cell.paragraphs[0]
-                p_cell.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                p_cell.paragraph_format.space_before = Pt(6)
-                p_cell.paragraph_format.space_after  = Pt(6)
-                run = p_cell.add_run(node_label)
-                run.bold = True
-                run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-                run.font.size = Pt(max(8, 11 - min(level, 3)))
-                _shade(cell, color)
-
-            for c_i in range(n_in_row * cells_per_node, n_cols):
-                try:
-                    _shade(tbl.rows[level].cells[c_i], "F5F5F5")
-                except Exception:
-                    pass
-
-        col_w = Cm(max(0.5, 16.0 / n_cols))
-        for row in tbl.rows:
-            for cell in row.cells:
-                try:
-                    cell.width = col_w
-                except Exception:
-                    pass
-
-        dest = str(p_path)
-        doc.save(dest)
-        return f"✅ Organigrama guardado en: {dest} ({len(nodes)} nodos, {max_level+1} niveles)"
-
-    except ImportError as e:
-        return f"python-docx no disponible: {e}"
-    except Exception as exc:
-        return f"Error creando organigrama: {exc}"
-
-
-def _tool_create_heatmap(args: dict) -> str:
-    """Genera un heatmap nativo en Word (tabla O365 con celdas coloreadas, sin matplotlib).
-
-    data: matriz 2D de valores [[fila1], [fila2], ...]
-    path/output: ruta del .docx a crear o en el que insertar el heatmap.
-    colormap: Blues | Reds | RdYlGn | YlOrRd | viridis
-    """
-    doc_path   = (args.get("path") or args.get("output", "/tmp/heatmap.docx")).strip()
-    data_vals  = args.get("data", [])
-    row_labels = args.get("row_labels", [])
-    col_labels = args.get("col_labels", [])
-    title      = args.get("title", "")
-    colormap   = args.get("colormap", "Blues")
-    show_vals  = args.get("show_values", True)
-    fmt        = args.get("value_format", ".1f")
-
-    if not data_vals:
-        return "Se requiere data=[[...], [...]] con los valores del heatmap."
-
-    try:
-        from docx import Document
-        from docx.shared import Pt, RGBColor, Cm
-        from docx.enum.text import WD_ALIGN_PARAGRAPH
-        from docx.oxml.ns import qn
-        from docx.oxml import OxmlElement
-
-        flat  = [v for row in data_vals for v in row if isinstance(v, (int, float))]
-        v_min = min(flat) if flat else 0.0
-        v_max = max(flat) if flat else 1.0
-        v_rng = max(v_max - v_min, 1e-9)
-
-        palettes = {
-            "Blues":   ((222, 235, 247), (8,   48,  107)),
-            "Reds":    ((254, 229, 217), (165, 15,  21)),
-            "RdYlGn":  ((215, 48,  39),  (26,  152, 80)),
-            "YlOrRd":  ((255, 255, 178), (189, 0,   38)),
-            "viridis": ((68,  1,   84),   (253, 231, 37)),
-        }
-
-        def _interp(t: float) -> str:
-            t = max(0.0, min(1.0, t))
-            lo, hi = palettes.get(colormap, palettes["Blues"])
-            r = int(lo[0] + (hi[0] - lo[0]) * t)
-            g = int(lo[1] + (hi[1] - lo[1]) * t)
-            b = int(lo[2] + (hi[2] - lo[2]) * t)
-            return f"{max(0,min(255,r)):02X}{max(0,min(255,g)):02X}{max(0,min(255,b)):02X}"
-
-        def _shade(cell, hex_color: str) -> None:
-            try:
-                tcPr = cell._tc.get_or_add_tcPr()
-                shd  = OxmlElement("w:shd")
-                shd.set(qn("w:val"), "clear")
-                shd.set(qn("w:color"), "auto")
-                shd.set(qn("w:fill"), hex_color)
-                tcPr.append(shd)
-            except Exception:
-                pass
-
-        n_rows = len(data_vals)
-        n_cols = max(len(r) for r in data_vals) if data_vals else 1
-        has_rl = bool(row_labels)
-        has_cl = bool(col_labels)
-
-        p_path = Path(doc_path).expanduser()
-        if p_path.exists():
-            doc = Document(str(p_path))
-        else:
-            doc = Document()
-            _apply_o365_styles_to_new_doc(doc)
-
-        if title:
-            h = doc.add_paragraph()
-            try:
-                h.style = doc.styles["Heading 2"]
-            except Exception:
-                pass
-            h.add_run(title)
-
-        tbl_rows = n_rows + (1 if has_cl else 0)
-        tbl_cols = n_cols + (1 if has_rl else 0)
-        tbl      = doc.add_table(rows=tbl_rows, cols=tbl_cols)
-
-        if has_cl:
-            h_row = tbl.rows[0]
-            if has_rl:
-                _shade(h_row.cells[0], "2F5496")
-            for c_i, lbl in enumerate(col_labels[:n_cols]):
-                cell = h_row.cells[c_i + (1 if has_rl else 0)]
-                cell.text = lbl
-                cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
-                for run in cell.paragraphs[0].runs:
-                    run.bold = True
-                    run.font.size = Pt(9)
-                    run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-                _shade(cell, "2F5496")
-
-        for r_i, row_data in enumerate(data_vals):
-            tr_i = r_i + (1 if has_cl else 0)
-            if tr_i >= len(tbl.rows):
-                break
-            row = tbl.rows[tr_i]
-            if has_rl:
-                lbl_cell = row.cells[0]
-                lbl_cell.text = row_labels[r_i] if r_i < len(row_labels) else ""
-                for run in lbl_cell.paragraphs[0].runs:
-                    run.bold = True
-                    run.font.size = Pt(9)
-                _shade(lbl_cell, "E9EFF7")
-            for c_i, val in enumerate(row_data[:n_cols]):
-                if not isinstance(val, (int, float)):
-                    continue
-                t    = (val - v_min) / v_rng
-                hx   = _interp(t)
-                cell = row.cells[c_i + (1 if has_rl else 0)]
-                _shade(cell, hx)
-                if show_vals:
-                    cell.text = ""
-                    p_cell = cell.paragraphs[0]
-                    p_cell.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    run = p_cell.add_run(format(val, fmt))
-                    run.font.size = Pt(8)
-                    run.font.color.rgb = (RGBColor(0xFF, 0xFF, 0xFF)
-                                          if t > 0.55 else RGBColor(0x30, 0x30, 0x30))
-
-        cell_w = Cm(max(0.7, 15.0 / max(tbl_cols, 1)))
-        for row in tbl.rows:
-            for cell in row.cells:
-                try:
-                    cell.width = cell_w
-                except Exception:
-                    pass
-
-        dest = str(p_path)
-        doc.save(dest)
-        return f"✅ Heatmap guardado en: {dest} ({n_rows}×{n_cols})"
-
-    except ImportError as e:
-        return f"python-docx no disponible: {e}"
-    except Exception as exc:
-        return f"Error creando heatmap: {exc}"
-
-
-def _tool_create_radar_chart(args: dict) -> str:
-    """Inserta gráfico radar/spider OOXML nativo en .docx (editable, sin matplotlib).
-
-    Si 'path' apunta a un .docx (existente o nuevo), inserta radar DrawingML nativo.
-    categories: ejes del radar; series: [{label, values}].
-    """
-    doc_path   = (args.get("path") or args.get("doc_path") or "").strip()
-    categories = args.get("categories", [])
-    series     = args.get("series", [])
-    title      = args.get("title", "")
-
-    if not categories or not series:
-        return "Se requiere categories=[...] y series=[{label, values}]."
-
-    if not doc_path:
-        return "Se requiere 'path' con la ruta al .docx donde insertar el gráfico radar."
-
-    p = Path(doc_path).expanduser()
-    if not p.exists() and doc_path.lower().endswith(".docx"):
-        try:
-            from docx import Document as _D
-            _d = _D()
-            _apply_o365_styles_to_new_doc(_d)
-            _d.save(str(p))
-        except Exception:
-            pass
-
-    return _tool_doc_insert_chart_native({
-        "path":          str(p),
-        "chart_type":    "radar",
-        "data":          {"categories": categories, "series": series},
-        "title":         title,
-        "width_inches":  float(args.get("width", 5.5)),
-        "height_inches": float(args.get("height", 4.0)),
-        "output_path":   args.get("output_path", ""),
-    })
 
 
 # ── Nuevas tools Excel avanzadas ──────────────────────────────────────────────
@@ -7901,7 +6106,6 @@ def _tool_xlsx_add_sheet(args: dict) -> str:
 
         if action == "add":
             if copy_from and copy_from in wb.sheetnames:
-                from copy import copy as _copy
                 source = wb[copy_from]
                 ws = wb.copy_worksheet(source)
                 ws.title = name
@@ -8337,10 +6541,7 @@ def _tool_pptx_set_background(args: dict) -> str:
 
     try:
         from pptx import Presentation
-        from pptx.util import Inches
         from pptx.dml.color import RGBColor as PptxRGB
-        from pptx.oxml.ns import qn as pqn
-        from lxml import etree
 
         prs   = Presentation(str(path))
         n_sld = len(prs.slides)
@@ -8357,7 +6558,6 @@ def _tool_pptx_set_background(args: dict) -> str:
 
         for i in targets:
             slide  = prs.slides[i]
-            layout = slide.slide_layout
 
             if bg_type == "solid":
                 r, g, b = _hex_to_rgb(color)
@@ -8417,7 +6617,7 @@ def _tool_doc_create_from_template(args: dict) -> str:
       {"type": "toc",           "title": "Tabla de contenido"}
       {"type": "signature_block","roles": ["Autor", "Revisor", "Aprobador"]}
       {"type": "code_block",    "code": "...", "language": "python"}
-      {"type": "markdown",      "text": "# H1\\n**bold** párrafo..."}
+      {"type": "markdown",      "text": "Texto plano con **negrita**/*cursiva* inline (NO parsea # ni listas)"}
       {"type": "pagebreak"}
       {"type": "horizontal_rule"}
     """
@@ -8592,7 +6792,7 @@ def _tool_doc_create_from_template(args: dict) -> str:
             n_added += 1
 
         elif btype == "markdown":
-            _md_populate_doc(doc, block.get("text", ""))
+            _render_native_paragraphs(doc, block.get("text", ""))
             n_added += 1
 
         elif btype == "pagebreak":
@@ -8867,7 +7067,7 @@ def _tool_doc_set_page_layout(args: dict) -> str:
         return f"Fichero no encontrado: {path}"
     try:
         from docx import Document
-        from docx.shared import Cm, Emu
+        from docx.shared import Cm
         from docx.enum.section import WD_ORIENT
 
         _PAGE_SIZES = {
@@ -8936,7 +7136,7 @@ def _tool_pptx_create_from_template(args: dict) -> str:
 
     try:
         from pptx import Presentation
-        from pptx.util import Inches, Pt
+        from pptx.util import Inches
 
         prs = Presentation(str(tpl))
 
@@ -9336,18 +7536,6 @@ _TOOLS = [
             "required": ["query"],
         },
     },
-    {
-        "name": "markdown_to_html",
-        "description": "Convierte markdown a HTML. Usa python-markdown, pandoc o conversión básica.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "content": {"type": "string", "description": "Texto markdown (alternativa a path)"},
-                "path":    {"type": "string", "description": "Ruta a un fichero .md (alternativa a content)"},
-                "output":  {"type": "string", "description": "Ruta de salida .html (opcional; sin ruta: devuelve el HTML)"},
-            },
-        },
-    },
     # ── Template and IT report tools ────────────────────────────────────────
     {
         "name": "doc_read_template_fields",
@@ -9422,8 +7610,8 @@ _TOOLS = [
     {
         "name": "doc_create",
         "description": "Crea un documento Word (.docx), Excel (.xlsx) o PowerPoint (.pptx) profesional con estilos O365 nativos (Calibri/Calibri Light, colores Office, OOXML nativo). "
-                       "Para .docx: soporta content_blocks (title, heading, paragraph, bullet_list, numbered_list, table, chart OOXML, image, checklist, callout, highlight, toc, signature_block, code_block, pagebreak, horizontal_rule) "
-                       "o markdown (convertido a OOXML completo). Con template_path hereda todos los estilos, cabecera/pie y márgenes corporativos. "
+                       "Para .docx usa SIEMPRE content_blocks para contenido nativo (title, heading, paragraph, bullet_list, numbered_list, table, chart OOXML, image, checklist, callout, highlight, toc, signature_block, code_block, pagebreak, horizontal_rule). "
+                       "El parámetro markdown solo vuelca texto plano como párrafos (énfasis inline **/*); no genera estructura. Con template_path hereda todos los estilos, cabecera/pie y márgenes corporativos. "
                        "Para .xlsx: hojas con tablas nativas, gráficas O365 y formatos condicionales. "
                        "Para .pptx: diapositivas con temas, gráficas nativas y layouts.",
         "inputSchema": {
@@ -9758,89 +7946,19 @@ _TOOLS = [
     },
     {
         "name": "insert_chart",
-        "description": "Inserta una gráfica matplotlib (bar, pie, line, scatter) como imagen PNG en un documento .docx.",
+        "description": "Inserta una gráfica OOXML nativa (objeto editable de Word, vectorial) en un .docx. Crea el documento si no existe. Tipos: bar, column, line, line_markers, area, pie, doughnut, scatter, stacked_bar, stacked_column, radar.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "path":          {"type": "string", "description": "Ruta al fichero .docx"},
-                "chart_type":    {"type": "string", "description": "Tipo: bar, pie, line, scatter"},
-                "data":          {"type": "object", "description": "Datos: {categories:[...], values:[...]} para bar/line; {labels:[...], sizes:[...]} para pie"},
+                "path":          {"type": "string", "description": "Ruta al fichero .docx (se crea con estilos O365 si no existe)"},
+                "chart_type":    {"type": "string", "description": "bar | column | line | line_markers | area | pie | doughnut | scatter | stacked_bar | stacked_column | radar"},
+                "data":          {"type": "object", "description": "{categories:[...], series:[{label, values:[...]}]}. Para scatter: series con {x_values, y_values}. También acepta data.values=[...] como serie única."},
                 "title":         {"type": "string", "description": "Título de la gráfica"},
-                "width_inches":  {"type": "number", "description": "Ancho en pulgadas (default: 6)"},
-                "output_path":   {"type": "string", "description": "Ruta de salida (omitir = sobreescribe el original)"},
-            },
-            "required": ["path"],
-        },
-    },
-    {
-        "name": "doc_insert_chart_native",
-        "description": "★ Inserta gráfica OOXML nativa en .docx (editable en Word/LibreOffice). Tipos: bar|column|stacked_bar|stacked_column|line|line_markers|area|pie|doughnut|scatter|radar|bubble.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "path":          {"type": "string", "description": "Ruta al fichero .docx existente"},
-                "chart_type":    {"type": "string", "description": "Tipo: bar | line | pie | doughnut | area | scatter"},
-                "data":          {"type": "object", "description": "Datos: {categories:[...], series:[{label, values},...]} o {values:[...], labels:[...]} para pie"},
-                "title":         {"type": "string", "description": "Título de la gráfica"},
-                "style":         {"type": "string", "description": "Estilo: office | dark | minimal | presentation"},
                 "width_inches":  {"type": "number", "description": "Ancho en pulgadas (default: 5.5)"},
                 "height_inches": {"type": "number", "description": "Alto en pulgadas (default: 3.5)"},
                 "output_path":   {"type": "string", "description": "Ruta de salida (omitir = sobreescribe el original)"},
             },
             "required": ["path", "chart_type", "data"],
-        },
-    },
-    {
-        "name": "doc_insert_diagram",
-        "description": "Inserta diagramas y gráficas en documentos .docx: flowchart, bar_chart, pie_chart, line_chart, table, org_chart.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "path":          {"type": "string",  "description": "Ruta al fichero .docx existente"},
-                "diagram_type":  {"type": "string",  "description": "Tipo: flowchart | bar_chart | pie_chart | line_chart | table | org_chart"},
-                "content":       {"type": "string",  "description": "Datos del diagrama. bar/pie/line: 'Label1,Label2\\nVal1,Val2'. table: 'Col1|Col2\\nFil1a|Fil1b'. flowchart: 'Paso1\\nPaso2'"},
-                "title":         {"type": "string",  "description": "Título (opcional)"},
-                "style":         {"type": "string",  "description": "Estilo: office | dark | minimal | presentation"},
-                "width_inches":  {"type": "number",  "description": "Ancho en pulgadas (default: 5.5)"},
-                "output_path":   {"type": "string",  "description": "Ruta de salida (omitir = sobreescribe el original)"},
-            },
-            "required": ["path", "diagram_type"],
-        },
-    },
-    {
-        "name": "create_bar_chart",
-        "description": "★ Crea gráfica de barras OOXML nativa en .docx (editable) si se da 'path'. Sin path, genera PNG. Soporta multi-series, barras apiladas, horizontales.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "data":   {"type": "object", "description": "Datos: {categories:[...], values:[...]}"},
-                "output": {"type": "string", "description": "Ruta de salida PNG (default: /tmp/chart_bar.png)"},
-                "title":  {"type": "string", "description": "Título de la gráfica"},
-            },
-        },
-    },
-    {
-        "name": "create_pie_chart",
-        "description": "★ Crea gráfica circular OOXML nativa en .docx (editable) si se da 'path'. Sin path, genera PNG. Soporta doughnut.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "data":   {"type": "object", "description": "Datos: {labels:[...], sizes:[...]}"},
-                "output": {"type": "string", "description": "Ruta de salida PNG (default: /tmp/chart_pie.png)"},
-                "title":  {"type": "string", "description": "Título de la gráfica"},
-            },
-        },
-    },
-    {
-        "name": "create_line_chart",
-        "description": "★ Crea gráfica de líneas OOXML nativa en .docx (editable) si se da 'path'. Sin path, genera PNG. Soporta área, marcadores, multi-series.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "data":   {"type": "object", "description": "Datos: {x_labels:[...], y_values:[...]}"},
-                "output": {"type": "string", "description": "Ruta de salida PNG (default: /tmp/chart_line.png)"},
-                "title":  {"type": "string", "description": "Título de la gráfica"},
-            },
         },
     },
     # ── Nuevas tools O365 nativas ──────────────────────────────────────────────
@@ -9996,123 +8114,6 @@ _TOOLS = [
                 "context": {"type": "integer", "description": "Líneas de contexto en el diff (default: 3)"},
             },
             "required": ["path_a", "path_b"],
-        },
-    },
-    # ── Nuevas tools matplotlib avanzadas ─────────────────────────────────────
-    {
-        "name": "create_scatter_chart",
-        "description": "★ Crea scatter plot OOXML nativo en .docx si se da 'path', o PNG como respaldo. Soporta multi-serie y línea de tendencia.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "output":       {"type": "string",  "description": "Ruta de salida PNG (default: /tmp/scatter.png)"},
-                "title":        {"type": "string",  "description": "Título del gráfico"},
-                "x_label":      {"type": "string",  "description": "Etiqueta eje X"},
-                "y_label":      {"type": "string",  "description": "Etiqueta eje Y"},
-                "trend_line":   {"type": "boolean", "description": "Añadir línea de tendencia (regresión lineal)"},
-                "style":        {"type": "string",  "description": "Estilo visual: office|dark|minimal|presentation"},
-                "data": {
-                    "type": "object",
-                    "description": "Datos: {x_values:[...], y_values:[...]} o {series:[{label, x_values, y_values}]}",
-                },
-            },
-            "required": ["data"],
-        },
-    },
-    {
-        "name": "create_stacked_bar_chart",
-        "description": "★ Crea gráfica de barras apiladas OOXML nativa en .docx si se da 'path', o PNG. Requiere data.series=[{label, values}].",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "output":      {"type": "string", "description": "Ruta PNG de salida"},
-                "title":       {"type": "string", "description": "Título del gráfico"},
-                "x_label":     {"type": "string", "description": "Etiqueta eje X"},
-                "y_label":     {"type": "string", "description": "Etiqueta eje Y"},
-                "horizontal":  {"type": "boolean","description": "Barras horizontales"},
-                "style":       {"type": "string", "description": "Estilo: office|dark|minimal|presentation"},
-                "data": {
-                    "type": "object",
-                    "description": "{categories:[...], series:[{label, values}]}",
-                },
-            },
-            "required": ["data"],
-        },
-    },
-    {
-        "name": "create_gantt_chart",
-        "description": "★ Genera diagrama de Gantt nativo en Word (tabla O365 editable). path/output: .docx destino. Soporta categorías por color y fechas YYYY-MM-DD.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "output":  {"type": "string", "description": "Ruta PNG de salida"},
-                "title":   {"type": "string", "description": "Título del diagrama"},
-                "style":   {"type": "string", "description": "Estilo: office|dark|minimal|presentation"},
-                "width":   {"type": "number", "description": "Ancho de la figura (default: 12)"},
-                "tasks": {
-                    "type": "array",
-                    "description": "Lista de tareas: [{name, start:'YYYY-MM-DD', end:'YYYY-MM-DD', category?}]",
-                    "items": {"type": "object"},
-                },
-            },
-            "required": ["tasks"],
-        },
-    },
-    {
-        "name": "create_org_chart",
-        "description": "★ Genera organigrama jerárquico nativo en Word (tabla O365 editable). path/output: .docx destino. Nodos y relaciones padre-hijo.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "output":  {"type": "string", "description": "Ruta PNG de salida"},
-                "title":   {"type": "string", "description": "Título del organigrama"},
-                "style":   {"type": "string", "description": "Estilo: office|dark|minimal|presentation"},
-                "nodes": {
-                    "type": "array",
-                    "description": "Lista de nodos: [{id, label, parent?}] donde parent es el id del nodo padre",
-                    "items": {"type": "object"},
-                },
-            },
-            "required": ["nodes"],
-        },
-    },
-    {
-        "name": "create_heatmap",
-        "description": "★ Genera heatmap (mapa de calor) nativo en Word (tabla O365 con celdas coloreadas). path/output: .docx destino.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "output":       {"type": "string",  "description": "Ruta PNG de salida"},
-                "title":        {"type": "string",  "description": "Título del heatmap"},
-                "colormap":     {"type": "string",  "description": "Paleta: Blues|Reds|RdYlGn|YlOrRd|coolwarm|viridis"},
-                "show_values":  {"type": "boolean", "description": "Mostrar valores en cada celda"},
-                "value_format": {"type": "string",  "description": "Formato de valor: .0f|.1f|.2f|d"},
-                "style":        {"type": "string",  "description": "Estilo: office|dark|minimal"},
-                "data":         {"type": "array",   "description": "Matriz 2D de valores [[fila1], [fila2], ...]"},
-                "row_labels":   {"type": "array",   "description": "Etiquetas de filas"},
-                "col_labels":   {"type": "array",   "description": "Etiquetas de columnas"},
-            },
-            "required": ["data"],
-        },
-    },
-    {
-        "name": "create_radar_chart",
-        "description": "★ Inserta gráfico radar/spider OOXML nativo en .docx (editable, sin matplotlib). Requiere 'path' al .docx.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "output":     {"type": "string",  "description": "Ruta PNG de salida"},
-                "title":      {"type": "string",  "description": "Título del gráfico"},
-                "fill":       {"type": "boolean", "description": "Rellenar áreas (default: true)"},
-                "style":      {"type": "string",  "description": "Estilo: office|dark|minimal|presentation"},
-                "categories": {"type": "array",   "description": "Categorías del radar (ejes)"},
-                "series": {
-                    "type": "array",
-                    "description": "Series: [{label, values:[...]}] — los values deben estar en el mismo rango numérico",
-                    "items": {"type": "object"},
-                },
-            },
-            "required": ["categories", "series"],
         },
     },
     # ── Nuevas tools Excel avanzadas ──────────────────────────────────────────
@@ -10358,7 +8359,6 @@ _TOOL_FNS: dict[str, Any] = {
     "notes_save":               _tool_notes_save,
     "image_to_text":            _tool_image_to_text,
     "contact_search":           _tool_contact_search,
-    "markdown_to_html":         _tool_markdown_to_html,
     "doc_read_template_fields": _tool_doc_read_template_fields,
     "doc_fill_template":            _tool_doc_fill_template,
     "doc_fill_corporate_template":  _tool_doc_fill_corporate_template,
@@ -10382,12 +8382,8 @@ _TOOL_FNS: dict[str, Any] = {
     "doc_set_page_layout":         _tool_doc_set_page_layout,
     "pptx_create_from_template":   _tool_pptx_create_from_template,
     "xlsx_create_table":           _tool_xlsx_create_table,
-    "doc_insert_diagram":          _tool_doc_insert_diagram,
-    "insert_chart":                _tool_insert_chart,
-    "doc_insert_chart_native":     _tool_doc_insert_chart_native,
-    "create_bar_chart":         _tool_create_bar_chart,
-    "create_pie_chart":         _tool_create_pie_chart,
-    "create_line_chart":        _tool_create_line_chart,
+    # insert_chart: única tool de gráficas Word, OOXML nativa (todos los chart_type)
+    "insert_chart":                _tool_doc_insert_chart_native,
     # ── Nuevas tools O365 nativas ──────────────────────────────────────────
     "pptx_create":                    _tool_pptx_create,
     "pptx_add_slide":                 _tool_pptx_add_slide,
@@ -10399,13 +8395,6 @@ _TOOL_FNS: dict[str, Any] = {
     "xlsx_apply_conditional_format":  _tool_xlsx_apply_conditional_format,
     "doc_extract_metadata":           _tool_doc_extract_metadata,
     "doc_compare":                    _tool_doc_compare,
-    # ── Matplotlib avanzado ────────────────────────────────────────────────
-    "create_scatter_chart":           _tool_create_scatter_chart,
-    "create_stacked_bar_chart":       _tool_create_stacked_bar_chart,
-    "create_gantt_chart":             _tool_create_gantt_chart,
-    "create_org_chart":               _tool_create_org_chart,
-    "create_heatmap":                 _tool_create_heatmap,
-    "create_radar_chart":             _tool_create_radar_chart,
     # ── Excel avanzado ─────────────────────────────────────────────────────
     "apply_cell_formatting":          _tool_apply_cell_formatting,
     "xlsx_freeze_panes":              _tool_xlsx_freeze_panes,
@@ -10583,10 +8572,10 @@ _PROMPTS: dict[str, dict] = {
     },
     "data_visualization": {
         "description": (
-            "Selecciona y genera la gráfica más adecuada para los datos y el objetivo. "
-            "Soporta: bar, stacked_bar, stacked_column, 100_stacked_column, line, stacked_line, "
-            "area, stacked_area, pie, doughnut, scatter — todas nativas O365 en docx/xlsx/pptx. "
-            "También: heatmap, radar, gantt, org_chart (matplotlib PNG incrustado)."
+            "Selecciona y genera la gráfica O365 nativa más adecuada para los datos y el objetivo. "
+            "Soporta: bar, column, stacked_bar, stacked_column, line, line_markers, "
+            "area, pie, doughnut, scatter, radar — todas nativas en docx (insert_chart), "
+            "xlsx (xlsx_insert_chart) y pptx (pptx_insert_chart)."
         ),
         "arguments": [
             {"name": "data_description", "description": "Descripción de los datos disponibles (categorías, series, valores)", "required": True},
@@ -11071,16 +9060,10 @@ def _get_prompt(name: str, args: dict) -> list[dict]:  # noqa: C901
             "| `stacked_area` | Composición acumulada temporal |\n"
             "| `pie` | Distribución porcentual (<6 categorías) |\n"
             "| `doughnut` | Igual que pie, con espacio central para KPI |\n"
-            "| `scatter` | Correlación entre dos variables continuas |\n\n"
-            "### Diagramas matplotlib (PNG incrustado):\n"
-            "| Tool | Cuándo usar |\n"
-            "|------|-------------|\n"
-            "| `create_heatmap` | Matrices de correlación o KPIs 2D |\n"
-            "| `create_radar_chart` | Comparar perfiles multidimensionales (≤8 ejes) |\n"
-            "| `create_gantt_chart` | Planificación temporal de tareas |\n"
-            "| `create_org_chart` | Jerarquías organizativas |\n"
-            "| `create_scatter_chart` | Scatter con múltiples series o burbujas |\n"
-            "| `create_stacked_bar_chart` | Stacked bars con matplotlib (más customizable) |\n\n"
+            "| `scatter` | Correlación entre dos variables continuas |\n"
+            "| `radar` | Comparar perfiles multidimensionales (≤8 ejes) |\n\n"
+            "Todas se generan con `insert_chart` (Word, OOXML nativo), `xlsx_insert_chart` "
+            "(Excel) o `pptx_insert_chart` (PowerPoint) — objetos editables, sin imágenes PNG.\n\n"
             "## RECOMENDACIÓN:\n\n"
             "1. Selecciona el tipo más adecuado para los datos y el objetivo (justifica)\n"
             "2. Si hay varias opciones, ordénalas por efectividad para la audiencia\n"
@@ -11088,7 +9071,7 @@ def _get_prompt(name: str, args: dict) -> list[dict]:  # noqa: C901
             "   - Para doc_create (.docx): el bloque `{\"type\": \"chart\", ...}` dentro de content_blocks\n"
             "   - Para doc_create (.xlsx): la entrada `{\"type\": \"bar\", ...}` dentro de `charts` de una hoja\n"
             "   - Para doc_create (.pptx): el bloque `{\"type\": \"chart\", ...}` dentro de `blocks` de un slide\n"
-            "   - Para matplotlib: los args exactos de la tool correspondiente\n\n"
+            "   - Para insert_chart (.docx): path, chart_type y data={categories, series}\n\n"
             f"Formato de salida objetivo: **{fmt}**"
         )
 
@@ -11536,18 +9519,6 @@ _RESOURCES = [
         "description": "Referencia completa de tipos de gráficas con sus tools y parámetros clave",
         "mimeType":    "application/json",
     },
-    {
-        "uri":         "office://diagram_templates",
-        "name":        "Plantillas de diagramas",
-        "description": "Plantillas y ejemplos JSON para flowchart, Gantt, organigrama, heatmap y radar",
-        "mimeType":    "application/json",
-    },
-    {
-        "uri":         "office://flowchart_shapes",
-        "name":        "Referencia de formas para diagramas de flujo",
-        "description": "Lista de formas estándar BPMN/UML para diagramas de flujo con descripción y uso",
-        "mimeType":    "application/json",
-    },
 ]
 
 
@@ -11741,100 +9712,37 @@ def _resource_font_combinations() -> str:
 def _resource_chart_types() -> str:
     import json
     chart_types = [
-        {"name": "bar",           "tool": "create_bar_chart",         "use_case": "Comparar categorías",           "multi_series": True,  "key_params": ["categories", "values/series", "x_label", "y_label", "horizontal", "stacked"]},
-        {"name": "stacked_bar",   "tool": "create_stacked_bar_chart", "use_case": "Comparar proporciones apiladas","multi_series": True,  "key_params": ["categories", "series", "horizontal"]},
-        {"name": "line",          "tool": "create_line_chart",        "use_case": "Tendencias temporales",         "multi_series": True,  "key_params": ["x_labels", "y_values/series", "fill_area"]},
-        {"name": "pie",           "tool": "create_pie_chart",         "use_case": "Distribución porcentual",       "multi_series": False, "key_params": ["labels", "sizes", "donut", "explode"]},
-        {"name": "scatter",       "tool": "create_scatter_chart",     "use_case": "Correlación entre variables",   "multi_series": True,  "key_params": ["x_values", "y_values", "trend_line", "point_labels"]},
-        {"name": "heatmap",       "tool": "create_heatmap",           "use_case": "Matrices de correlación, KPIs", "multi_series": False, "key_params": ["data", "row_labels", "col_labels", "colormap"]},
-        {"name": "radar",         "tool": "create_radar_chart",       "use_case": "Comparar perfiles/habilidades", "multi_series": True,  "key_params": ["categories", "series", "fill"]},
-        {"name": "gantt",         "tool": "create_gantt_chart",       "use_case": "Planificación de proyectos",    "multi_series": False, "key_params": ["tasks[{name,start,end,category}]"]},
-        {"name": "org_chart",     "tool": "create_org_chart",         "use_case": "Jerarquías organizativas",      "multi_series": False, "key_params": ["nodes[{id,label,parent}]"]},
-        {"name": "xlsx_bar/line/pie", "tool": "xlsx_insert_chart",    "use_case": "Gráfica nativa incrustada en .xlsx","multi_series": True, "key_params": ["path", "sheet", "data_range", "chart_type"]},
+        {"name": "bar",            "use_case": "Comparar categorías (barras verticales agrupadas)", "multi_series": True},
+        {"name": "column",         "use_case": "Columnas verticales",                               "multi_series": True},
+        {"name": "stacked_bar",    "use_case": "Proporciones apiladas (horizontal)",                "multi_series": True},
+        {"name": "stacked_column", "use_case": "Proporciones apiladas (vertical)",                  "multi_series": True},
+        {"name": "line",           "use_case": "Tendencias temporales",                             "multi_series": True},
+        {"name": "line_markers",   "use_case": "Tendencias con marcadores en cada punto",           "multi_series": True},
+        {"name": "area",           "use_case": "Áreas acumuladas / volumen",                        "multi_series": True},
+        {"name": "pie",            "use_case": "Distribución porcentual",                           "multi_series": False},
+        {"name": "doughnut",       "use_case": "Distribución porcentual con hueco central",         "multi_series": False},
+        {"name": "scatter",        "use_case": "Correlación X/Y (series con x_values/y_values)",     "multi_series": True},
+        {"name": "radar",          "use_case": "Comparar perfiles multidimensionales (≤8 ejes)",    "multi_series": True},
     ]
-    return json.dumps(chart_types, ensure_ascii=False, indent=2)
-
-
-def _resource_diagram_templates() -> str:
-    import json
-    templates = {
-        "gantt_example": {
-            "description": "Diagrama de Gantt básico para un proyecto de 3 semanas",
-            "tool": "create_gantt_chart",
-            "args": {
-                "title": "Plan de Proyecto Q1",
-                "style": "office",
-                "tasks": [
-                    {"name": "Análisis de requisitos", "start": "2026-01-05", "end": "2026-01-10", "category": "Análisis"},
-                    {"name": "Diseño de arquitectura", "start": "2026-01-08", "end": "2026-01-15", "category": "Diseño"},
-                    {"name": "Desarrollo módulo A",    "start": "2026-01-13", "end": "2026-01-22", "category": "Desarrollo"},
-                    {"name": "Desarrollo módulo B",    "start": "2026-01-16", "end": "2026-01-26", "category": "Desarrollo"},
-                    {"name": "Testing integración",    "start": "2026-01-23", "end": "2026-01-30", "category": "QA"},
-                    {"name": "Despliegue producción",  "start": "2026-01-29", "end": "2026-01-31", "category": "Release"},
-                ],
-            },
+    return json.dumps({
+        "word_insert_chart": {
+            "tool": "insert_chart",
+            "note": "Gráfica OOXML NATIVA en .docx (objeto editable de Word, vectorial). Crea el documento si no existe.",
+            "data_format": {"categories": ["..."], "series": [{"label": "...", "values": ["..."]}]},
+            "chart_types": chart_types,
         },
-        "org_chart_example": {
-            "description": "Organigrama de departamento TI",
-            "tool": "create_org_chart",
-            "args": {
-                "title": "Departamento de TI",
-                "nodes": [
-                    {"id": "cto",      "label": "CTO",                "parent": None},
-                    {"id": "dev_lead", "label": "Dev Lead",            "parent": "cto"},
-                    {"id": "ops_lead", "label": "Ops Lead",            "parent": "cto"},
-                    {"id": "qa_lead",  "label": "QA Lead",             "parent": "cto"},
-                    {"id": "fe_dev",   "label": "Frontend Dev",        "parent": "dev_lead"},
-                    {"id": "be_dev",   "label": "Backend Dev",         "parent": "dev_lead"},
-                    {"id": "sre",      "label": "SRE Engineer",        "parent": "ops_lead"},
-                    {"id": "qa_eng",   "label": "QA Engineer",         "parent": "qa_lead"},
-                ],
-            },
+        "excel_chart": {
+            "tool": "xlsx_insert_chart",
+            "note": "Gráfica nativa de openpyxl anclada a un rango de celdas en .xlsx.",
+            "chart_types": ["bar", "line", "pie", "area", "scatter"],
+            "key_params": ["path", "sheet", "data_range", "chart_type", "position"],
         },
-        "radar_example": {
-            "description": "Gráfico radar para comparar habilidades de dos personas",
-            "tool": "create_radar_chart",
-            "args": {
-                "title": "Evaluación de Competencias",
-                "categories": ["Python", "DevOps", "SQL", "Comunicación", "Liderazgo", "Cloud"],
-                "series": [
-                    {"label": "Ana", "values": [9, 7, 8, 7, 6, 8]},
-                    {"label": "Pedro", "values": [7, 9, 6, 8, 9, 7]},
-                ],
-            },
+        "pptx_chart": {
+            "tool": "pptx_insert_chart",
+            "note": "Gráfica nativa en una diapositiva .pptx.",
+            "chart_types": ["bar", "column", "line", "pie"],
         },
-        "heatmap_example": {
-            "description": "Heatmap de KPIs mensuales por región",
-            "tool": "create_heatmap",
-            "args": {
-                "title": "KPIs por Región — Q1 2026",
-                "colormap": "RdYlGn",
-                "row_labels": ["Norte", "Sur", "Este", "Oeste"],
-                "col_labels": ["Enero", "Febrero", "Marzo"],
-                "data": [[78, 82, 85], [90, 88, 92], [65, 70, 75], [85, 87, 90]],
-            },
-        },
-    }
-    return json.dumps(templates, ensure_ascii=False, indent=2)
-
-
-def _resource_flowchart_shapes() -> str:
-    import json
-    shapes = [
-        {"name": "Terminal (oval)",     "use": "Inicio/Fin del proceso",          "symbol": "( )"},
-        {"name": "Process (rectangle)", "use": "Acción o paso del proceso",       "symbol": "[  ]"},
-        {"name": "Decision (diamond)",  "use": "Condición o pregunta Sí/No",      "symbol": "<  >"},
-        {"name": "IO (parallelogram)",  "use": "Entrada/Salida de datos",         "symbol": "/  /"},
-        {"name": "Document",            "use": "Documento generado o consultado", "symbol": "[~]"},
-        {"name": "Database (cylinder)", "use": "Base de datos o almacenamiento",  "symbol": "[DB]"},
-        {"name": "Manual input",        "use": "Entrada manual por el usuario",   "symbol": "[M]"},
-        {"name": "Connector (circle)",  "use": "Referencia a otro punto del flujo","symbol": "(A)"},
-        {"name": "Subprocess",          "use": "Subproceso o función externa",    "symbol": "[+]"},
-        {"name": "Delay",               "use": "Espera o retraso en el proceso",  "symbol": "[D>]"},
-        {"name": "Merge",               "use": "Unión de flujos paralelos",       "symbol": "[V]"},
-        {"name": "Parallel",            "use": "División en flujos paralelos",    "symbol": "[||]"},
-    ]
-    return json.dumps(shapes, ensure_ascii=False, indent=2)
+    }, ensure_ascii=False, indent=2)
 
 
 _RESOURCE_FNS = {
@@ -11851,8 +9759,6 @@ _RESOURCE_FNS = {
     "office://theme_colors":        _resource_theme_colors,
     "office://font_combinations":   _resource_font_combinations,
     "office://chart_types":         _resource_chart_types,
-    "office://diagram_templates":   _resource_diagram_templates,
-    "office://flowchart_shapes":    _resource_flowchart_shapes,
 }
 
 

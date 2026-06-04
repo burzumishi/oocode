@@ -1,6 +1,16 @@
 # 22 — Servidores MCP
 
-OOCode incluye 5 servidores MCP bundled que se ejecutan como procesos independientes y se comunican via stdio con JSON-RPC 2.0 (protocolo MCP 2024-11-05).
+OOCode incluye 7 servidores MCP bundled que se ejecutan como procesos independientes y se comunican via stdio con JSON-RPC 2.0 (protocolo MCP 2024-11-05).
+
+| Servidor | Tools | Por defecto |
+|----------|-------|-------------|
+| `oocode-assistant` | 54 | activo |
+| `devops-assistant` | 66 | activo |
+| `system-assistant` | ~40 | activo |
+| `database-assistant` | 20 | desactivado |
+| `home-office-assistant` | 66 | desactivado |
+| `security-assistant` | 24 | desactivado |
+| `iot-assistant` | 25 | desactivado |
 
 ## Activación
 
@@ -10,7 +20,9 @@ Cada servidor se activa con su flag en `~/.oocode/oocode.json`:
 {
   "mcp": {
     "oocodeAssistant":    { "enabled": true  },
+    "devopsAssistant":    { "enabled": true  },
     "systemAssistant":    { "enabled": true  },
+    "databaseAssistant":  { "enabled": false },
     "homeOfficeAssistant":{ "enabled": false },
     "securityAssistant":  { "enabled": false },
     "iotAssistant":       { "enabled": false },
@@ -31,7 +43,7 @@ Estado en el REPL:
 
 **Fichero:** `mcp_servers/oocode_assistant.py`  
 **Flag:** `oocodeAssistant.enabled` (activo por defecto)  
-**Descripción:** Herramientas de desarrollo: git, docker, filesystem, búsqueda de código, símbolos, utilidades
+**Descripción:** 54 herramientas de análisis de código, edición, utilidades y linting. Git, Docker y fs-mutations se movieron a `devops-assistant`.
 
 ### Tools (categorías)
 
@@ -41,9 +53,11 @@ Estado en el REPL:
 |------|-------------|
 | `read_files` | Leer múltiples ficheros en un batch |
 | `write_file` | Crear o sobreescribir un fichero |
-| `find_files` | Buscar ficheros por patrón glob |
+| `ls_file` / `ls_dir` | Listar fichero/directorio con permisos |
+| `find_files` / `find_file` / `find_dir` | Buscar ficheros y directorios |
 | `list_recent_files` | Ficheros modificados recientemente |
 | `read_project_file` | Leer fichero relativo al directorio del proyecto |
+| `file_stat` | Metadatos de un fichero (permisos, tamaño, fechas) |
 
 **Búsqueda de código:**
 
@@ -55,6 +69,20 @@ Estado en el REPL:
 | `read_sections` | Extraer funciones/clases por nombre sin leer el fichero entero |
 | `symbol_lookup` | Buscar símbolo en el proyecto con ripgrep |
 | `affected_files` | Ficheros que usan un símbolo dado |
+| `find_symbol` / `list_symbols` | Buscar/listar símbolos con ctags |
+| `analyze_codebase` | Resumen estructural del proyecto |
+| `code_compare` | Comparar implementaciones de funciones entre ficheros |
+
+**Edición avanzada:**
+
+| Tool | Descripción |
+|------|-------------|
+| `bulk_replace` | Reemplazos múltiples en un fichero |
+| `regex_replace` | Reemplazo con regex en fichero |
+| `smart_replace` | Reemplazo inteligente con contexto |
+| `patch_apply` | Aplicar un parche diff |
+| `pre_edit_check` | Verificación antes de editar (busca old_string) |
+| `context_before_edit` | Leer contexto antes de modificar |
 
 **Análisis y utilidades:**
 
@@ -62,64 +90,30 @@ Estado en el REPL:
 |------|-------------|
 | `get_datetime` | Fecha y hora actuales |
 | `system_info` | Información del sistema |
-| `run_quick_check` | Verificación rápida de un fichero (sintaxis, linters) |
+| `run_quick_check` | Verificación rápida (sintaxis, linters) |
 | `search_todos` | Buscar TODOs/FIXMEs en el proyecto |
 | `port_check` | Verificar si un puerto está en uso |
 | `http_get` | Petición HTTP GET |
 | `calculate` | Evaluar expresión matemática |
 | `diff_files` | Diff entre dos ficheros |
-| `code_compare` | Comparar implementaciones de funciones |
 | `env_check` | Verificar variables de entorno |
-| `json_format` | Formatear JSON |
-| `json_validate` | Validar JSON |
+| `json_format` / `json_validate` | Formatear y validar JSON |
 | `yaml_validate` | Validar YAML |
-| `jq_query` | Ejecutar consulta jq sobre JSON |
+| `jq_query` | Ejecutar consulta jq |
+| `xml_format` / `xml_validate` | Formatear y validar XML |
+| `render_markdown` | Renderizar markdown a HTML |
 | `hash_text` | Calcular hash de un texto |
+| `url_encode` | Codificar URL |
 | `process_list` | Lista de procesos activos |
 
-**Git:**
+**Linting:**
 
 | Tool | Descripción |
 |------|-------------|
-| `git_status` | Estado del repositorio |
-| `git_diff` | Diff de cambios |
-| `git_log` | Historial de commits |
-| `git_add` | Stage ficheros |
-| `git_commit` | Crear commit |
-| `git_push` | Push al remoto |
-| `git_pull` | Pull del remoto |
-| `git_branch` | Gestión de ramas |
-| `git_stash` | Stash de cambios |
-| `git_patch` | Aplicar/crear parches |
-| `git_clone` | Clonar repositorio |
-| `git_worktree` | Gestión de git worktrees |
-| `git_blame` | Ver autoría por línea |
-| `git_rebase` | Rebase interactivo |
-| `git_tag` | Gestión de tags |
-| `git_cherry_pick` | Cherry-pick de commits |
-
-**Docker:**
-
-| Tool | Descripción |
-|------|-------------|
-| `docker_ps` | Lista de contenedores |
-| `docker_logs` | Logs de un contenedor |
-| `docker_exec` | Ejecutar comando en contenedor |
-| `docker_inspect` | Inspeccionar contenedor |
-| `docker_images` | Lista de imágenes |
-| `docker_stop` | Parar contenedor |
-| `docker_rm` | Eliminar contenedor |
-| `docker_cp` | Copiar ficheros entre host y contenedor |
-| `compose_version` | Versión de docker compose |
-| `compose_services` | Servicios del compose |
-| `compose_status` | Estado de servicios |
-| `compose_up` | Levantar servicios |
-| `compose_down` | Parar y eliminar servicios |
-| `compose_logs` | Logs de servicios compose |
-| `compose_build` | Construir imágenes |
-| `compose_pull` | Pull de imágenes |
-| `compose_exec` | Ejecutar en servicio |
-| `compose_run` | Ejecutar comando one-off |
+| `lint_file` / `lint_project` | Linting de fichero/proyecto |
+| `gitlint_check` | Validar formato de mensajes git |
+| `ansible_lint` | Linting de playbooks Ansible |
+| `efm_config_update` | Actualizar configuración efm-langserver |
 
 ### Prompts (9)
 
@@ -141,7 +135,126 @@ El servidor expone recursos estáticos como referencia contextual para el LLM.
 
 ---
 
-## 2. system-assistant
+## 2. devops-assistant
+
+**Fichero:** `mcp_servers/devops_assistant.py`  
+**Flag:** `devopsAssistant.enabled` (activo por defecto)  
+**Descripción:** 66 herramientas para flujos DevOps: git, Docker/Compose, build, debug, archive y mutaciones del sistema de ficheros.
+
+### Tools (categorías)
+
+**Git (16):**
+
+| Tool | Descripción |
+|------|-------------|
+| `git_status` / `git_diff` / `git_log` | Estado, diff e historial |
+| `git_add` / `git_commit` / `git_push` / `git_pull` | Operaciones básicas |
+| `git_branch` / `git_stash` / `git_tag` | Gestión de ramas, stash y tags |
+| `git_clone` / `git_worktree` | Clonar y gestionar worktrees |
+| `git_blame` / `git_rebase` / `git_cherry_pick` / `git_patch` | Historial avanzado |
+
+**Docker / Compose (23):**
+
+| Tool | Descripción |
+|------|-------------|
+| `docker_ps` / `docker_logs` / `docker_exec` | Operaciones de contenedor |
+| `docker_inspect` / `docker_images` / `docker_stop` / `docker_rm` / `docker_cp` | Gestión de contenedores |
+| `compose_up` / `compose_down` / `compose_stop` / `compose_restart` | Ciclo de vida |
+| `compose_logs` / `compose_build` / `compose_pull` / `compose_exec` / `compose_run` | Operaciones compose |
+| `compose_version` / `compose_services` / `compose_status` / `compose_config` / `compose_images` / `compose_top` | Info compose |
+
+**Debug (4):**
+
+| Tool | Descripción |
+|------|-------------|
+| `strace_run` | Ejecutar con strace |
+| `gdb_run` | Depurar con GDB |
+| `pdb_run` | Depurar Python con pdb |
+| `valgrind_run` | Análisis de memoria con valgrind |
+
+**Build (7):**
+
+| Tool | Descripción |
+|------|-------------|
+| `make_run` | Ejecutar target de Makefile |
+| `run_script` | Ejecutar script (bash/python/node/ruby) |
+| `format_code` | Formatear código (ruff/black/gofmt/…) |
+| `mypy_check` | Chequeo de tipos Python |
+| `python_exec` | Ejecutar fragmento Python |
+| `pip_tool` | Gestión de paquetes pip |
+| `npm_tool` | Gestión de paquetes npm |
+
+**Archive (3):**
+
+| Tool | Descripción |
+|------|-------------|
+| `archive_create` | Crear archivo tar.gz/zip |
+| `archive_list` | Listar contenido del archivo |
+| `archive_extract` | Extraer archivo |
+
+**Filesystem mutations (13):**
+
+| Tool | Descripción |
+|------|-------------|
+| `chmod_file` / `chmod_dir` | Cambiar permisos |
+| `chown_file` / `chown_dir` | Cambiar propietario |
+| `mv_file` / `cp_file` | Mover/copiar ficheros |
+| `rm_file` / `rm_dir` | Eliminar ficheros/directorios |
+| `mkdir_dir` / `touch_file` | Crear directorio/fichero |
+| `symlink_create` / `readlink` | Enlace simbólico |
+| `file_stat` | Metadatos de fichero |
+
+---
+
+## 3. database-assistant
+
+**Fichero:** `mcp_servers/database_assistant.py`  
+**Flag:** `databaseAssistant.enabled` (desactivado por defecto)  
+**Descripción:** 20 herramientas de bases de datos. SQLite con stdlib Python (sin deps). PostgreSQL y MySQL opcionales.
+
+### Tools
+
+**SQLite (stdlib, siempre disponible):**
+
+| Tool | Descripción |
+|------|-------------|
+| `sqlite_query` | Ejecutar SELECT (resultado como tabla ASCII) |
+| `sqlite_schema` | Mostrar CREATE TABLE de todas las tablas |
+| `sqlite_tables` | Listar tablas con conteo de filas |
+| `sqlite_insert` / `sqlite_update` / `sqlite_delete` | Escritura |
+| `sqlite_create_table` | Crear tabla con DDL |
+| `sqlite_export` | Exportar tabla a CSV o JSON |
+| `sqlite_to_csv` | Exportar tabla a fichero CSV |
+| `sqlite_vacuum` | VACUUM + ANALYZE |
+| `sqlite_indices` | Listar índices |
+| `sqlite_explain` | EXPLAIN QUERY PLAN |
+| `csv_to_sqlite` | Importar CSV a una tabla SQLite |
+
+**PostgreSQL (requiere `pip install psycopg2`):**
+
+| Tool | Descripción |
+|------|-------------|
+| `pg_query` | SELECT con salida tabla ASCII |
+| `pg_schema` | Lista tablas + columnas |
+| `pg_explain` | EXPLAIN ANALYZE |
+
+**MySQL (requiere `pip install pymysql`):**
+
+| Tool | Descripción |
+|------|-------------|
+| `mysql_query` | SELECT con salida tabla ASCII |
+| `mysql_schema` | Lista tablas + columnas |
+
+**Utilidades:**
+
+| Tool | Descripción |
+|------|-------------|
+| `db_stats` | Estadísticas: tamaño, nº tablas, nº filas |
+| `sql_format` | Formatear SQL con indentación |
+
+---
+
+## 4. system-assistant
 
 **Fichero:** `mcp_servers/system_assistant.py`  
 **Flag:** `systemAssistant.enabled` (activo por defecto)  
@@ -230,13 +343,13 @@ El servidor expone recursos estáticos como referencia contextual para el LLM.
 
 ---
 
-## 3. home-office-assistant
+## 5. home-office-assistant
 
 **Fichero:** `mcp_servers/home_office_assistant.py`  
 **Flag:** `homeOfficeAssistant.enabled` (desactivado por defecto)  
-**Descripción:** 77+ herramientas para documentación corporativa O365, email, calendario, notas, OCR, CMDB
+**Descripción:** 66 herramientas para documentación corporativa O365 **nativa**, email, calendario, notas, OCR, CMDB. Genera solo contenido O365 nativo (sin conversión markdown→documento ni gráficas PNG matplotlib).
 
-**Requisito:** `pip install python-docx python-pptx openpyxl matplotlib pillow docxtpl`
+**Requisito:** `pip install python-docx python-pptx openpyxl pillow docxtpl`
 
 ### Tools (categorías)
 
@@ -249,8 +362,7 @@ El servidor expone recursos estáticos como referencia contextual para el LLM.
 | `doc_read` | Leer contenido de un documento Word |
 | `doc_read_template_fields` | Listar campos de una plantilla |
 | `doc_list_templates` | Listar plantillas disponibles |
-| `doc_insert_chart_native` | Insertar gráfico nativo OOXML en Word |
-| `doc_insert_diagram` | Insertar diagrama (Mermaid/tabla de diagrama) |
+| `insert_chart` | Insertar gráfica OOXML **nativa** en Word (bar/column/line/area/pie/doughnut/scatter/stacked/radar) — objeto editable de Word |
 | `doc_embed_image` | Incrustar imagen en documento |
 | `doc_apply_style` | Aplicar estilo O365 (Calibri/Calibri Light) |
 | `doc_set_table_style` | Aplicar estilo a tabla en Word |
@@ -313,8 +425,6 @@ El servidor expone recursos estáticos como referencia contextual para el LLM.
 |------|-------------|
 | `image_to_text` | OCR: extraer texto de imagen |
 | `pdf_extract_text` | Extraer texto de PDF |
-| `markdown_to_html` | Convertir Markdown a HTML |
-| `insert_chart` | Insertar gráfico dinámico (matplotlib) |
 
 **Contactos y CMDB:**
 
@@ -368,7 +478,7 @@ Los documentos Word se crean con `content_blocks`, una lista de bloques estructu
 
 ---
 
-## 4. security-assistant
+## 6. security-assistant
 
 **Fichero:** `mcp_servers/security_assistant.py`  
 **Flag:** `securityAssistant.enabled` (desactivado por defecto)  
@@ -438,7 +548,7 @@ Los documentos Word se crean con `content_blocks`, una lista de bloques estructu
 
 ---
 
-## 5. iot-assistant
+## 7. iot-assistant
 
 **Fichero:** `mcp_servers/iot_assistant.py`  
 **Flag:** `iotAssistant.enabled` (desactivado por defecto)  

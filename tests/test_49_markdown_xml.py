@@ -246,7 +246,7 @@ class TestReportResources:
 
     def test_total_resources_count(self):
         from mcp_servers.oocode_assistant import _RESOURCES
-        assert len(_RESOURCES) == 25
+        assert len(_RESOURCES) == 21
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -461,7 +461,8 @@ class TestTotals:
 
     def test_tool_count_120(self):
         from mcp_servers.oocode_assistant import _TOOLS
-        assert len(_TOOLS) == 120
+        from mcp_servers.devops_assistant import _TOOLS as _DEVOPS_TOOLS
+        assert len(_TOOLS) + len(_DEVOPS_TOOLS) == 119
 
     def test_prompt_count_45(self):
         from mcp_servers.oocode_assistant import _PROMPTS

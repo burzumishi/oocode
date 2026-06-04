@@ -45,7 +45,7 @@ def api_agents():
 def api_agent_output(run_id: str):
     """Devuelve la tarea y resultado completo de un subagente por run_id (prefix match)."""
     try:
-        from agent.subagent import get_by_prefix, _registry
+        from agent.subagent import get_by_prefix
         sub = get_by_prefix(run_id)
         if sub is None:
             # Buscar también en recientes

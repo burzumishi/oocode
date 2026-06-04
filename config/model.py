@@ -1,523 +1,28 @@
+"""Modelos de configuración: AgentDef y OOConfig (carga/guardado de oocode.json)."""
 import json
 from pathlib import Path
 from typing import Optional
+
 from pydantic import BaseModel
 
-CONFIG_DIR       = Path.home() / ".oocode"
-CONFIG_FILE      = CONFIG_DIR / "oocode.json"
-MEMORY_DIR       = CONFIG_DIR / "memory"
-HISTORY_FILE     = CONFIG_DIR / "history"
-KEYBINDINGS_FILE = CONFIG_DIR / "keybindings.json"
+from config.constants import CONFIG_DIR, DEFAULT_AGENT_ID
+from config.defaults import DEFAULT_CONFIG
 
-VERSION     = "0.3.8"
-APP_NAME    = "OOCode"
-APP_SUBTITLE = "Ollama Open Code"
+# Host Ollama por defecto — las embeddings siempre usan protocolo Ollama, así que
+# con backend de chat no-Ollama y sin embedHost explícito se cae a este local.
+_DEFAULT_OLLAMA_HOST = DEFAULT_CONFIG["api"]["host"]
 
-DEFAULT_AGENT_ID = "main"
 
-DEFAULT_CONFIG: dict = {
-    "ollama": {
-        "host":             "http://localhost:11434",
-        "extraHosts":       [],           # hosts adicionales para subagentes (round-robin)
-        "embedHost":        "",           # host dedicado para embeddings (vacío = usar host principal)
-        "subagentRouting":  "round-robin", # "round-robin" | "primary-only"
-        "ollamaRetryCount": 2,            # reintentos automáticos en timeout de Ollama (0 = sin retry)
-        "ollamaRetryDelay": 3.0           # segundos de espera base entre reintentos (se duplica con backoff)
-    },
-    "agents": {
-        "defaults": {
-            "model": None,
-            "workspace": str(CONFIG_DIR / "workspace" / "main")
-        },
-        "list": [
-            {
-                "id":        "main",
-                "name":      "OOCode",
-                "emoji":     "🤖",
-                "model":     None,
-                "workspace": str(CONFIG_DIR / "workspace" / "main")
-            }
-        ]
-    },
-    "permissions": {
-        # Core tools
-        "bash":              "ask",
-        "write_file":        "ask",
-        "edit_file":         "ask",
-        "read_file":         "auto",
-        "list_dir":          "auto",
-        "web_search":        "auto",
-        "web_fetch":         "auto",
-        "searxng_search":    "auto",
-        "spawn_subagent":    "ask",
-        "explore":           "auto",
-        "create_team":       "ask",
-        "run_team":          "ask",
-        # Linting (MCP tools)
-        "lint_file":         "auto",
-        "lint_project":      "auto",
-        # Git (MCP tools — read-only → auto, write → ask)
-        "git_status":        "auto",
-        "git_diff":          "auto",
-        "git_log":           "auto",
-        "git_commit":        "ask",
-        "git_push":          "ask",
-        "git_pull":          "ask",
-        "git_add":           "ask",
-        "git_branch":        "auto",
-        "git_stash":         "ask",
-        "git_patch":         "ask",
-        "git_clone":         "ask",
-        "git_worktree":      "ask",
-        # Tests (plugin test_runner) — solo verifican, no modifican ficheros
-        "run_tests":         "auto",
-        "test_file":         "auto",
-        # Docker (MCP tools — read-only → auto, write → ask)
-        "docker_ps":         "auto",
-        "docker_logs":       "auto",
-        "docker_inspect":    "auto",
-        "docker_images":     "auto",
-        "docker_exec":       "ask",
-        "docker_stop":       "ask",
-        "docker_rm":         "ask",
-        "docker_cp":         "ask",
-        # Docker Compose (MCP tools — read-only → auto, write → ask)
-        "compose_version":   "auto",
-        "compose_services":  "auto",
-        "compose_status":    "auto",
-        "compose_config":    "auto",
-        "compose_images":    "auto",
-        "compose_top":       "auto",
-        "compose_logs":      "auto",
-        "compose_up":        "ask",
-        "compose_down":      "ask",
-        "compose_stop":      "ask",
-        "compose_restart":   "ask",
-        "compose_build":     "ask",
-        "compose_pull":      "ask",
-        "compose_exec":      "ask",
-        "compose_run":       "ask",
-        # Embeddings (plugin embeddings_search)
-        "index_workspace":   "auto",
-        "semantic_search":   "auto",
-        # code_search (read-only)
-        "code_search":       "auto",
-        # edit_files (atómico — requiere confirmación)
-        "edit_files":        "ask",
-        # Búsqueda de código (MCP bundled — read-only)
-        "grep_code":         "auto",
-        "multi_grep":        "auto",
-        "code_outline":      "auto",
-        "read_sections":     "auto",
-        "affected_files":    "auto",
-        "symbol_lookup":     "auto",
-        "code_compare":      "auto",
-        "find_files":        "auto",
-        "read_files":        "auto",
-        "diff_files":        "auto",
-        "http_get":          "auto",   # solo permite URLs locales
-        "calculate":         "auto",
-        "env_check":         "auto",
-        "json_format":       "auto",
-        "hash_text":         "auto",
-        "port_check":        "auto",
-        "search_todos":      "auto",
-        "run_quick_check":   "auto",
-        "system_info":       "auto",
-        "list_recent_files": "auto",
-        "read_project_file": "auto",
-        "get_datetime":      "auto",
-        "process_list":      "auto",
-        # LSP plugin (read-only → auto; escribe fichero → ask)
-        "lsp_definition":      "auto",
-        "lsp_references":      "auto",
-        "lsp_hover":           "auto",
-        "lsp_symbols":         "auto",
-        "lsp_diagnostics":     "auto",
-        "lsp_completion":      "auto",
-        "lsp_type_definition":    "auto",
-        "lsp_implementation":     "auto",
-        "lsp_code_actions":       "auto",
-        "lsp_workspace_symbols":  "auto",
-        "lsp_call_hierarchy":     "auto",
-        "lsp_rename":             "ask",   # puede modificar múltiples ficheros
-        "lsp_format":             "ask",   # modifica el fichero
-        "lsp_restart":            "auto",  # solo reinicia el servidor, no modifica ficheros
-        # ctags plugin
-        "build_symbol_index": "ask",
-        "find_symbol":        "auto",
-        "list_symbols":       "auto",
-        # Filesystem tools (MCP) — lectura → auto, escritura/destructivo → ask
-        "ls_file":            "auto",
-        "ls_dir":             "auto",
-        "find_file":          "auto",
-        "find_dir":           "auto",
-        "grep_file":          "auto",
-        "chmod_file":         "ask",
-        "chmod_dir":          "ask",
-        "chown_file":         "ask",
-        "chown_dir":          "ask",
-        "mv_file":            "ask",
-        "cp_file":            "ask",
-        "rm_file":            "ask",
-        "rm_dir":             "ask",
-        "mkdir_dir":          "ask",
-        "touch_file":         "ask",
-        # Debug de procesos (ask por impacto)
-        "strace_run":         "ask",
-        "gdb_run":            "ask",
-        "pdb_run":            "ask",
-        "valgrind_run":       "ask",
-        # Build y ejecución
-        "make_run":           "ask",
-        "run_script":         "ask",
-        "format_code":        "ask",
-        "mypy_check":         "auto",
-        # Python tools
-        "python_exec":        "auto",
-        "pip_tool":           "ask",
-        # Node.js tools
-        "npm_tool":           "ask",
-        # Archive
-        "archive_extract":    "ask",
-        "archive_create":     "ask",
-        "archive_list":       "auto",
-        # Metadatos de ficheros
-        "file_stat":          "auto",
-        "symlink_create":     "ask",
-        "readlink":           "auto",
-        # Parches y edición avanzada
-        "patch_apply":        "ask",
-        "regex_replace":      "ask",
-        "bulk_replace":       "ask",
-        # Edición segura compuesta
-        "smart_replace":      "ask",
-        "context_before_edit":"auto",
-        "pre_edit_check":     "auto",
-        # Visualización y análisis
-        "tree":               "auto",
-        "analyze_codebase":   "auto",   # meta-tool: tree+count+grep en una llamada (lectura)
-        # Markdown y XML
-        "render_markdown":    "auto",   # lectura/validación Markdown
-        "xml_format":         "auto",   # formato XML (puede escribir si se pasa output)
-        "xml_validate":       "auto",   # validación XML (solo lectura)
-        # Linters especializados
-        "gitlint_check":      "auto",   # solo lectura git + gitlint
-        "ansible_lint":       "auto",   # solo lectura + ansible-lint
-        "efm_config_update":  "auto",   # escribe ~/.oocode/efm-langserver.yaml
-        "count_lines":        "auto",   # lectura — cuenta líneas de un fichero
-        "template_fill":      "auto",   # renderizado de plantillas (no escribe)
-        # System Assistant MCP — lectura → auto, escritura/acción → ask
-        "systemctl_status":   "auto",
-        "systemctl_action":   "ask",
-        "journalctl":         "auto",
-        "net_interfaces":     "auto",
-        "net_connections":    "auto",
-        "net_ping":           "auto",
-        "net_dns":            "auto",
-        "disk_usage":         "auto",
-        "disk_inodes":        "auto",
-        "dir_size":           "auto",
-        "lsblk_info":         "auto",
-        "user_list":          "auto",
-        "user_info":          "auto",
-        "group_list":         "auto",
-        "who_logged":         "auto",
-        "ps_list":            "auto",
-        "top_snapshot":       "auto",
-        "kill_process":       "ask",
-        "fw_status":          "auto",
-        "fw_rules":           "auto",
-        "fw_allow":           "ask",
-        "fw_deny":            "ask",
-        "sys_info":           "auto",
-        "sys_updates":        "auto",
-        "sys_logs":           "auto",
-        "env_vars":           "auto",
-        "cron_list":          "auto",
-        "apt_update":         "ask",
-        "apt_upgrade":        "ask",
-        "apt_install":        "ask",
-        "apt_remove":         "ask",
-        "apt_search":         "auto",
-        "apt_info":           "auto",
-        "apt_list_installed": "auto",
-        "dnf_update":         "auto",
-        "dnf_install":        "ask",
-        "dnf_remove":         "ask",
-        "dnf_search":         "auto",
-        "dnf_info":           "auto",
-        "rpm_query":          "auto",
-        # Tree-sitter plugin (read-only)
-        "extract_functions": "auto",
-        "extract_classes":   "auto",
-        "extract_imports":   "auto",
-        "ast_summary":       "auto",
-        # Todo plugin
-        "todo_list":         "auto",
-        "todo_add":          "ask",
-        "todo_done":         "auto",
-        "todo_sync":         "auto",
-        # Changelog plugin (read-only)
-        "changelog_today":   "auto",
-        "changelog_session": "auto",
-        "changelog_week":    "auto",
-        # Clipboard plugin
-        "clipboard_copy":    "auto",
-        "clipboard_paste":   "auto",
-        # Vault plugin
-        "vault_list":        "auto",
-        "vault_get":         "auto",
-        # Workspace — guardar instrucciones persistentes
-        "workspace_remember": "auto",
-        # Memoria persistente del agente
-        "mem_save":           "auto",
-        # Planificación autónoma del agente
-        "plan_create":        "auto",
-        "task_done":          "auto",
-        # Git nuevas tools
-        "git_blame":          "auto",
-        "git_rebase":         "ask",
-        "git_tag":            "ask",
-        "git_cherry_pick":    "ask",
-        # Validación y procesado
-        "json_validate":      "auto",
-        "yaml_validate":      "auto",
-        "jq_query":           "auto",
-        # Skills (converters + snippets — pure computation)
-        "encode_base64":     "auto",
-        "decode_base64":     "auto",
-        "url_encode":        "auto",
-        "url_decode":        "auto",
-        "compute_hash":      "auto",
-        "to_base":           "auto",
-        "format_json":       "auto",
-        "escape_string":     "auto",
-        "hex_encode":        "auto",
-        "hex_decode":        "auto",
-        "snippet_save":      "auto",
-        "snippet_get":       "auto",
-        "snippet_list":      "auto",
-        "snippet_delete":    "auto",
-        # IoT assistant
-        "tapo_list":       "auto",
-        "tapo_status":     "auto",
-        "tapo_on_off":     "ask",
-        "tapo_set":        "ask",
-        "blink_status":    "auto",
-        "blink_arm":       "ask",
-        "blink_snapshot":  "ask",
-        "blink_clips":     "auto",
-        "blink_verify":    "auto",
-        "alexa_devices":   "auto",
-        "alexa_speak":     "ask",
-        "alexa_command":   "ask",
-        "alexa_volume":    "ask",
-        "tuya_list":       "auto",
-        "tuya_status":     "auto",
-        "tuya_control":    "ask",
-        "ha_entities":     "auto",
-        "ha_state":        "auto",
-        "ha_control":      "ask",
-        "ha_automation":   "ask",
-        "mqtt_publish":    "ask",
-        "mqtt_subscribe":  "auto",
-        "esphome_list":    "auto",
-        "esphome_control": "ask",
-        "iot_discover":    "auto",
-        # Security assistant (read-only/analysis = auto; offensive = ask)
-        "nmap_scan":           "ask",
-        "port_scan":           "auto",
-        "ssl_check":           "auto",
-        "whois_lookup":        "auto",
-        "dns_enum":            "auto",
-        "http_headers":        "auto",
-        "nikto_scan":          "ask",
-        "gobuster_run":        "ask",
-        "curl_request":        "auto",
-        "encode_decode":       "auto",
-        "hash_crack":          "ask",
-        "jwt_decode":          "auto",
-        "cert_inspect":        "auto",
-        "log_analyze":         "auto",
-        "secret_scan":         "auto",
-        "cve_lookup":          "auto",
-        "xor_decode":          "auto",
-        "steganography_check": "auto",
-        "base_convert":        "auto",
-        "hex_dump":            "auto",
-        "fw_audit":            "auto",
-        "ssh_key_audit":       "auto",
-        "sudoers_review":      "auto",
-        "file_integrity_check": "auto",
-    },
-    "context": {
-        "minKeep":              6,      # mensajes mínimos a conservar tras compactar
-        "compactThreshold":     0.85,   # fracción del límite que dispara auto-compactación
-        "maxSummaryChars":      2100,   # chars máximos del resumen acumulado (~600 tok)
-        "maxToolResultTokens":  800,    # tokens máximos de un resultado de tool en contexto
-        "autoContinueMax":      8,      # auto-continuaciones máx. por turno (0 = desactivado)
-        "highWater":            0.70,   # fracción para truncar tool results en 2ª pasada
-        "toolMaxChars":         3000    # chars máximos por tool result tras 2ª pasada de compactación
-    },
-    "embeddings": {
-        "model":               "nomic-embed-text-v2-moe:latest",
-        "maxInputChars":       8000,  # chars máximos de texto a embedar
-        "similarityThreshold": 0.30,  # score mínimo para devolver un resultado
-        "snippetChars":        400,   # chars del snippet por resultado
-        "topK":                3,     # resultados máximos por búsqueda
-        "memoryEmbedEnabled":  True,  # usar embeddings para búsqueda semántica en memorias
-        "diskCacheEnabled":    True,  # persistir caché de embeddings a disco
-        "diskCacheDir":        "~/.oocode/cache",  # directorio de caché en disco
-        "diskCacheMaxEntries": 2000,  # máx. entradas en caché de disco
-        "ramCacheMax":         256,   # vectores máximos en caché LRU en RAM
-    },
-    "tools": {
-        "readFileLinesDefault":  150,   # líneas por defecto en read_file
-        "readFileLinesWarnLarge": 500,  # a partir de cuántas líneas avisar
-        "webFetchMaxChars":      8000,  # chars máximos de web_fetch
-        "webFetchTimeout":       15,    # timeout en segundos de web_fetch
-        "webSearchMaxResults":   5,     # resultados por defecto de web_search
-        "bashMaxOutputChars":    20000, # chars máximos de salida de bash
-        "codeSearchMaxResults":   50,   # resultados máximos de code_search
-        "codeSearchContextLines": 2,    # líneas de contexto en code_search
-        "codeSearchMaxFilesize":  "500K", # tamaño máximo de fichero en rg
-        "toolCacheEnabled":       True,  # activar caché intra-turno de tools
-        "toolCacheMaxSize":       200    # entradas máximas en la caché intra-turno
-    },
-    "workspace": {
-        "maxMemoryLines": 50,   # líneas de MEMORY.md en el mini-context
-        "maxDailyChars":  2000  # chars del log diario en el mini-context
-    },
-    "searxng": {
-        "url":        "",         # URL de la instancia SearXNG (vacío = desactivado)
-        "enabled":    False,      # True = reemplaza web_search con SearXNG
-        "maxResults": 5,          # resultados máximos por búsqueda
-        "categories": "general",  # categorías por defecto
-        "language":   "auto",     # idioma (auto, es, en, ...)
-        "safeSearch": 0,          # 0=off, 1=moderate, 2=strict
-        "timeout":    10          # timeout en segundos
-    },
-    "logging": {
-        "enabled":    True,       # activar/desactivar logs a fichero
-        "file":       "",         # ruta del fichero (vacío = ~/.oocode/logs/oocode.log)
-        "level":      "info",     # debug | info | warn | error
-        "maxSizeMb":  5,          # tamaño máximo antes de rotar
-        "maxFiles":   3           # ficheros rotados a conservar
-    },
-    "appearance": {
-        "accentColor": "cyan"     # color del prompt y del banner (clave de COLOR_PRESETS)
-    },
-    "plugins": {
-        "enabled": []             # lista de plugins activos (sincronizado con /plugins enable)
-    },
-    "pluginOptions": {
-        "searxng": {
-            "enabled":    False   # usar SearXNG como buscador en el plugin
-        },
-        "lsp": {
-            "requestTimeout": 10,   # segundos máximos esperando respuesta LSP
-            "serverCmds":     {},   # overrides de comandos por extensión {".py": ["pylsp"]}
-            "autoStart":      []    # extensiones a arrancar al inicio (p.ej. [".py", ".ts"])
-        }
-    },
-    "skills": {
-        "enabled": []             # lista de skills activos (sincronizado con /skills enable)
-    },
-    "models": {
-        "systemOverhead": 2000,  # tokens reservados para system prompt + tool schemas
-        "repeatPenalty":  None,  # default global de repeat_penalty (None = sin override)
-        "seed":           None,  # default global de seed (-1=aleatorio, None = sin override)
-        "configs": {}            # {model_id: {contextWindow, maxTokens, params, thinking}}
-    },
-    "fallback": {
-        "enabled":        False,  # activar agente de fallback
-        "model":          "",     # modelo alternativo, p.ej. "phi3:mini"
-        "timeoutSeconds": 120     # segundos sin tokens antes de usar el fallback
-    },
-    "mcp": {
-        "servers":        [],    # lista de {name, cmd, env?, cwd?} — servidores MCP a arrancar al inicio
-        "requestTimeout": 15.0,  # segundos máximos esperando respuesta MCP
-        "oocodeAssistant": {
-            "enabled": True      # arrancar el MCP server bundled oocode_assistant.py
-        },
-        "systemAssistant": {
-            "enabled": True      # arrancar el MCP server bundled system_assistant.py
-        },
-        "homeOfficeAssistant": {
-            "enabled": False     # arrancar el MCP server bundled home_office_assistant.py
-        },
-        "securityAssistant": {
-            "enabled": False     # arrancar el MCP server bundled security_assistant.py
-        },
-        "iotAssistant": {
-            "enabled": False     # arrancar el MCP server bundled iot_assistant.py
-        },
-    },
-    "hooks": {
-        "enabled":  True,                  # activar sistema de hooks
-        "builtins": [
-            "diff_after_write", "ctags_after_write", "lint_after_write",
-            "quick_syntax_after_write", "verify_after_edit", "test_suite_delta",
-            "config_syntax_after_write",
-            "deadlock_detection", "dead_code_detection", "performance_profiling",
-        ]
-    },
-    "snapshots": {
-        "enabled":         True,   # guardar snapshot al iniciar nueva sesión
-        "maxSnapshots":    20,     # máximo de snapshots a conservar por agente
-        "saveOnCompact":   False   # guardar snapshot también al compactar contexto
-    },
-    "rag": {
-        "enabled":             True,   # inyectar código relevante del workspace en el system prompt
-        "topK":                5,      # top_k base (queries cortas/simples)
-        "similarityThreshold": 0.40,   # threshold base
-        "maxSnippetChars":     4000,   # chars totales máximos del bloque inyectado
-        "indexInterval":       300,    # segundos entre re-indexaciones en background
-        "topKComplex":         10,     # top_k para queries largas/autoedición (>complexMinChars)
-        "thresholdComplex":    0.35,   # threshold más permisivo para queries complejas
-        "complexMinChars":     150,    # longitud mínima del mensaje para activar boost
-        "maxFileChars":        6000,   # chars por fichero antes de chunking
-        "chunkChars":          512,    # chars por chunk de indexación
-        "chunkOverlap":        64,     # solapamiento entre chunks consecutivos
-        "maxFiles":            2000,   # ficheros máximos a indexar en el workspace
-        "minSlotChars":        200     # mínimo de chars por fragmento en la respuesta RAG
-    },
-    "vision": {
-        "enabled":       True,   # activar detección de imágenes en el input
-        "showIndicator": True    # mostrar indicador de visión en la toolbar
-    },
-    "chatlog": {
-        "enabled":    False,               # activar/desactivar registro de conversaciones
-        "path":       "",                  # ruta del fichero (vacío = ~/.oocode/logs/chat.log)
-        "maxSizeMb":  10                   # tamaño máximo antes de rotar
-    },
-    "webui": {
-        "enabled":   False,                # True = WebUI activo al arrancar
-        "host":      "0.0.0.0",           # IP de escucha (0.0.0.0 = todas las interfaces)
-        "port":      4000,                 # puerto HTTP del WebUI
-        "logFile":   "",                   # ruta del log (vacío = ~/.oocode/logs/webserver.log)
-        "logMaxSizeMb": 5                  # tamaño máximo del log antes de rotar
-    },
-    "subagents": {
-        "maxConcurrent":   4,              # subagentes simultáneos máximos
-        "maxTeams":        3,              # equipos de agentes simultáneos máximos
-        "maxTeamSize":     5,              # agentes máximos por equipo
-        "recentTtl":       1800,           # segundos que permanecen los subagentes finalizados
-        "defaultPriority": 0              # prioridad por defecto de los subagentes
-    },
-    "backup": {
-        "enabled":   True,                 # activar backups automáticos antes de escribir
-        "dir":       "",                   # directorio de backups (vacío = ~/.oocode/backup/)
-        "maxFiles":  50,                   # máximo de ficheros .bak a conservar
-        "extensions": [                    # extensiones que se respaldan
-            ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".c", ".cpp",
-            ".h", ".hpp", ".java", ".rb", ".php", ".cs", ".sh", ".bash",
-            ".pl", ".pm", ".sql", ".md", ".txt", ".json", ".yaml", ".yml",
-            ".toml", ".html", ".css"
-        ]
-    }
-}
+def _const(name: str):
+    """Resuelve una ruta de configuración desde el paquete `config` en runtime.
+
+    load()/save() la usan para que parchear `config.CONFIG_FILE` / `CONFIG_DIR` /
+    `MEMORY_DIR` (como hacen los tests, igual que cuando todo vivía en config.py)
+    siga surtiendo efecto pese a que las constantes ahora viven en config.constants.
+    """
+    import config as _pkg
+    from config import constants as _c
+    return getattr(_pkg, name, getattr(_c, name))
 
 
 class AgentDef(BaseModel):
@@ -526,11 +31,20 @@ class AgentDef(BaseModel):
     emoji:        str = "🤖"
     model:        Optional[str] = None
     workspace:    str = str(CONFIG_DIR / "workspace" / "main")
-    instructions: str = ""
+    # La identidad/comportamiento del agente vive en sus ficheros .md del workspace
+    # (IDENTITY.md, SOUL.md, …), no en el JSON. Campos extra del JSON se ignoran.
+    model_config = {"extra": "ignore"}
 
 
 class OOConfig(BaseModel):
-    # ── Ollama ────────────────────────────────────────────────────────────────
+    # ── API backend (bloque "api" unificado en oocode.json) ───────────────────
+    api_type:     str = "ollama"   # "ollama" | "openai" | "anthropic"
+    api_key:      str = ""         # API key para OpenAI / Anthropic
+    # api_base_url y ollama_host se cargan ambos del campo único api.host:
+    #   backend Ollama → usa ollama_host; backend OpenAI → usa api_base_url.
+    api_base_url: str = ""         # URL base para OpenAI-compat (llama.cpp, LM Studio, vLLM…)
+
+    # ── Servidor / hosts (campos del bloque "api", específicos de Ollama) ──────
     ollama_host:             str       = "http://localhost:11434"
     ollama_extra_hosts:      list[str] = []
     ollama_embed_host:       str       = ""
@@ -542,7 +56,6 @@ class OOConfig(BaseModel):
     agent_id:           str  = DEFAULT_AGENT_ID
     agent_name:         str  = "OOCode"
     agent_emoji:        str  = "🤖"
-    agent_instructions: str  = ""
     agents:      list[AgentDef] = []
     permissions: dict[str, str] = {}
 
@@ -552,12 +65,13 @@ class OOConfig(BaseModel):
     # el modelo activo no tiene config per-modelo.
     max_context_tokens:      int   = 8000   # fallback interno, no en oocode.json
     compact_min_keep:        int   = 6
-    compact_threshold:       float = 0.85
+    compact_threshold:       float = 0.80
     max_summary_chars:       int   = 2100
     max_tool_result_tokens:  int   = 800
     auto_continue_max:       int   = 8   # auto-continuaciones máx. por turno (0=desactivado)
     context_high_water:      float = 0.70  # fracción de max_tokens para truncado 2ª pasada
     context_tool_max_chars:  int   = 3000  # chars máx. por tool result en 2ª pasada
+    ctx_mode:                str   = "mini"  # contexto del workspace al arrancar: "mini" | "full"
 
     # ── Embeddings ────────────────────────────────────────────────────────────
     embed_model:                str   = "nomic-embed-text-v2-moe:latest"
@@ -578,6 +92,7 @@ class OOConfig(BaseModel):
     web_fetch_timeout:         int = 15
     web_search_max_results:    int = 5
     bash_max_output_chars:     int = 20000
+    mcp_max_output_chars:      int = 4000
     code_search_max_results:   int = 50
     code_search_context_lines: int = 2
     code_search_max_filesize:  str = "500K"
@@ -630,11 +145,14 @@ class OOConfig(BaseModel):
     # Lista de configs de servidores MCP: [{name, cmd, env?, cwd?}]
     mcp_servers:                    list  = []
     mcp_request_timeout:            float = 15.0
-    mcp_oocode_assistant_enabled:   bool  = True
-    mcp_system_assistant_enabled:   bool  = True
+    mcp_oocode_assistant_enabled:    bool  = True
+    mcp_system_assistant_enabled:    bool  = True
+    mcp_devops_assistant_enabled:    bool  = True
+    mcp_database_assistant_enabled:  bool  = False
     mcp_home_office_assistant_enabled: bool = False
     mcp_security_assistant_enabled:   bool = False
-    mcp_iot_assistant_enabled:        bool = False
+    mcp_iot_assistant_enabled:          bool = False
+    mcp_http_client_assistant_enabled:  bool = False
 
     # ── Hooks ─────────────────────────────────────────────────────────────────
     hooks_enabled:  bool       = True
@@ -670,6 +188,10 @@ class OOConfig(BaseModel):
     vision_enabled:        bool = True
     vision_show_indicator: bool = True
 
+    # ── Finalización de tarea (frase canónica, idioma del agente) ──────────────
+    completion_phrase:        str       = "He completado todas las tareas."
+    completion_extra_phrases: list[str] = []
+
     # ── Chat log ──────────────────────────────────────────────────────────────
     chatlog_enabled:      bool = False
     chatlog_path:         str  = ""
@@ -683,11 +205,14 @@ class OOConfig(BaseModel):
     webui_log_max_size:   int  = 5
 
     # ── Subagentes ────────────────────────────────────────────────────────────
-    subagents_max_concurrent:   int = 4
-    subagents_max_teams:        int = 3
-    subagents_max_team_size:    int = 5
-    subagents_recent_ttl:       int = 1800
-    subagents_default_priority: int = 0
+    subagents_max_concurrent:    int = 4
+    subagents_max_teams:         int = 3
+    subagents_max_team_size:     int = 5
+    subagents_recent_ttl:        int = 1800
+    subagents_default_priority:  int = 0
+    subagents_auto_cont_max:     int = 16   # 0 = hereda auto_continue_max del agente principal
+    subagents_inference_timeout: int = 0    # 0 = hereda fallback.timeoutSeconds
+    subagents_default_timeout:   int = 0    # 0 = sin límite de tiempo por tarea
 
     # ── Backups ───────────────────────────────────────────────────────────────
     backup_enabled:     bool      = True
@@ -700,14 +225,32 @@ class OOConfig(BaseModel):
     fallback_model:   str  = ""
     fallback_timeout: int  = 120   # segundos
 
+    # Override de runtime (no se carga del JSON): timeout de inferencia forzado.
+    # Lo usa SubAgentRunner para aplicar subagents.inferenceTimeout a los subagentes
+    # con máxima prioridad, independientemente de fallback/per-model. 0 = sin override.
+    inference_timeout_override: int = 0
+
     @property
     def effective_embed_host(self) -> str:
         """Host para embeddings.
 
-        En modo primary-only: siempre el host principal, ignorando embedHost.
-        Esto garantiza que configurar primary-only realmente centraliza todo
-        el tráfico Ollama en el host principal, incluyendo embeddings y memoria.
+        Las embeddings SIEMPRE usan el protocolo Ollama (EmbeddingClient envuelve
+        ollama.Client), independientemente del backend de chat. Por eso:
+
+        - Si hay embedHost explícito, se respeta.
+        - En modo primary-only: el host principal, centralizando el tráfico Ollama.
+        - Con backend Ollama: ollama_host.
+        - Con backend OpenAI/Anthropic SIN embedHost: ollama_host alimenta la misma
+          URL del servidor de chat (campo unificado api.host), que NO habla Ollama.
+          Caer al default local de Ollama evita apuntar el cliente de embeddings a
+          un servidor OpenAI/Anthropic. Configura api.embedHost para un host propio.
         """
+        # Backend de chat no-Ollama: el host de chat no habla protocolo Ollama.
+        # Usa embedHost explícito o cae al default local de Ollama (nunca ollama_host,
+        # que apunta al servidor OpenAI/Anthropic). primary-only no aplica aquí.
+        if self.api_type != "ollama":
+            return self.ollama_embed_host or _DEFAULT_OLLAMA_HOST
+        # Backend Ollama: primary-only centraliza todo en el host principal (ignora embedHost).
         if self.ollama_subagent_routing == "primary-only":
             return self.ollama_host
         return self.ollama_embed_host or self.ollama_host
@@ -725,9 +268,12 @@ class OOConfig(BaseModel):
     def model_timeout(self, model_name: str) -> int:
         """Timeout en segundos para un modelo concreto. 0 = sin timeout.
 
-        Prioridad: timeoutSeconds del model_config > fallback.timeoutSeconds
-        (solo si el fallback está configurado) > 0.
+        Prioridad: inference_timeout_override (subagentes) > timeoutSeconds del
+        model_config > fallback.timeoutSeconds (solo si el fallback está
+        configurado) > 0.
         """
+        if self.inference_timeout_override > 0:
+            return self.inference_timeout_override
         per_model = self.model_configs.get(model_name, {}).get("timeoutSeconds")
         if per_model is not None:
             return int(per_model)
@@ -841,6 +387,9 @@ class OOConfig(BaseModel):
 
     @classmethod
     def load(cls, agent_id: Optional[str] = None) -> "OOConfig":
+        CONFIG_DIR  = _const("CONFIG_DIR")
+        CONFIG_FILE = _const("CONFIG_FILE")
+        MEMORY_DIR  = _const("MEMORY_DIR")
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         MEMORY_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -853,19 +402,26 @@ class OOConfig(BaseModel):
         def _get(section: str, key: str):
             return raw.get(section, {}).get(key, DEFAULT_CONFIG[section][key])
 
-        _ollama_raw          = raw.get("ollama", {})
-        _mo_raw              = raw.get("modelOptions", {})   # solo para migración desde versión anterior
-        ollama_host          = _ollama_raw.get("host",            DEFAULT_CONFIG["ollama"]["host"])
-        ollama_extra_hosts   = _ollama_raw.get("extraHosts",      DEFAULT_CONFIG["ollama"]["extraHosts"])
-        ollama_embed_host    = _ollama_raw.get("embedHost",       DEFAULT_CONFIG["ollama"]["embedHost"])
-        ollama_subagent_routing = _ollama_raw.get("subagentRouting",
-                                                   DEFAULT_CONFIG["ollama"]["subagentRouting"])
-        ollama_retry_count   = int(_ollama_raw.get("ollamaRetryCount",
+        # Bloque unificado "api": backend LLM + parámetros de servidor (host, embeddings, routing…)
+        _api_raw    = raw.get("api", {})
+        _mo_raw     = raw.get("modelOptions", {})   # solo para migración desde versión anterior
+        api_type    = _api_raw.get("type", DEFAULT_CONFIG["api"]["type"])
+        api_key     = _api_raw.get("key",  DEFAULT_CONFIG["api"]["key"])
+        # El campo único "host" alimenta tanto ollama_host como api_base_url (OpenAI baseUrl).
+        # El backend Ollama usa ollama_host; el backend OpenAI usa api_base_url. Anthropic ignora ambos.
+        _api_host    = _api_raw.get("host", DEFAULT_CONFIG["api"]["host"])
+        ollama_host  = _api_host
+        api_base_url = _api_host
+        ollama_extra_hosts   = _api_raw.get("extraHosts",      DEFAULT_CONFIG["api"]["extraHosts"])
+        ollama_embed_host    = _api_raw.get("embedHost",       DEFAULT_CONFIG["api"]["embedHost"])
+        ollama_subagent_routing = _api_raw.get("subagentRouting",
+                                               DEFAULT_CONFIG["api"]["subagentRouting"])
+        ollama_retry_count   = int(_api_raw.get("ollamaRetryCount",
                                    _mo_raw.get("ollamaRetryCount",
-                                               DEFAULT_CONFIG["ollama"]["ollamaRetryCount"])))
-        ollama_retry_delay   = float(_ollama_raw.get("ollamaRetryDelay",
+                                               DEFAULT_CONFIG["api"]["ollamaRetryCount"])))
+        ollama_retry_delay   = float(_api_raw.get("ollamaRetryDelay",
                                      _mo_raw.get("ollamaRetryDelay",
-                                                 DEFAULT_CONFIG["ollama"]["ollamaRetryDelay"])))
+                                                 DEFAULT_CONFIG["api"]["ollamaRetryDelay"])))
         _models_raw          = raw.get("models", {})
         model_repeat_penalty = _models_raw.get("repeatPenalty", _mo_raw.get("repeatPenalty"))
         model_seed           = _models_raw.get("seed", _mo_raw.get("seed"))
@@ -910,14 +466,15 @@ class OOConfig(BaseModel):
             model        = agent.model or defaults.get("model")
             workspace    = agent.workspace or defaults.get("workspace", str(CONFIG_DIR / "workspace" / "main"))
             a_id, a_name, a_emoji = agent.id, agent.name, agent.emoji
-            a_instructions = agent.instructions
         else:
             model        = defaults.get("model")
             workspace    = defaults.get("workspace", str(CONFIG_DIR / "workspace" / "main"))
             a_id, a_name, a_emoji = target_id, "OOCode", "🤖"
-            a_instructions = ""
 
         _cfg = cls(
+            api_type                = api_type,
+            api_key                 = api_key,
+            api_base_url            = api_base_url,
             ollama_host             = ollama_host,
             ollama_extra_hosts      = ollama_extra_hosts,
             ollama_embed_host       = ollama_embed_host,
@@ -927,7 +484,6 @@ class OOConfig(BaseModel):
             agent_id            = a_id,
             agent_name          = a_name,
             agent_emoji         = a_emoji,
-            agent_instructions  = a_instructions,
             agents              = agents_list,
             permissions  = permissions,
 
@@ -938,6 +494,7 @@ class OOConfig(BaseModel):
             auto_continue_max       = _get("context", "autoContinueMax"),
             context_high_water      = _get("context", "highWater"),
             context_tool_max_chars  = _get("context", "toolMaxChars"),
+            ctx_mode                = (_get("context", "ctxMode") if _get("context", "ctxMode") in ("mini", "full") else "mini"),
 
             embed_model                 = _get("embeddings", "model"),
             embed_max_input_chars       = _get("embeddings", "maxInputChars"),
@@ -956,6 +513,7 @@ class OOConfig(BaseModel):
             web_fetch_timeout          = _get("tools", "webFetchTimeout"),
             web_search_max_results     = _get("tools", "webSearchMaxResults"),
             bash_max_output_chars      = _get("tools", "bashMaxOutputChars"),
+            mcp_max_output_chars       = _get("tools", "mcpMaxOutputChars"),
             code_search_max_results    = _get("tools", "codeSearchMaxResults"),
             code_search_context_lines  = _get("tools", "codeSearchContextLines"),
             code_search_max_filesize   = _get("tools", "codeSearchMaxFilesize"),
@@ -1012,8 +570,17 @@ class OOConfig(BaseModel):
             mcp_security_assistant_enabled = raw.get("mcp", {}).get(
                 "securityAssistant", DEFAULT_CONFIG["mcp"]["securityAssistant"]
             ).get("enabled", False),
+            mcp_devops_assistant_enabled = raw.get("mcp", {}).get(
+                "devopsAssistant", DEFAULT_CONFIG["mcp"]["devopsAssistant"]
+            ).get("enabled", True),
+            mcp_database_assistant_enabled = raw.get("mcp", {}).get(
+                "databaseAssistant", DEFAULT_CONFIG["mcp"]["databaseAssistant"]
+            ).get("enabled", False),
             mcp_iot_assistant_enabled = raw.get("mcp", {}).get(
                 "iotAssistant", DEFAULT_CONFIG["mcp"]["iotAssistant"]
+            ).get("enabled", False),
+            mcp_http_client_assistant_enabled = raw.get("mcp", {}).get(
+                "httpClientAssistant", DEFAULT_CONFIG["mcp"]["httpClientAssistant"]
             ).get("enabled", False),
 
             hooks_enabled  = raw.get("hooks", {}).get("enabled",
@@ -1047,6 +614,11 @@ class OOConfig(BaseModel):
             vision_show_indicator = raw.get("vision", {}).get("showIndicator",
                                             DEFAULT_CONFIG["vision"]["showIndicator"]),
 
+            completion_phrase        = raw.get("completion", {}).get("phrase",
+                                            DEFAULT_CONFIG["completion"]["phrase"]),
+            completion_extra_phrases = raw.get("completion", {}).get("extraPhrases",
+                                            list(DEFAULT_CONFIG["completion"]["extraPhrases"])),
+
             chatlog_enabled     = raw.get("chatlog", {}).get("enabled",
                                           DEFAULT_CONFIG["chatlog"]["enabled"]),
             chatlog_path        = raw.get("chatlog", {}).get("path",
@@ -1065,16 +637,22 @@ class OOConfig(BaseModel):
             webui_log_max_size = raw.get("webui", {}).get("logMaxSizeMb",
                                          DEFAULT_CONFIG["webui"]["logMaxSizeMb"]),
 
-            subagents_max_concurrent   = raw.get("subagents", {}).get("maxConcurrent",
-                                              DEFAULT_CONFIG["subagents"]["maxConcurrent"]),
-            subagents_max_teams        = raw.get("subagents", {}).get("maxTeams",
-                                              DEFAULT_CONFIG["subagents"]["maxTeams"]),
-            subagents_max_team_size    = raw.get("subagents", {}).get("maxTeamSize",
-                                              DEFAULT_CONFIG["subagents"]["maxTeamSize"]),
-            subagents_recent_ttl       = raw.get("subagents", {}).get("recentTtl",
-                                              DEFAULT_CONFIG["subagents"]["recentTtl"]),
-            subagents_default_priority = raw.get("subagents", {}).get("defaultPriority",
-                                              DEFAULT_CONFIG["subagents"]["defaultPriority"]),
+            subagents_max_concurrent    = raw.get("subagents", {}).get("maxConcurrent",
+                                               DEFAULT_CONFIG["subagents"]["maxConcurrent"]),
+            subagents_max_teams         = raw.get("subagents", {}).get("maxTeams",
+                                               DEFAULT_CONFIG["subagents"]["maxTeams"]),
+            subagents_max_team_size     = raw.get("subagents", {}).get("maxTeamSize",
+                                               DEFAULT_CONFIG["subagents"]["maxTeamSize"]),
+            subagents_recent_ttl        = raw.get("subagents", {}).get("recentTtl",
+                                               DEFAULT_CONFIG["subagents"]["recentTtl"]),
+            subagents_default_priority  = raw.get("subagents", {}).get("defaultPriority",
+                                               DEFAULT_CONFIG["subagents"]["defaultPriority"]),
+            subagents_auto_cont_max     = raw.get("subagents", {}).get("autoContMax",
+                                               DEFAULT_CONFIG["subagents"]["autoContMax"]),
+            subagents_inference_timeout = raw.get("subagents", {}).get("inferenceTimeout",
+                                               DEFAULT_CONFIG["subagents"]["inferenceTimeout"]),
+            subagents_default_timeout   = raw.get("subagents", {}).get("defaultTimeout",
+                                               DEFAULT_CONFIG["subagents"]["defaultTimeout"]),
 
             backup_enabled    = raw.get("backup", {}).get("enabled",
                                         DEFAULT_CONFIG["backup"]["enabled"]),
@@ -1089,8 +667,9 @@ class OOConfig(BaseModel):
         # ── Migración automática: añadir secciones nuevas y eliminar campos deprecated ──
         _missing_sections  = [
             k for k in DEFAULT_CONFIG
-            if k not in raw
+            if k not in raw and k != "api"   # "api" puede no existir en configs antiguas → se añade en save()
         ]
+        _has_api_gap = "api" not in raw
         # Campos deprecated eliminados de la spec pero que pueden seguir en el JSON
         _has_deprecated = "maxTokens" in raw.get("context", {})
         # modelOptions legacy: si existe en el JSON, save() lo eliminará y relocaliza los valores
@@ -1098,9 +677,12 @@ class OOConfig(BaseModel):
         # Claves nuevas dentro de secciones existentes
         _has_mcp_gaps = (
             "systemAssistant" not in raw.get("mcp", {}) or
+            "devopsAssistant" not in raw.get("mcp", {}) or
+            "databaseAssistant" not in raw.get("mcp", {}) or
             "homeOfficeAssistant" not in raw.get("mcp", {}) or
             "securityAssistant" not in raw.get("mcp", {}) or
-            "iotAssistant" not in raw.get("mcp", {})
+            "iotAssistant" not in raw.get("mcp", {}) or
+            "httpClientAssistant" not in raw.get("mcp", {})
         )
         # embed_max_input_chars: migrar valores obsoletos (≤3000) al nuevo default (8000)
         _embed_old = raw.get("embeddings", {}).get("maxInputChars", 0)
@@ -1113,12 +695,13 @@ class OOConfig(BaseModel):
             if "thinking" in _mcfg and "maxThinkingTokens" not in _mcfg["thinking"]:
                 _mcfg["thinking"]["maxThinkingTokens"] = _old_max_think
                 _has_thinking_gap = True
-        if _missing_sections or _has_deprecated or _has_mcp_gaps or _has_model_opts_legacy or _has_thinking_gap:
+        if _missing_sections or _has_deprecated or _has_mcp_gaps or _has_model_opts_legacy or _has_thinking_gap or _has_api_gap:
             _cfg.save()
 
         return _cfg
 
     def save(self) -> None:
+        CONFIG_FILE = _const("CONFIG_FILE")
         # Backup con rotación antes de sobreescribir
         if CONFIG_FILE.exists():
             import shutil
@@ -1135,13 +718,17 @@ class OOConfig(BaseModel):
         if CONFIG_FILE.exists():
             raw = json.loads(CONFIG_FILE.read_text())
 
-        _ol = raw.setdefault("ollama", {})
-        _ol["host"]             = self.ollama_host
-        _ol["extraHosts"]       = self.ollama_extra_hosts
-        _ol["embedHost"]        = self.ollama_embed_host
-        _ol["subagentRouting"]  = self.ollama_subagent_routing
-        _ol["ollamaRetryCount"] = self.ollama_retry_count
-        _ol["ollamaRetryDelay"] = self.ollama_retry_delay
+        # Bloque unificado "api": backend + parámetros de servidor en un solo sitio
+        _ap = raw.setdefault("api", {})
+        _ap["type"]             = self.api_type
+        _ap["key"]              = self.api_key
+        _ap["host"]             = self.ollama_host
+        _ap["extraHosts"]       = self.ollama_extra_hosts
+        _ap["embedHost"]        = self.ollama_embed_host
+        _ap["subagentRouting"]  = self.ollama_subagent_routing
+        _ap["ollamaRetryCount"] = self.ollama_retry_count
+        _ap["ollamaRetryDelay"] = self.ollama_retry_delay
+        raw.pop("ollama", None)   # bloque legacy fusionado en "api"
         raw["permissions"] = self.permissions
 
         # Contexto (maxTokens eliminado: se calcula desde models.configs)
@@ -1154,6 +741,7 @@ class OOConfig(BaseModel):
         ctx["autoContinueMax"]     = self.auto_continue_max
         ctx["highWater"]           = self.context_high_water
         ctx["toolMaxChars"]        = self.context_tool_max_chars
+        ctx["ctxMode"]             = self.ctx_mode
 
         # Embeddings
         emb = raw.setdefault("embeddings", {})
@@ -1176,6 +764,7 @@ class OOConfig(BaseModel):
         tools["webFetchTimeout"]        = self.web_fetch_timeout
         tools["webSearchMaxResults"]    = self.web_search_max_results
         tools["bashMaxOutputChars"]     = self.bash_max_output_chars
+        tools["mcpMaxOutputChars"]      = self.mcp_max_output_chars
         tools["codeSearchMaxResults"]   = self.code_search_max_results
         tools["codeSearchContextLines"] = self.code_search_context_lines
         tools["codeSearchMaxFilesize"]  = self.code_search_max_filesize
@@ -1246,7 +835,10 @@ class OOConfig(BaseModel):
         mcp_sec.setdefault("systemAssistant", {})["enabled"] = self.mcp_system_assistant_enabled
         mcp_sec.setdefault("homeOfficeAssistant", {})["enabled"] = self.mcp_home_office_assistant_enabled
         mcp_sec.setdefault("securityAssistant", {})["enabled"]   = self.mcp_security_assistant_enabled
-        mcp_sec.setdefault("iotAssistant", {})["enabled"]        = self.mcp_iot_assistant_enabled
+        mcp_sec.setdefault("devopsAssistant",   {})["enabled"] = self.mcp_devops_assistant_enabled
+        mcp_sec.setdefault("databaseAssistant", {})["enabled"] = self.mcp_database_assistant_enabled
+        mcp_sec.setdefault("iotAssistant", {})["enabled"]          = self.mcp_iot_assistant_enabled
+        mcp_sec.setdefault("httpClientAssistant", {})["enabled"]  = self.mcp_http_client_assistant_enabled
 
         # Hooks
         hooks_sec = raw.setdefault("hooks", {})
@@ -1280,6 +872,11 @@ class OOConfig(BaseModel):
         vis["enabled"]       = self.vision_enabled
         vis["showIndicator"] = self.vision_show_indicator
 
+        # Finalización de tarea: ajuste interno/avanzado (señal de fin de turno +
+        # auto-continue). NO se materializa en oocode.json para no exponerlo como
+        # personalización de usuario. load() lo sigue leyendo si un agente multi-idioma
+        # lo añade a mano; si ya existe en el JSON, no se toca (se preserva tal cual).
+
         # Chat log
         cl = raw.setdefault("chatlog", {})
         cl["enabled"]   = self.chatlog_enabled
@@ -1296,11 +893,14 @@ class OOConfig(BaseModel):
 
         # Subagentes
         sa = raw.setdefault("subagents", {})
-        sa["maxConcurrent"]   = self.subagents_max_concurrent
-        sa["maxTeams"]        = self.subagents_max_teams
-        sa["maxTeamSize"]     = self.subagents_max_team_size
-        sa["recentTtl"]       = self.subagents_recent_ttl
-        sa["defaultPriority"] = self.subagents_default_priority
+        sa["maxConcurrent"]    = self.subagents_max_concurrent
+        sa["maxTeams"]         = self.subagents_max_teams
+        sa["maxTeamSize"]      = self.subagents_max_team_size
+        sa["recentTtl"]        = self.subagents_recent_ttl
+        sa["defaultPriority"]  = self.subagents_default_priority
+        sa["autoContMax"]      = self.subagents_auto_cont_max
+        sa["inferenceTimeout"] = self.subagents_inference_timeout
+        sa["defaultTimeout"]   = self.subagents_default_timeout
 
         # Backups
         bk = raw.setdefault("backup", {})

@@ -1,4 +1,4 @@
-*oocode.txt*  OOCode VIM Plugin — Wrapper completo del TUI OOCode (v3.0)
+*oocode.txt*  OOCode VIM Plugin — Wrapper completo del TUI OOCode (v3.1)
 
 ==============================================================================
 CONTENIDO                                                      *oocode-contents*
@@ -19,10 +19,12 @@ OOCode VIM Plugin es un wrapper completo del TUI de OOCode. Se conecta al
 WebUI daemon via HTTP y ofrece streaming SSE en tiempo real con tools, plan y
 texto del agente apareciendo en el panel de VIM mientras se generan.
 
-  • Streaming SSE en tiempo real — tool_start/done, text, plan, done en vivo.
+  • Streaming SSE en tiempo real — text, tool_start/done, plan, subagentes,
+    preflight y done en vivo (misma sesión que el WebUI, cookie compartida).
   • Detección automática del servidor — escanea puertos 4000, 7788, 3000, 5000
     y lee ~/.oocode/webui_state.json para obtener el puerto activo.
-  • Panel de respuestas integrado — split con historial, tools y plan.
+  • Panel de respuestas integrado — split con historial, tools, plan y subagentes.
+  • Control del turno — :OOCodeKill interrumpe; :OOCodeElevated cicla permisos.
   • TUI completo embebido — :OOCodeTUI abre el TUI nativo en el terminal de VIM.
   • Todos los slash commands disponibles via :OOCodeCmd con autocompletado.
   • Integración de contexto — envía fichero, selección visual, posición cursor.
@@ -66,6 +68,13 @@ Pon en tu .vimrc / init.vim: >
   " Arrancar stream SSE automáticamente si el servidor está activo
   let g:oocode_auto_sse  = 1
 
+  " Modo streaming SSE (1) — paridad TUI/WebUI: texto, tools, plan y subagentes
+  " aparecen en vivo. Con 0 usa send_sync bloqueante (respuesta completa de golpe).
+  let g:oocode_stream    = 1
+
+  " Timeout del turno en streaming (s): si el stream enmudece, se cierra el turno
+  let g:oocode_turn_timeout = 360
+
   " Desactivar todos los mapeos por defecto
   let g:oocode_no_mappings = 0
 
@@ -102,6 +111,18 @@ Pon en tu .vimrc / init.vim: >
 
 *:OOCodeOpen* / *:OOCodeClose* / *:OOCodeToggle*
   Gestiona el panel de respuestas.
+
+*:OOCodeKill*
+  Interrumpe el turno activo del agente (equivale al botón Kill del WebUI y a
+  /kill en el TUI). Cancela también los subagentes en ejecución.
+
+*:OOCodeElevated* [modo]
+  Cicla o establece el modo elevated del agente: ask|off|on|full. Sin argumento
+  cicla al siguiente. Equivale al badge elevated del WebUI.
+    ask  — normal, respeta permisos de oocode.json
+    off  — solo lectura, bloquea operaciones peligrosas
+    on   — elevado, auto-aprueba 'ask', respeta 'deny'
+    full — sin restricciones, aprueba todo
 
 *:OOCodeStatus*
   Estado: agente, modelo, ctx%, hooks, plugins. Fuerza re-detección.
@@ -147,6 +168,8 @@ Pon en tu .vimrc / init.vim: >
   <Leader>ou   — :OOCodeTUI       TUI completo embebido
   <Leader>on   — :OOCodeNew       Nueva sesión
   <Leader>ok   — :OOCodeConnect   Re-detectar servidor
+  <Leader>oK   — :OOCodeKill      Interrumpir el turno activo
+  <Leader>oe   — :OOCodeElevated  Ciclar modo elevated
 
 Desactiva los mapeos con: >
   let g:oocode_no_mappings = 1
@@ -156,24 +179,43 @@ Desactiva los mapeos con: >
 6. STREAMING SSE                                              *oocode-streaming*
 
 El plugin usa `curl -sN --no-buffer` en un job de fondo para mantener una
-conexión SSE persistente con /api/chat/stream.
+conexión SSE persistente con /api/chat/stream, exactamente igual que el WebUI.
 
-Cuando envías un mensaje, el POST a /api/chat/send dispara los eventos que
-fluyen por el stream SSE ya abierto:
+IMPORTANTE — sesión compartida: antes de abrir el stream, el plugin establece
+la cookie de sesión Flask con una petición que COMPLETA (GET /api/chat/status).
+Esto es crítico: un curl SSE persistente nunca vuelca el cookie jar (curl lo
+escribe al terminar la transferencia, y el stream no termina), así que sin este
+paso el POST de envío iría sin cookie, Flask crearía una sesión distinta y los
+eventos del turno caerían en OTRA cola — el panel quedaría mudo. Con la cookie
+establecida, el SSE y el POST /api/chat/send comparten sid y todo fluye en vivo.
 
-  connected    → confirmación de conexión al panel
-  thinking     → "  ● Pensando…" (se elimina al llegar texto/tool)
-  tool_start   → "  ◐ tool_name …" (actualizado in-place al recibir done)
-  tool_done    → "  ⎿ tool_name  ▸ N líneas"
-  plan         → "  ◈  Plan de ejecución [1/N]" con tareas
-  stream_chunk → texto acumulado (flush completo en evento done)
-  done         → flush de texto + separador de turno
-  error        → mensaje de error
+Cuando envías un mensaje, el POST a /api/chat/send (fire-and-forget) dispara los
+eventos que fluyen por el stream SSE ya abierto:
 
-El stream reconecta automáticamente si se desconecta (timeout o red).
+  connected      → confirmación de conexión (silenciosa)
+  status         → actualiza la cabecera: modelo, ctx%, tareas
+  preflight      → frase enlatada que reemplaza "Pensando…" mientras piensa
+  thinking       → "  ● Pensando…" (se elimina al llegar texto/tool)
+  text           → prosa del agente, volcada en orden con las tools
+  stream_chunk   → chunks de streaming del modelo
+  tool_start     → "  ◐ tool_name  contexto …" (in-place al recibir done)
+  tool_done      → "  ⎿ tool_name  contexto  ▸ N líneas"
+  plan           → "  ◈  Plan de ejecución [1/N]" con tareas
+  plan_progress  → "  ◈  Plan [done/total] ▸ tarea activa"
+  subagent_start → cabecera del subagente; su texto/tools se prefijan con │
+  subagent_done  → "  │ ⎿ nombre ✓"
+  embed_flash    → operación de memoria/RAG (indicador discreto)
+  done           → flush de texto + separador de turno
+  error          → mensaje de error
 
-En VIM sin soporte de jobs (compilado sin +job), el plugin cae a modo
-`send_sync` que bloquea hasta que el agente termina y muestra el resultado.
+El stream reconecta automáticamente si se desconecta (timeout o red). Un
+watchdog (g:oocode_turn_timeout) cierra el turno si el stream enmudece, para
+que el prompt no quede colgado en "Pensando…".
+
+Con g:oocode_stream = 0, o en VIM sin soporte de jobs (compilado sin +job), el
+plugin usa send_sync: una sola petición que bloquea/espera a que el agente
+termina y muestra la respuesta completa con sus tool events (sin streaming).
+En ese modo NO se mantiene un SSE en paralelo (evita competir por la cola).
 
 ==============================================================================
 7. STATUSLINE                                                *oocode-statusline*

@@ -23,7 +23,7 @@ _err()  { printf '  \033[31m✗\033[0m  %s\n' "$*"; }
 echo ""
 echo "  ╔═══════════════════════════════════╗"
 echo "  ║   OOCode — Ollama Open Code       ║"
-echo "  ║   Instalador v1.1                 ║"
+echo "  ║   Instalador v1.2  ·  OOCode 0.4.3 ║"
 echo "  ╚═══════════════════════════════════╝"
 echo ""
 _info "Directorio del repo: ${REPO_DIR}"
@@ -140,8 +140,15 @@ if [ ! -f "${CONFIG_DIR}/oocode.json" ]; then
     _info "Creando configuración por defecto…"
     cat > "${CONFIG_DIR}/oocode.json" << 'EOF'
 {
-  "ollama": {
-    "host": "http://localhost:11434"
+  "api": {
+    "type":            "ollama",
+    "key":             "",
+    "host":            "http://localhost:11434",
+    "extraHosts":      [],
+    "embedHost":       "",
+    "subagentRouting": "round-robin",
+    "ollamaRetryCount": 2,
+    "ollamaRetryDelay": 3.0
   },
 
   "agents": {
@@ -247,6 +254,17 @@ if [ ! -f "${CONFIG_DIR}/oocode.json" ]; then
     "enabled":        false,
     "model":          "",
     "timeoutSeconds": 120
+  },
+
+  "subagents": {
+    "maxConcurrent":    4,
+    "maxTeams":         3,
+    "maxTeamSize":      5,
+    "recentTtl":        1800,
+    "defaultPriority":  0,
+    "autoContMax":      16,
+    "inferenceTimeout": 0,
+    "defaultTimeout":   0
   },
 
   "searxng": {
@@ -372,7 +390,11 @@ echo "    oocode                            Inicia OOCode"
 echo "    oocode --host http://IP:11434     Ollama en red local"
 echo "    oocode --model qwen3.5:9b         Modelo específico"
 echo "    oocode /ruta/al/proyecto          Workspace del proyecto"
-echo "    oocode --agent coding             Agente 'coding'"
+echo "    oocode --agent coding             Agente 'coding' (sin --agent usa 'main')"
+echo ""
+echo "  Personalizar un agente sin tocar código:"
+echo "    Edita la sección '## Notas' de ~/.oocode/workspace/<agente>/TOOLS.md"
+echo "    (uso de herramientas) o AGENTS.md (delegación). Ver doc/16_workspaces_agents.md"
 echo ""
 echo "  Actualizar (los cambios se aplican al instante):"
 echo "    cd ${REPO_DIR} && git pull"
@@ -380,6 +402,14 @@ echo ""
 echo "  Plugins disponibles (/plugins enable <nombre>):"
 echo "    diff, git, docker, changelog, linter, test_runner,"
 echo "    ctags, tree_sitter, embeddings_search, todo, clipboard, searxng, vault"
+echo ""
+echo "  WebUI (navegador, beta):"
+echo "    oocode --webserver start          http://localhost:4000"
+echo ""
+echo "  Extensiones de editor (requieren la WebUI activa):"
+echo "    VIM/Neovim:  Plug 'burzumishi/oocode', { 'rtp': 'extensions/vim' }"
+echo "    VSCode:      extensions/vscode/  (npm install && npm run compile)"
+echo "    Ver: doc/21_extensions.md"
 echo ""
 echo "  /doctor — diagnóstico completo de la instalación"
 echo ""

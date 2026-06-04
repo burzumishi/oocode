@@ -16,6 +16,9 @@ from mcp_servers.oocode_assistant import (
     _tool_find_file,
     _tool_find_dir,
     _tool_grep_file,
+    _tool_tree,
+)
+from mcp_servers.devops_assistant import (
     _tool_mkdir_dir,
     _tool_touch_file,
     _tool_mv_file,
@@ -23,7 +26,6 @@ from mcp_servers.oocode_assistant import (
     _tool_rm_file,
     _tool_rm_dir,
     _tool_file_stat,
-    _tool_tree,
     _tool_readlink,
     _tool_symlink_create,
     _tool_chmod_file,

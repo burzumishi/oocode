@@ -22,6 +22,7 @@ from mcp_servers.oocode_assistant import (
     _RESOURCE_FNS,
     _get_prompt,
 )
+from mcp_servers.devops_assistant import _TOOLS as _DEVOPS_TOOLS, _TOOL_FNS as _DEVOPS_TOOL_FNS
 
 
 # ── _TOOLS schema integrity ───────────────────────────────────────────────────
@@ -66,8 +67,9 @@ class TestToolSchemas:
             assert callable(fn), f"Handler de '{name}' no es callable"
 
     def test_tool_count(self):
-        """Verificar que no bajamos de 109 tools registradas."""
-        assert len(_TOOLS) >= 109, f"Solo hay {len(_TOOLS)} tools (mínimo 109)"
+        """Verificar que no bajamos de 109 tools entre oocode + devops."""
+        total = len(_TOOLS) + len(_DEVOPS_TOOLS)
+        assert total >= 109, f"Solo hay {total} tools combinadas (mínimo 109)"
 
 
 # ── _PROMPTS coverage ─────────────────────────────────────────────────────────
@@ -176,17 +178,13 @@ class TestPrompts:
 _EXPECTED_RESOURCES = [
     "project://context",
     "project://structure",
-    "project://git",
     "project://deps",
     "project://tests",
     "project://env",
     "project://errors",
     "project://metrics",
     "project://changelog",
-    "project://docker",
     "project://coverage",
-    "project://makefile",
-    "project://ci",
     "project://lint",
     "project://openapi",
     "project://todos",
@@ -207,7 +205,7 @@ class TestResources:
             assert uri in uris, f"Resource '{uri}' no registrado en _RESOURCES"
 
     def test_resource_count(self):
-        assert len(_RESOURCES) >= 20, f"Solo hay {len(_RESOURCES)} resources (mínimo 20)"
+        assert len(_RESOURCES) >= 16, f"Solo hay {len(_RESOURCES)} resources en oocode-assistant (mínimo 16)"
 
     def test_all_resources_have_handler(self):
         for uri in _EXPECTED_RESOURCES:

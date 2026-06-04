@@ -87,11 +87,21 @@ class ToolRegistry:
         entry = self._tools.get(name)
         return entry[0] if entry else None
 
-    def ollama_schemas(self) -> list[dict]:
+    def tool_schemas(self) -> list[dict]:
+        """Schemas de tools en formato OpenAI/Ollama: {"type":"function","function":{...}}."""
         return [
             {"type": "function", "function": schema}
             for _, schema in self._tools.values()
         ]
+
+    def ollama_schemas(self) -> list[dict]:
+        """Alias de compatibilidad de `tool_schemas()` (nombre previo a multi-backend).
+
+        Solo lo ejercitan los tests; el código de producción usa `tool_schemas()`.
+        Se mantiene como red de compatibilidad para código/tests externos que aún
+        usen el nombre antiguo. Puede retirarse cuando ya no haya consumidores.
+        """
+        return self.tool_schemas()
 
     @property
     def cache_enabled(self) -> bool:

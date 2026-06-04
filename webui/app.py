@@ -18,15 +18,14 @@ Toda la lógica está en los módulos:
 import os
 import sys
 from pathlib import Path
+from flask import Flask
 
 # Garantizar que el proyecto está en sys.path al importar webui desde cualquier CWD
 _PROJECT_ROOT = str(Path(__file__).parent.parent)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from flask import Flask
-
-# ── Clave de sesión persistente ───────────────────────────────────────────────
+# ── Clave de sesión persistente ──────────────────────────────────────────────
 _SECRET_FILE = Path.home() / ".oocode" / "webui_secret.key"
 _SECRET_FILE.parent.mkdir(parents=True, exist_ok=True)
 if _SECRET_FILE.exists():
@@ -41,18 +40,18 @@ app.secret_key = _secret
 app.config['JSON_SORT_KEYS'] = False
 
 # ── Blueprints ────────────────────────────────────────────────────────────────
-from webui.api_config  import bp as _bp_cfg;     app.register_blueprint(_bp_cfg)
-from webui.api_chat    import bp as _bp_chat;    app.register_blueprint(_bp_chat)
-from webui.api_files   import bp as _bp_files;   app.register_blueprint(_bp_files)
-from webui.api_agents  import bp as _bp_agents;  app.register_blueprint(_bp_agents)
-from webui.page_home   import bp as _bp_home;    app.register_blueprint(_bp_home)
-from webui.page_config import bp as _bp_pcfg;    app.register_blueprint(_bp_pcfg)
-from webui.page_chat   import bp as _bp_pchat;   app.register_blueprint(_bp_pchat)
+from webui.api_config import bp as _bp_cfg;     app.register_blueprint(_bp_cfg)
+from webui.api_chat   import bp as _bp_chat;    app.register_blueprint(_bp_chat)
+from webui.api_files  import bp as _bp_files;   app.register_blueprint(_bp_files)
+from webui.api_agents import bp as _bp_agents;  app.register_blueprint(_bp_agents)
+from webui.page_home  import bp as _bp_home;    app.register_blueprint(_bp_home)
+from webui.page_config import bp as _bp_pcfg;   app.register_blueprint(_bp_pcfg)
+from webui.page_chat  import bp as _bp_pchat;   app.register_blueprint(_bp_pchat)
 from webui.page_agents import bp as _bp_pagents; app.register_blueprint(_bp_pagents)
-from webui.page_misc   import bp as _bp_misc;    app.register_blueprint(_bp_misc)
+from webui.page_misc  import bp as _bp_misc;    app.register_blueprint(_bp_misc)
 
 # ── Re-exports para compatibilidad con tests existentes ───────────────────────
-from webui.sessions import (  # noqa: E402,F401
+from webui.sessions import (  # noqa: F401
     _WEBUI_SESSIONS,
     _SESSIONS_LOCK,
     _ensure_session_entry,
@@ -61,8 +60,8 @@ from webui.sessions import (  # noqa: E402,F401
     _create_loop_for_webui,
     _SESSION_TTL,
 )
-import webui.helpers as _helpers_mod  # noqa: E402
-from webui.helpers import (  # noqa: E402,F401
+import webui.helpers as _helpers_mod
+from webui.helpers import (  # noqa: F401
     _human_size,
     _model_cards,
     _get_or_create_sid,
@@ -126,9 +125,10 @@ def _get_theme() -> str:
 # ── Arranque standalone ───────────────────────────────────────────────────────
 
 def run_standalone(host: str = "0.0.0.0", port: int = 4000,
-                   log_file: str = "") -> None:
+                   log_file: str = "", log_max_size_mb: int = 5) -> None:
     """Arranca el WebUI en modo standalone (sin TUI). Llamado por `oocode --webui start`."""
     import logging as _log
+    import logging.handlers as _log_handlers
 
     log_path = (Path(log_file).expanduser() if log_file
                 else Path.home() / ".oocode" / "logs" / "webserver.log")
@@ -136,7 +136,11 @@ def run_standalone(host: str = "0.0.0.0", port: int = 4000,
 
     wz = _log.getLogger("werkzeug")
     wz.handlers.clear()
-    fh = _log.FileHandler(str(log_path), encoding="utf-8")
+    fh = _log_handlers.RotatingFileHandler(
+        str(log_path), encoding="utf-8",
+        maxBytes=max(1, int(log_max_size_mb)) * 1024 * 1024,
+        backupCount=3,
+    )
     fh.setFormatter(_log.Formatter("%(asctime)s %(levelname)s %(message)s"))
     wz.addHandler(fh)
     wz.propagate = False

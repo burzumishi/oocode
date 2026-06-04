@@ -128,48 +128,72 @@ ul.tag-list li { background:var(--bg-tertiary); padding:4px 12px; border-radius:
 .tui-messages { flex:1; overflow-y:auto; padding:14px 16px; display:flex; flex-direction:column; gap:0; scroll-behavior:smooth; }
 .tui-messages::-webkit-scrollbar { width:6px; }
 .tui-messages::-webkit-scrollbar-thumb { background:#1e2d45; border-radius:3px; }
-.tui-msg { margin-bottom:14px; animation:slideIn .18s ease; }
+/* ── Mensajes ── */
+.tui-msg { margin-bottom:10px; animation:slideIn .18s ease; }
 .tui-msg-user .tui-msg-hdr { color:#89b4fa; font-size:.78rem; margin-bottom:4px; }
 .tui-msg-user .tui-msg-body { background:#0f1929; border-left:2px solid #89b4fa; padding:8px 12px; border-radius:0 6px 6px 0; white-space:pre-wrap; font-size:.88rem; }
-.tui-msg-agent .tui-msg-hdr { color:#00e5ff; font-size:.78rem; margin-bottom:4px; }
-.tui-msg-agent .tui-msg-body { color:#c0c8d8; font-size:.88rem; white-space:pre-wrap; line-height:1.6; }
-.tui-msg-agent-dot { display:inline-block; }
-.tui-msg-agent-dot.streaming { animation:agentDotPulse .9s ease-in-out infinite; }
+/* Agente: ● text inline — estilo TUI */
+.tui-msg-agent { display:flex; align-items:flex-start; gap:.6ch; padding:3px 0; }
+.tui-dot { color:#00e5ff; flex-shrink:0; line-height:1.65; font-size:.9rem; user-select:none; }
+.tui-dot.streaming { animation:agentDotPulse .9s ease-in-out infinite; }
 @keyframes agentDotPulse { 0%,100%{opacity:.4;color:#007799} 50%{opacity:1;color:#00e5ff} }
-.tui-tool { display:flex; align-items:flex-start; gap:8px; padding:3px 0; font-size:.82rem; color:#556677; }
-.tui-tool-icon { color:#00cc66; flex-shrink:0; width:14px; }
-.tui-tool-name { color:#00cc66; font-weight:600; }
-.tui-tool-ctx  { color:#446655; }
-.tui-tool-block-wrapper { margin:4px 0 8px 0; border-left:2px solid #006688; border-radius:0 4px 4px 0; overflow:hidden; }
-.tui-tool-block-wrapper.done { border-left-color:#1e3050; }
-.tui-tool-block-header { display:flex; align-items:center; gap:8px; padding:5px 10px; cursor:pointer; background:rgba(15,25,40,.7); color:#445566; font-size:.8rem; user-select:none; transition:background .15s; }
-.tui-tool-block-header:hover { background:rgba(30,45,70,.7); color:#667788; }
-.tui-tool-block-icon { color:#334455; flex-shrink:0; }
-.tui-tool-block-icon.running { color:#00aacc; animation:thinkSpin 1.5s linear infinite; }
-.tui-tool-block-summary { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.tui-tool-block-toggle { flex-shrink:0; color:#2a3a50; font-size:.72rem; padding:1px 5px; border:1px solid #1e2d45; border-radius:3px; }
-.tui-tool-block-wrapper.done .tui-tool-block-toggle { color:#334455; }
-.tui-tool-block-wrapper.expanded .tui-tool-block-toggle { color:#445566; }
-/* Inner: por defecto colapsado; visible solo cuando .expanded */
-.tui-tool-block-inner { padding:0; background:rgba(10,16,28,.5); overflow:hidden; max-height:0; transition:max-height .3s ease-out, padding .3s ease-out; }
-.tui-tool-block-wrapper.expanded .tui-tool-block-inner { max-height:800px; padding:2px 8px 4px 8px; overflow-y:auto; }
-/* File cards dentro de bloques: ocultas cuando colapsado, visibles cuando .expanded */
-.tui-tool-block-wrapper .tui-file-card { display:none !important; }
-.tui-tool-block-wrapper.expanded .tui-file-card { display:flex !important; }
-.tui-thinking { display:flex; align-items:center; gap:10px; color:#00e5ff; font-size:.82rem; padding:6px 0; }
-.tui-thinking-label { color:#00b8cc; letter-spacing:.04em; }
-.tui-thinking-wave { display:inline-flex; align-items:flex-end; gap:3px; height:16px; }
-.tui-thinking-bar { display:inline-block; width:3px; height:14px; background:linear-gradient(to top, #00e5ff, #0066aa); border-radius:2px; animation:thinkWave 1.1s ease-in-out infinite; }
-.tui-thinking-bar:nth-child(1){animation-delay:0s}
-.tui-thinking-bar:nth-child(2){animation-delay:.12s}
-.tui-thinking-bar:nth-child(3){animation-delay:.24s}
-.tui-thinking-bar:nth-child(4){animation-delay:.36s}
-.tui-thinking-bar:nth-child(5){animation-delay:.48s}
-.tui-thinking-bar:nth-child(6){animation-delay:.36s}
-.tui-thinking-bar:nth-child(7){animation-delay:.24s}
-@keyframes thinkWave { 0%,100%{opacity:.15;transform:scaleY(.35)} 50%{opacity:1;transform:scaleY(1)} }
-.tui-thinking-sym { color:#00e5ff; animation:thinkSpin 2s linear infinite; display:inline-block; }
-@keyframes thinkSpin { 0%{opacity:.3} 50%{opacity:1} 100%{opacity:.3} }
+.tui-msg-agent .tui-msg-body { color:#c0c8d8; font-size:.88rem; line-height:1.65; flex:1; min-width:0; }
+/* ── Filas de tools: estilo pipa TUI ── */
+.tui-tool { display:flex; align-items:flex-start; padding:1px 0; font-size:.82rem; font-family:'JetBrains Mono','Fira Code',monospace; }
+.tui-tool-pipe { color:#1a2d3a; flex-shrink:0; white-space:pre; user-select:none; }
+.tui-tool-icon { flex-shrink:0; }
+.tui-tool-icon.running { color:#00aacc; }
+.tui-tool-icon.ok  { color:#3a7a4a; }
+.tui-tool-icon.err { color:#f38ba8; }
+.tui-tool-name { color:#3a8faa; white-space:nowrap; margin-left:.2ch; }
+.tui-tool-ctx  { color:#2a5a48; margin-left:.4ch; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.tui-running-dots { color:#223344; margin-left:.3ch; }
+/* ── Tool block: pipa TUI, sin caja ── */
+.tui-tool-block-wrapper { margin:1px 0 4px 0; }
+.tui-tool-block-header { display:flex; align-items:center; gap:.4ch; padding:2px 0; cursor:pointer; font-size:.82rem; font-family:'JetBrains Mono','Fira Code',monospace; user-select:none; }
+.tui-tool-block-header:hover .tui-tool-block-summary { color:#556677; }
+.tui-tool-block-icon { color:#2a5040; flex-shrink:0; }
+.tui-tool-block-icon.running { color:#00aacc; }
+.tui-tool-block-summary { flex:1; color:#2a5040; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.tui-tool-block-toggle { color:#1a2d3a; font-size:.7rem; flex-shrink:0; margin-left:.4ch; }
+.tui-tool-block-wrapper.expanded .tui-tool-block-toggle { color:#334455; }
+/* Inner: colapsado por defecto; visible solo con .expanded */
+.tui-tool-block-inner { overflow:hidden; max-height:0; transition:max-height .25s ease-out; }
+.tui-tool-block-wrapper.expanded .tui-tool-block-inner { max-height:600px; padding-bottom:2px; }
+/* Tarjetas de archivo siempre visibles (no dependientes del estado del tool block) */
+.tui-tool-block-wrapper .tui-file-card { display:flex !important; }
+/* ── Plan block: estilo TUI plano ── */
+.tui-plan-block { margin:5px 0 10px 0; font-family:'JetBrains Mono','Fira Code',monospace; font-size:.84rem; }
+.tui-plan-header { color:#bb66ff; font-weight:600; white-space:nowrap; padding:1px 0; }
+.tui-plan-header.done { color:#3a8a5a; }
+.tui-plan-icon { color:#bb66ff; }
+.tui-plan-icon.done { color:#3a8a5a; }
+.tui-plan-stats { color:#445566; font-weight:normal; font-size:.8rem; }
+.tui-plan-summary { color:#4a5566; font-size:.79rem; padding-left:2ch; }
+.tui-plan-tasks { margin-top:2px; display:flex; flex-direction:column; gap:1px; }
+.tui-plan-task { display:flex; align-items:flex-start; gap:.5ch; font-size:.82rem; }
+.tui-plan-task.pending { color:#334455; padding-left:2ch; }
+.tui-plan-task.active  { color:#cc99ff; padding-left:0; }
+.tui-plan-task.done    { color:#2a7a4a; padding-left:2ch; }
+.tui-task-sym { flex-shrink:0; }
+.tui-plan-task.active .tui-task-sym  { color:#bb66ff; }
+.tui-plan-task.done .tui-task-sym    { color:#3a8a5a; }
+.tui-plan-task.pending .tui-task-sym { color:#334455; }
+.tui-plan-extra { color:#263040; font-size:.78rem; padding-left:2ch; }
+/* ── Pensando: línea encima del prompt con barras verticales ondulantes ── */
+.tui-thinking-area { display:flex; align-items:center; gap:.6ch; padding:4px 12px; background:#080814; border-top:1px solid #0d1225; font-family:'JetBrains Mono','Fira Code',monospace; font-size:.84rem; flex-shrink:0; }
+.tui-thinking-dot  { color:#00e5ff; animation:agentDotPulse .9s ease-in-out infinite; flex-shrink:0; }
+.tui-thinking-word { color:#00b8cc; white-space:nowrap; }
+.tui-wave-bars { display:flex; align-items:flex-end; gap:2px; height:13px; margin-left:.3ch; flex-shrink:0; }
+.tui-wave-bar  { width:3px; background:#006680; border-radius:1px; animation:waveBarAnim 1.1s ease-in-out infinite; }
+.tui-wave-bar:nth-child(1) { animation-delay:0.00s; }
+.tui-wave-bar:nth-child(2) { animation-delay:0.18s; }
+.tui-wave-bar:nth-child(3) { animation-delay:0.36s; }
+.tui-wave-bar:nth-child(4) { animation-delay:0.54s; }
+.tui-wave-bar:nth-child(5) { animation-delay:0.72s; }
+.tui-wave-bar:nth-child(6) { animation-delay:0.54s; }
+.tui-wave-bar:nth-child(7) { animation-delay:0.36s; }
+@keyframes waveBarAnim { 0%,100%{ height:2px; opacity:.35; } 50%{ height:12px; opacity:1; background:#00aacc; } }
 .tui-error { color:#f38ba8; background:rgba(243,138,168,.08); border:1px solid rgba(243,138,168,.2); padding:8px 12px; border-radius:var(--radius); font-size:.85rem; margin:6px 0; }
 .tui-input-area { padding:10px 12px; border-top:1px solid #1a2035; background:#0a0a18; flex-shrink:0; }
 .tui-input-row { display:flex; gap:8px; align-items:flex-end; }
@@ -180,14 +204,8 @@ ul.tag-list li { background:var(--bg-tertiary); padding:4px 12px; border-radius:
 .tui-send-btn { padding:9px 18px; background:#00e5ff; color:#0a0a18; border:none; border-radius:6px; font-size:.95rem; font-weight:bold; cursor:pointer; transition:opacity .2s,background .3s; white-space:nowrap; flex-shrink:0; min-width:90px; text-align:center; }
 .tui-send-btn:hover { opacity:.85; }
 .tui-send-btn:disabled { opacity:.5; cursor:not-allowed; background:#0a2030; color:#224; }
+/* .tui-bottom-bar: base reutilizada por las filas de detalle MCP/LSP (.tui-sb2). */
 .tui-bottom-bar { display:flex; align-items:center; gap:8px; background:#060612; border-top:1px solid #0d1225; padding:3px 10px; font-size:.74rem; color:#334455; flex-shrink:0; white-space:nowrap; overflow:hidden; }
-.tui-bottom-bar .bb-agent { color:#00e5ff; }
-.tui-bottom-bar .bb-sep { color:#1a2035; }
-.tui-bottom-bar .bb-model { color:#445577; }
-.tui-bottom-bar .bb-ctx { color:#336644; }
-.tui-bottom-bar .bb-ctx.warn { color:#f9e2af; }
-.tui-bottom-bar .bb-ctx.crit { color:#f38ba8; animation:ctxCritBlink .8s ease-in-out infinite; }
-.tui-bottom-bar .bb-hint { color:#223344; margin-left:auto; font-size:.72rem; }
 .tui-sb2 { font-size:.72rem; padding:2px 10px; gap:6px; flex-wrap:wrap; overflow:hidden; background:#060612; border-top:1px solid #0a0f1c; }
 .tui-agent-row { display:flex; align-items:center; gap:8px; padding:6px 10px; background:#0a0a18; border-bottom:1px solid #1a2035; flex-shrink:0; flex-wrap:wrap; }
 .tui-agent-row label { color:#556677; font-size:.78rem; flex-shrink:0; }

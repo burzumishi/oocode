@@ -236,6 +236,18 @@ Desde v0.3.7 el agente puede usar estas herramientas de orquestación como cualq
 | `create_team` | Crea equipo con subtareas para múltiples agentes | Tarea descomponible en partes paralelas independientes |
 | `run_team` | Ejecuta el equipo y devuelve resultados | Tras `create_team` |
 | `spawn_fanout` | N chunks del mismo problema en paralelo (mismo agente) | Análisis de repo grande, divide-and-conquer |
+| `explore` | Exploración profunda de solo lectura en una llamada | Mapear código/fuentes antes de decidir |
+
+> **Dispatch secuencial (v0.4.2):** las herramientas de orquestación nunca se ejecutan en paralelo dentro del `ThreadPoolExecutor`, aunque el LLM las batchee con `read_file`/`grep_code`. Su cabecera y su streaming `│` solo se renderizan en la rama secuencial; paralelizarlas dejaba el output del subagente "encerrado" en el bloque anterior. Para paralelismo real usa `spawn_fanout` (mismo agente, N chunks) o `create_team` (dominios distintos), que tienen concurrencia interna.
+
+### Narración del equipo (v0.4.2)
+
+Para que el usuario siga lo que hace el equipo, el agente coordinador debe:
+
+1. **Antes** de `create_team`/`run_team`/`spawn_fanout`: anunciar en una frase la composición y el reparto ("Monto un equipo: Coder → API, Office → informe").
+2. **Después** de `run_team`/`spawn_fanout`: **sintetizar** qué aportó cada agente (combinar hallazgos, destacar lo completado, mencionar errores) antes de cerrar la tarea con `task_done()` — nunca cerrar en silencio saltándose la síntesis.
+
+En el WebUI, la **team-bar** (cabecera de equipo bajo el prompt) muestra en vivo una línea compacta `📋 Agente principal 💬 💻 Subagente · N subagente(s)`. El detalle de cada subagente —su tarea, plan, texto y herramientas— vive en su propio **bloque dentro de la conversación**, no en la barra de estado.
 
 ### `spawn_subagent` — parámetros
 

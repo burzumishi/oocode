@@ -12,8 +12,7 @@ from agent.loop_helpers import (
     _HEADER_ANIM_CODES, _ANSI_BOLD, _ANSI_RESET,
     _SPINNER_FRAMES, _TASK_ICON_COLORS,
     _make_compact_summary, _ctx_bar, _fmt_tokens, _pbar_thin_ratio,
-    _sfmt, _COMPACT_LOCK,
-    _ANIM_JOIN_TIMEOUT, _COMPACT_SPINNER_POLL,
+    _sfmt, _ANIM_JOIN_TIMEOUT, _COMPACT_SPINNER_POLL,
     _COMPACT_TEXT, _COMPACT_NEAR_TEXT,
 )
 import tools.progress as _tool_progress
@@ -47,6 +46,7 @@ class TUIDisplayMixin:
     _session_mems:          list[str]
     _tool_current_file:     str
     _last_elapsed:          float
+    _last_response:         str
     # -- attrs públicos de __init__
     capture_output:         bool
     is_subagent:            bool
@@ -378,13 +378,51 @@ class TUIDisplayMixin:
         self._session_reads = []
         self._session_mems  = []
 
+        # ── Paso 5: recuperar el último mensaje del agente ────────────────────
+        # La compactación limpia el área visible. Sin esto, el último mensaje del
+        # agente (p.ej. un resumen final que pregunta si continuar) se perdería de
+        # vista y el usuario respondería a ciegas. Usamos _last_agent_msg (el ÚLTIMO
+        # bloque de texto, actualizado por iteración) y no _last_response (que solo
+        # se fija en _turn_finish, quedando obsoleto al compactar a mitad de turno:
+        # en la 2ª/3ª compactación de un mismo run() mostraba el mensaje de la 1ª).
+        # Fallback a _last_response por compatibilidad. Markdown, sangría 2.
+        last = (getattr(self, "_last_agent_msg", "")
+                or getattr(self, "_last_response", "") or "").strip()
+        if last:
+            from rich.markdown import Markdown as _Md
+            from rich.padding import Padding as _Pad
+            _con.print("  [dim]●[/dim] [dim]último mensaje del agente (antes de compactar):[/dim]")
+            try:
+                _con.print(_Pad(_Md(last), (0, 0, 0, 2)))
+            except Exception:
+                for _ln in last.split("\n"):
+                    _con.print(f"  {_ln}")
+            _con.print()
+
         # Plan: no reprint tras compactación — el spinner multitarea ya indica la tarea activa
 
     def _do_compact_locked(self, with_summary: bool = True) -> int:
         """Lógica de compactación — siempre ejecutada bajo _COMPACT_LOCK."""
+        # A: min_keep adaptativo — preservar mensajes del turno de tarea activa.
+        # Si hay una tarea de plan activa, la compactación no puede eliminar los
+        # mensajes generados desde que esa tarea empezó.
+        _ctx_mk = self.context
+        _saved_mk = _ctx_mk.min_keep
+        _plan_msg_idx = getattr(self, "_plan_active_msg_idx", -1)
+        if _plan_msg_idx >= 0:
+            _msgs_since = len(_ctx_mk.messages) - _plan_msg_idx
+            if _msgs_since > 0:
+                _ctx_mk.min_keep = max(_saved_mk, _msgs_since + 2)
+        try:
+            return self._do_compact_locked_inner(with_summary)
+        finally:
+            _ctx_mk.min_keep = _saved_mk
+
+    def _do_compact_locked_inner(self, with_summary: bool = True) -> int:
         if self.capture_output:
             summarize_fn = self._summarize_messages if with_summary else None
-            dropped = self.context.compact(summarize_fn=summarize_fn)
+            dropped = self.context.compact(summarize_fn=summarize_fn,
+                                           resummary_fn=self._condense_summary)
             if dropped:
                 self.session.log_compaction(len(dropped))
             return len(dropped)
@@ -401,7 +439,8 @@ class TUIDisplayMixin:
                 f"[cyan]{n_msgs} msgs · ~{cur_tok:,} tok[/cyan]"
             )
             summarize_fn = self._summarize_messages if with_summary else None
-            dropped = ctx.compact(summarize_fn=summarize_fn)
+            dropped = ctx.compact(summarize_fn=summarize_fn,
+                                  resummary_fn=self._condense_summary)
             if dropped:
                 self.session.log_compaction(len(dropped))
                 new_tok = ctx.token_estimate()
@@ -475,7 +514,8 @@ class TUIDisplayMixin:
 
                     summarize_fn = _cb_summarize
 
-                dropped = ctx.compact(summarize_fn=summarize_fn)
+                dropped = ctx.compact(summarize_fn=summarize_fn,
+                                     resummary_fn=self._condense_summary)
                 self._status_cb("")  # Limpia status
 
                 if dropped:
@@ -530,7 +570,8 @@ class TUIDisplayMixin:
 
             progress.update(ptask, description="eliminando mensajes…")
             progress.advance(ptask)
-            dropped = ctx.compact(summarize_fn=summarize_fn)
+            dropped = ctx.compact(summarize_fn=summarize_fn,
+                                  resummary_fn=self._condense_summary)
             progress.advance(ptask)
             progress.update(ptask, description="completado ✓")
 

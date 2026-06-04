@@ -2,7 +2,6 @@
 import random
 import time
 from pathlib import Path
-from typing import Any
 from rich.table import Table
 from rich.text import Text
 from rich.columns import Columns
@@ -274,9 +273,14 @@ def print_config(config) -> None:
     t = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
     t.add_column("key", style="dim", no_wrap=True)
     t.add_column("val", style="white")
+    _api_type = getattr(config, "api_type", "ollama")
     t.add_row("Agente",    f"{config.agent_emoji} {config.agent_name} ({config.agent_id})")
+    t.add_row("Backend",   f"[cyan]{_api_type}[/cyan]" + ("" if _api_type == "ollama" else "  [dim](experimental)[/dim]"))
     t.add_row("Modelo",    f"[bold cyan]{config.model or '(sin seleccionar)'}[/bold cyan]")
-    t.add_row("Servidor",  config.ollama_host)
+    if _api_type == "openai":
+        t.add_row("baseUrl",   config.api_base_url or "[dim](sin configurar)[/dim]")
+    elif _api_type == "ollama":
+        t.add_row("Servidor",  config.ollama_host)
     t.add_row("Workspace", config.workspace)
     t.add_row("Contexto",  f"{config.max_context_tokens} tokens máx.")
     console.print(t)
@@ -505,7 +509,7 @@ def print_status(config, session, runtime, context) -> None:
 
 def print_gateway_status(config) -> None:
     """Estado del servidor Ollama (equivalente a /gateway-status de OpenClaw)."""
-    import ollama as _ollama
+    from api.ollama import list_ollama_models
 
     console.print()
     console.rule("[bold cyan]Gateway / Ollama[/bold cyan]", style="blue")
@@ -514,13 +518,7 @@ def print_gateway_status(config) -> None:
     console.print(f"  [dim]Host:[/dim]  {config.ollama_host}")
 
     try:
-        client = _ollama.Client(host=config.ollama_host)
-        #try:
-        data = client.list()
-        #finally:
-        #    return True
-        #    client.close()
-        models = data.get("models", []) if isinstance(data, dict) else list(data.models)
+        models = list_ollama_models(config.ollama_host)
         console.print(f"  [green]●[/green]  Conectado  —  [white]{len(models)}[/white] [dim]modelos disponibles[/dim]")
 
         if models:
@@ -531,11 +529,9 @@ def print_gateway_status(config) -> None:
             t.add_column("Tamaño",  style="dim", justify="right")
             t.add_column("Activo",  style="bold green", width=7)
             for m in models:
-                name   = m.model if hasattr(m, "model") else m.get("name", "—")
-                _raw_size = m.size if hasattr(m, "size") else m.get("size", 0)
-                size      = (_raw_size or 0) / 1e9
-                det: Any  = m.details if hasattr(m, "details") else {}
-                family = (det.family if hasattr(det, "family") else det.get("family", "—")) if det else "—"
+                name   = m["name"]
+                size   = (m["size"] or 0) / 1e9
+                family = m["details"].get("family", "—") if m["details"] else "—"
                 active = "◀" if name == config.model else ""
                 t.add_row(name, str(family), f"{size:.1f} GB", active)
             console.print(t)
@@ -855,14 +851,41 @@ def print_config_full(config) -> None:
     console.rule("[bold cyan]Configuración completa[/bold cyan]", style="blue")
     console.print()
 
+    # ── Backend LLM (bloque "api" unificado) ───────────────────────────────────
+    _api_type = getattr(config, "api_type", "ollama")
+    _key      = getattr(config, "api_key", "")
+    _key_disp = ("••••" + _key[-4:]) if len(_key) > 4 else ("[green]configurada[/green]" if _key else "[dim](sin key)[/dim]")
+    if _api_type == "ollama":
+        _backend_rows = [
+            ("type",        "[cyan]ollama[/cyan]  [dim](estable)[/dim]"),
+            ("host",        config.ollama_host),
+            ("embedHost",   config.ollama_embed_host or "[dim](= host)[/dim]"),
+            ("extraHosts",  ", ".join(h for h in config.ollama_extra_hosts if h) or "[dim](ninguno)[/dim]"),
+            ("subagentRouting", config.ollama_subagent_routing),
+            ("ollamaRetry", f"{config.ollama_retry_count}× / {config.ollama_retry_delay}s"),
+        ]
+    elif _api_type == "openai":
+        _backend_rows = [
+            ("type",      "[cyan]openai[/cyan]  [dim](OpenAI-compatible — experimental)[/dim]"),
+            ("baseUrl",   config.api_base_url or "[dim](sin configurar)[/dim]"),
+            ("key",       _key_disp),
+            ("embedHost", f"{config.effective_embed_host}  [dim](embeddings vía Ollama)[/dim]"),
+        ]
+    else:  # anthropic
+        _backend_rows = [
+            ("type",      "[cyan]anthropic[/cyan]  [dim](experimental)[/dim]"),
+            ("key",       _key_disp),
+            ("embedHost", f"{config.effective_embed_host}  [dim](embeddings vía Ollama)[/dim]"),
+        ]
+
     sections = [
         ("Agente", [
             ("ID",          config.agent_id),
             ("Nombre",      f"{config.agent_emoji} {config.agent_name}"),
             ("Modelo",      config.model or "(sin seleccionar)"),
-            ("Host",        config.ollama_host),
             ("Workspace",   config.workspace),
         ]),
+        ("Backend (api)", _backend_rows),
         ("Contexto", [
             ("maxTokens",           str(config.max_context_tokens)),
             ("minKeep",             str(config.compact_min_keep)),
@@ -946,6 +969,16 @@ def print_config_full(config) -> None:
         ("Hooks", [
             ("Activo",   "[green]sí[/green]" if config.hooks_enabled else "[dim]no[/dim]"),
             ("builtins", ", ".join(config.hooks_builtins) or "[dim](ninguno)[/dim]"),
+        ]),
+        ("Subagentes", [
+            ("maxConcurrent",    str(config.subagents_max_concurrent)),
+            ("maxTeams",         str(config.subagents_max_teams)),
+            ("maxTeamSize",      str(config.subagents_max_team_size)),
+            ("autoContMax",      str(config.subagents_auto_cont_max)),
+            ("inferenceTimeout", f"{config.subagents_inference_timeout}s" if config.subagents_inference_timeout else "[dim]0 (hereda fallback)[/dim]"),
+            ("defaultTimeout",   f"{config.subagents_default_timeout}s" if config.subagents_default_timeout else "[dim]0 (sin límite)[/dim]"),
+            ("defaultPriority",  str(config.subagents_default_priority)),
+            ("recentTtl",        f"{config.subagents_recent_ttl}s"),
         ]),
         ("Fallback", [
             ("Activado",        "[green]sí[/green]" if config.fallback_enabled else "[dim]no[/dim]"),

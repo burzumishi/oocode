@@ -152,14 +152,39 @@ def doctor_page():
     else:
         _fail("Config", "No se pudo cargar OOConfig")
 
-    # Ollama
+    # Backend LLM (ollama | openai | anthropic)
     if cfg:
-        try:
-            import urllib.request
-            urllib.request.urlopen(f"{cfg.ollama_host}/api/tags", timeout=3)
-            _ok("Ollama", f"Conectado en {cfg.ollama_host}")
-        except Exception as e:
-            _warn("Ollama", f"No disponible en {cfg.ollama_host}: {e}")
+        import urllib.request
+        _api_type = getattr(cfg, "api_type", "ollama")
+        if _api_type == "ollama":
+            try:
+                urllib.request.urlopen(f"{cfg.ollama_host}/api/tags", timeout=3)
+                _ok("Backend LLM", f"Ollama conectado en {cfg.ollama_host}")
+            except Exception as e:
+                _warn("Backend LLM", f"Ollama no disponible en {cfg.ollama_host}: {e}")
+        else:
+            _label = "OpenAI-compatible" if _api_type == "openai" else "Anthropic"
+            _ok("Backend LLM", f"Tipo: {_api_type} ({_label} — experimental)")
+            if _api_type == "anthropic" and not getattr(cfg, "api_key", ""):
+                _fail("Backend LLM", "Falta API key (api.key) requerida por Anthropic")
+            elif _api_type == "openai" and getattr(cfg, "api_base_url", ""):
+                try:
+                    _hdr = {"Authorization": f"Bearer {cfg.api_key}"} if cfg.api_key else {}
+                    _req = urllib.request.Request(
+                        f"{cfg.api_base_url.rstrip('/')}/models", headers=_hdr)
+                    urllib.request.urlopen(_req, timeout=4)
+                    _ok("Backend LLM", f"Conectado en {cfg.api_base_url}")
+                except Exception as e:
+                    _warn("Backend LLM", f"baseUrl no verificado ({cfg.api_base_url}): {e}")
+
+        # Embeddings: siempre protocolo Ollama (memoria/RAG), sea cual sea el backend
+        if getattr(cfg, "memory_embed_enabled", True):
+            _eh = cfg.effective_embed_host
+            try:
+                urllib.request.urlopen(f"{_eh}/api/tags", timeout=3)
+                _ok("Embeddings", f"Host Ollama conectado: {_eh}")
+            except Exception as e:
+                _warn("Embeddings", f"Host Ollama de embeddings no disponible ({_eh}): {e}")
 
     # Dependencias Python
     for pkg, label in [("flask", "Flask"), ("rich", "Rich"), ("ollama", "ollama SDK"),

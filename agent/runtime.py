@@ -124,27 +124,3 @@ class RuntimeSettings:
         if self.reasoning:
             return base + "\nMuestra tu razonamiento paso a paso."
         return base
-
-    def summary_line(self) -> str:
-        parts = []
-        if self.think_level != "off":
-            parts.append(f"think={self.think_level}")
-        if self.reasoning:
-            parts.append("reasoning=on")
-        if self.fast_mode:
-            parts.append("fast=on")
-        if self.verbose:
-            parts.append("verbose=on")
-        if self.trace:
-            parts.append("trace=on")
-        if self.elevated != "ask":
-            parts.append(f"elevated={self.elevated}")
-        if self.usage_display != "tokens":
-            parts.append(f"usage={self.usage_display}")
-        if self.ctx_mode != "mini":
-            parts.append(f"ctx={self.ctx_mode}")
-        if self.accent_color != "cyan":
-            parts.append(f"color={self.accent_color}")
-        if self.extra_dirs:
-            parts.append(f"+{len(self.extra_dirs)} dirs")
-        return "  ".join(parts) if parts else "defaults"

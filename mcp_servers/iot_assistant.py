@@ -20,7 +20,6 @@ Dependencias opcionales:
 from __future__ import annotations
 
 import json
-import os
 import socket
 import subprocess
 import sys
@@ -1085,7 +1084,6 @@ def _tool_mqtt_publish(args: dict) -> str:
 
     cfg = _load_cfg()["mqtt"]
     try:
-        import paho.mqtt.client as mqtt
         import paho.mqtt.publish as publish
     except ImportError:
         return "Instalar: pip install paho-mqtt\nLuego reinicia OOCode."

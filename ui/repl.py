@@ -95,6 +95,7 @@ def _build_style(accent: str) -> Style:
         "sub-done":     "#00cc66",           # ◯ subagente terminado
         "sub-dim":      "#8899bb",           # hints, elapsed, hints
         "sub-name":     "#bb66ff bold",      # emoji + id del subagente
+        "sub-chat":     "#00e5ff bold",      # 💬 parpadeante (comunicación sub↔principal)
         # ── Task progress panel ────────────────────────────────────────────────
         "task-done":     "#00cc66",                     # ✔ verde brillante
         "task-active":   "#00e5ff bold",                # ◼ cyan brillante
@@ -256,9 +257,11 @@ def _build_toolbar(agent_loop) -> HTML:
     # Primer bloque: comienza con '· ' (sin espacio inicial — ocupa todo el borde)
     if _n_sub > 0:
         # Con subagentes: icono animado + badge de count; el panel de subagentes
-        # muestra la lista completa sobre la toolbar
+        # muestra la lista completa sobre la toolbar. El 💬 parpadea con blink_on
+        # ("  " = 2 celdas en la fase apagada → mismo ancho que el emoji, sin saltos).
+        _chat = "\U0001f4ac" if blink_on else "  "
         agent_block = (
-            f'· <mcp-active>{_bot_icon} {_agent_name} \U0001f4ac sub:{_n_sub}</mcp-active>'
+            f'· <mcp-active>{_bot_icon} {_agent_name} {_chat} sub:{_n_sub}</mcp-active>'
         )
     else:
         agent_block = f'· <agent-main>{_bot_icon} {_agent_name}</agent-main>'

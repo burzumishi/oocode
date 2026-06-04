@@ -93,11 +93,69 @@ El LLM también puede lanzar sub-agentes directamente usando la herramienta `spa
 spawn_subagent(
   agent_id="review",
   task="revisa el diff actual y lista los riesgos",
-  timeout_seconds=180     # opcional: mata el subagente si tarda más de 3 minutos
+  timeout_seconds=180     # opcional: mata el subagente si un PASO no progresa en 3 min
 )
 ```
 
-El parámetro `timeout_seconds` activa un **watchdog thread** que dispara el `kill_event` del subagente al expirar. El subagente termina limpiamente en la siguiente iteración de su loop y el padre recibe un mensaje de error de timeout en lugar de bloquearse indefinidamente.
+El parámetro `timeout_seconds` activa un **watchdog por inactividad**: un thread que
+dispara el `kill_event` del subagente solo si pasa `timeout_seconds` **sin progreso**.
+Es un timeout **por paso / petición al LLM, no por tiempo total**: el `AgentLoop` del
+subagente emite un *heartbeat* al iniciar cada iteración, al recibir la respuesta del
+LLM y tras cada tool, así que un subagente que avanza de forma sostenida **no se
+detiene** aunque la tarea completa dure mucho más que `timeout_seconds`. Solo se mata
+si una sola petición al LLM (o una tool) se cuelga más de `timeout_seconds`. El
+subagente termina limpiamente en la siguiente iteración de su loop y el padre recibe
+un mensaje de error de timeout en lugar de bloquearse indefinidamente.
+
+## Configurar límites de subagentes (`subagents` en `oocode.json`)
+
+Desde v0.4.0 el bloque `subagents` de `oocode.json` expone tres campos nuevos para controlar el comportamiento de los subagentes de forma independiente al agente principal:
+
+```json
+{
+  "subagents": {
+    "maxConcurrent":    4,
+    "autoContMax":      16,
+    "inferenceTimeout": 0,
+    "defaultTimeout":   0
+  }
+}
+```
+
+| Campo | Default | Descripción |
+|-------|---------|-------------|
+| `maxConcurrent` | 4 | Subagentes corriendo en paralelo simultáneamente |
+| `autoContMax` | 16 | **Auto-continues máximos para subagentes.** A diferencia del agente principal (`context.autoContinueMax: 8`), los subagentes tienen un límite más alto porque suelen ejecutar tareas largas de varios pasos. Con 0, hereda el valor del agente principal. |
+| `inferenceTimeout` | 0 | **Timeout de inferencia** en segundos, solo para subagentes. Útil cuando los subagentes hacen razonamiento complejo que tarda más de lo normal por turno. **Desde v0.4.1** se aplica con máxima prioridad (`inference_timeout_override`): supera al timeout per-modelo y al de fallback, y funciona aunque no haya modelo de fallback configurado. Con 0, hereda el timeout del agente principal. |
+| `defaultTimeout` | 0 | **Timeout por paso/petición al LLM** (inactividad), **no** por tiempo total. El watchdog mata el subagente solo si un paso pasa este número de segundos **sin progreso** (sin heartbeat); un subagente que avanza no se detiene aunque la tarea total dure más. Se usa si el LLM llama `spawn_subagent`/`spawn_fanout` sin `timeout_seconds`. Con 0 no hay watchdog. |
+
+### Ejemplo: subagentes con 5 minutos de inferencia y sin límite de tarea
+
+```json
+{
+  "subagents": {
+    "autoContMax":      20,
+    "inferenceTimeout": 300,
+    "defaultTimeout":   0
+  }
+}
+```
+
+### Ejemplo: matar un subagente si un paso se cuelga más de 10 minutos
+
+```json
+{
+  "subagents": {
+    "defaultTimeout": 600
+  }
+}
+```
+
+Con esto, un subagente puede trabajar horas en una tarea larga siempre que cada paso
+(petición al LLM o tool) progrese; solo se mata si **un único paso** se cuelga más de
+600 s. Esto evita que tareas legítimamente largas se detengan «por acumular tiempo».
+
+> **Nota:** `timeout_seconds` explícito en la llamada `spawn_subagent(timeout_seconds=N)` siempre tiene precedencia sobre `defaultTimeout`. En ambos casos la semántica es **por paso sin progreso**, no tiempo total.
 
 ## Control de sub-agentes con `/subagents`
 
@@ -139,7 +197,8 @@ Sub-agente #4       → host[0] = localhost:11434   ← vuelve al inicio
 
 ```json
 {
-  "ollama": {
+  "api": {
+    "type":            "ollama",
     "host":            "http://localhost:11434",
     "extraHosts":      ["http://gpu2:11434", "http://gpu3:11434"],
     "embedHost":       "http://cpu-server:11434",
@@ -172,6 +231,25 @@ Agente principal
         └── context.add_tool_result(resultado_str)
         └── continúa con Ollama (mismo modelo)
 ```
+
+Para no inundar el terminal, el streaming `│` muestra **hasta 12 líneas por turno** del sub-agente; al alcanzar el límite aparece `… buffer lleno (ctrl+o para ver completo)` y el resto de ese turno se omite del live view (sigue completo en el historial expandible con `Ctrl+O`). El presupuesto se **refresca en cada turno** del sub-agente: a medida que avanza (auto-continue), las líneas nuevas siguen apareciendo y las antiguas hacen scroll hacia arriba — así siempre ves su actividad reciente, no solo el primer turno.
+
+Todo el bloque del sub-agente comparte la columna `│`, incluido su `●` de texto y su continuación:
+
+```
+  │ ● Tarea 6 activa: Documentar cambios en doc/interaccion_social.md.
+  │   Voy a crear la documentación con todos los cambios del Sprint 9.
+  │   ◐  Write(interaccion_social.md)
+  │   │  Fichero escrito: /ruta/doc.md (8292 caracteres)
+```
+
+## Directorio de trabajo (cwd de las tools)
+
+El sub-agente carga **su propio** workspace de identidad (`~/.oocode/workspace/<id>/`), pero ejecuta las tools (`bash`, `python_exec`, `workspace_remember`) en el **`project_dir` del padre** — el mismo proyecto en el que trabaja el agente principal, no su carpeta de identidad. Así un sub-agente `coding` que hace `bash("mkdir -p doc")` lo crea en el proyecto, no en `~/.oocode/workspace/coding/`.
+
+## Delegación consciente de agentes
+
+El LLM ve el **rol de cada agente disponible** (leído de su `IDENTITY.md`) tanto en los schemas de `spawn_subagent`/`create_team`/`spawn_fanout` como en una sección "Agentes disponibles para delegar" del system prompt (cuando hay >1 agente). Así puede decidir delegar en el agente más afín a la tarea (p.ej. una búsqueda web en `webcrawler`) en vez de resolverlo todo él mismo — sin necesidad de prompts específicos. Puedes afinar esta preferencia en la sección `## Notas` de `AGENTS.md` (ver doc 16).
 
 ## Aislamiento del sub-agente
 

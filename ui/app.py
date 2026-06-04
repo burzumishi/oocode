@@ -343,6 +343,16 @@ class OOCodeApp:
         # Compact-reset callback → vacía el área de conversación antes del reset visual
         agent_loop._clear_output_cb = self._clear_output_for_compact
 
+        # Re-estilado en caliente: /color reasigna el accent → el Style del app
+        # full-screen se construye una sola vez, así que hay que reaplicarlo.
+        agent_loop._restyle_cb = self._restyle
+
+        # Live block callbacks para los subagentes: sliding window igual que el main agent
+        _runner = getattr(agent_loop, "subagent_runner", None)
+        if _runner is not None:
+            _runner._parent_live_start_cb = self._update_live_tool_start
+            _runner._parent_live_done_cb  = self._subagent_update_live_tools
+
         # Hook de nueva sesión → limpia el historial de entrada en memoria
         agent_loop._on_new_session = self._reset_input_history
 
@@ -603,6 +613,25 @@ class OOCodeApp:
         # Las invalidaciones inmediatas desde callbacks intermedios acumulan
         # repaints innecesarios en prompt_toolkit cuando corren múltiples tools.
 
+    def _subagent_update_live_tools(self, _count: int) -> None:
+        """Variante de _update_live_tools para tools de subagentes.
+
+        Actualiza el sliding window (completed_tools + current_tool) sin tocar
+        _live_block_tool_n: el contador ⎿ "Used N tools" pertenece al agente principal.
+        """
+        with self._lock:
+            if self._live_block_current_tool:
+                _tool_entry = self._live_block_current_tool
+                if self._live_block_preview:
+                    _tool_entry = f"{_tool_entry} {self._live_block_preview[0]}"
+                self._live_block_completed_tools.append(_tool_entry)
+                if len(self._live_block_completed_tools) > 4:
+                    self._live_block_completed_tools.pop(0)
+            self._live_block_current_tool = ""
+            self._live_block_preview = []
+            self._live_block_action = ""
+            self._output_cache_key += 1
+
     def _update_live_current_tool(self, tool_label: str) -> None:
         """Muestra el nombre de la tool ejecutando en '|  ◐ tool:' (sin preview). Prefer _update_live_tool_start."""
         with self._lock:
@@ -629,6 +658,20 @@ class OOCodeApp:
             self._live_block_action = action
             self._output_cache_key += 1
 
+    def _restyle(self, accent: str) -> None:
+        """Reaplica el Style de prompt_toolkit en caliente (lo invoca /color).
+
+        El Application se construye una vez con un Style fijo; sin esto, /color
+        actualizaría rt.accent_color (y el ● de la conversación, que es Rich y se
+        recalcula por turno) pero NO la toolbar/prompt con estilo prompt_toolkit
+        (sep-label, brand, agent…), que quedarían con el color anterior hasta reiniciar.
+        """
+        from ui.repl import _build_style
+        _app = getattr(self, "_app", None)
+        if _app is not None:
+            _app.style = _build_style(accent)
+            _app.invalidate()
+
     def _flush_live_block(self, summary: str = "") -> None:
         """Cierra el live block y lo mueve al buffer estático con ● de color fijo."""
         with self._lock:
@@ -636,12 +679,12 @@ class OOCodeApp:
                 return
             # Determinar color final desde accent_color del agente
             try:
-                from agent.runtime import COLOR_PRESETS
                 _ac = getattr(self._agent_loop.rt, "accent_color", "cyan")
                 _ANSI_ACCENT = {
                     "green": "\x1b[1;32m", "cyan": "\x1b[1;36m",
                     "blue": "\x1b[1;34m",  "magenta": "\x1b[1;35m",
                     "yellow": "\x1b[1;33m", "red": "\x1b[1;31m",
+                    "white": "\x1b[1;37m",
                 }
                 bullet_color = _ANSI_ACCENT.get(_ac, "\x1b[1;36m")
             except Exception:
@@ -754,12 +797,17 @@ class OOCodeApp:
         except Exception:
             return [("", "")]
 
-        # Porcentaje de contexto para la línea de header
-        try:
-            cs      = self._agent_loop.context.stats()
-            ctx_pct = int(cs["tokens_estimate"] / max(cs["max_tokens"], 1) * 100)
-            ctx_str = f" · {ctx_pct}% ctx ·"
-        except Exception:
+        # Porcentaje de contexto del SUBAGENTE activo para la línea de header.
+        # No usamos el ctx del agente principal (eso ya está en el toolbar de abajo):
+        # aquí, en el panel de subagentes, el % debe reflejar el contexto del
+        # subagente en ejecución. Preferimos el running; si ninguno reporta ctx
+        # todavía (aún no ha completado su 1.ª petición al LLM), no mostramos nada.
+        _ctx_sub = next((s for s in subs if s.status == "running" and s.ctx_pct > 0), None)
+        if _ctx_sub is None:
+            _ctx_sub = next((s for s in subs if s.ctx_pct > 0), None)
+        if _ctx_sub is not None:
+            ctx_str = f" · {_ctx_sub.ctx_pct}% ctx ·"
+        else:
             ctx_str = " ·"
 
         result: list[tuple[str, str]] = []
@@ -773,8 +821,10 @@ class OOCodeApp:
         )
 
         # ── Línea header — todos los controles en una sola línea + ctx% · ───
+        # 2 espacios de sangría → ⏵⏵ alineado con la columna del emoji de las
+        # líneas de subagente de abajo (que también arrancan con "  ").
         header_l = (
-            "    ⏵⏵ Subagentes Activos"
+            "  ⏵⏵ Subagentes Activos"
             " · ^C interrumpir · /subagents gestionar"
             " · /kill · /steer"
         )
@@ -810,9 +860,15 @@ class OOCodeApp:
             sub_label  = html.escape(f"{sub.agent_emoji} {sub.agent_id[:12]}")
             task_short = html.escape(sub.task)
 
+            # 💬 parpadea (~1 s) mientras el subagente comunica con el principal;
+            # "  " (2 celdas) en la fase apagada mantiene el ancho sin saltos.
+            _chat = "💬" if int(time.time()) % 2 == 0 else "  "
+
             result.append(("class:sub-dim",  "  "))
             result.append((icon_style,       f"{agent_emoji} "))
-            result.append(("class:sub-name", f"{agent_name} 💬 {sub_label}: "))
+            result.append(("class:sub-main", f"{agent_name} "))   # agente principal (cyan)
+            result.append(("class:sub-chat", f"{_chat} "))
+            result.append(("class:sub-name", f"{sub_label}: "))   # subagente (violeta)
             result.append(("class:sub-dim",  task_short))
             result.append(("class:sub-dim",  st_str + sub_ctx))
             result.append((st_style,         ""))
@@ -1053,6 +1109,34 @@ class OOCodeApp:
             if label.endswith("──") and label.startswith("["):
                 inner = label[:-2]     # "[ oocode ❯ ... ]"
                 tail  = "──"
+                # "oocode" (marca) en su color de marca; el resto sigue el accent.
+                _bi = inner.find("oocode")
+                if _bi != -1:
+                    _be = _bi + len("oocode")
+                    _after = inner[_be:]    # " ❯ agent ❯ project ]"
+                    # Nombre del proyecto (último segmento tras "❯ ") en su color propio.
+                    _pi    = _after.rfind("❯ ")
+                    _close = _after.rfind("]")
+                    if _pi != -1 and _close > _pi:
+                        _pj_start = _pi + len("❯ ")
+                        _proj_raw = _after[_pj_start:_close]   # "project "
+                        _proj     = _proj_raw.rstrip()
+                        _proj_tl  = _proj_raw[len(_proj):]     # espaciado conservado
+                        if _proj:
+                            return [
+                                ("class:sep-label", inner[:_bi]),
+                                ("class:brand",     "oocode"),
+                                ("class:sep-label", _after[:_pj_start]),
+                                ("class:project",   _proj),
+                                ("class:sep-label", _proj_tl + _after[_close:]),
+                                ("class:sep",       tail),
+                            ]
+                    return [
+                        ("class:sep-label", inner[:_bi]),
+                        ("class:brand",     "oocode"),
+                        ("class:sep-label", _after),
+                        ("class:sep",       tail),
+                    ]
                 return [("class:sep-label", inner), ("class:sep", tail)]
             return [("class:sep-label", label)]
 
@@ -1289,9 +1373,11 @@ class OOCodeApp:
                 console.print("  [dim]Cancelado.[/dim]")
                 return
             if self._agent_thread and self._agent_thread.is_alive():
-                self._agent_loop._kill_requested = True
+                _summary = self._agent_loop.request_kill()
                 self._set_status("")
-                _out("\n  ↯  Kill enviado al agente.\n")
+                _nsub = _summary.get("subagents", 0)
+                _sfx  = f"  ·  {_nsub} subagente(s)" if _nsub else ""
+                _out(f"\n  ↯  Kill enviado al agente.{_sfx}\n")
             else:
                 _out("\n  (Ctrl+C — escribe /exit para salir)\n")
 
@@ -1770,16 +1856,38 @@ class OOCodeApp:
             sys.stdout.flush()
             return
 
-        # /kill — sin esperar al agente
+        # /kill — interrumpe el turno actual + subagentes/equipos al momento.
+        # /kill all — además deshabilita scheduler y resetea tareas wip.
         if lower in ("/kill", "/kill all"):
-            if self._agent_thread and self._agent_thread.is_alive():
-                self._agent_loop._kill_requested = True
+            _is_all = (lower == "/kill all")
+            _running = bool(self._agent_thread and self._agent_thread.is_alive())
+            # kill_all() alcanza subagentes/equipos aunque el turno principal no esté
+            # vivo (p.ej. subagentes de background). request_kill aborta el LLM en
+            # vuelo (socket) + mata subagentes; devuelve cuántos.
+            _n_sub = 0
+            if _running or _is_all:
+                summary = self._agent_loop.request_kill()
+                _n_sub  = summary.get("subagents", 0)
                 self._set_status("")
-                if lower == "/kill all" and self._agent_loop.scheduler:
-                    for job in self._agent_loop.scheduler.all_jobs():
-                        if job.get("enabled", True):
-                            self._agent_loop.scheduler.toggle(job["id"])
-                sys.stdout.write("  ↯  Kill enviado.\n")
+            _extra = []
+            if _n_sub:
+                _extra.append(f"{_n_sub} subagente(s)")
+            if _is_all and self._agent_loop.scheduler:
+                _jobs = [j for j in self._agent_loop.scheduler.all_jobs()
+                         if j.get("enabled", True)]
+                for job in _jobs:
+                    self._agent_loop.scheduler.toggle(job["id"])
+                if _jobs:
+                    _extra.append(f"{len(_jobs)} job(s) scheduler")
+            if _is_all and getattr(self._agent_loop, "tasks", None):
+                _wip = self._agent_loop.tasks.all_tasks(status="wip")
+                for t in _wip:
+                    self._agent_loop.tasks.update(t["id"], status="todo")
+                if _wip:
+                    _extra.append(f"{len(_wip)} tarea(s) wip→todo")
+            if _running or _is_all:
+                _suffix = ("  ·  " + "  ·  ".join(_extra)) if _extra else ""
+                sys.stdout.write(f"  ↯  Kill enviado.{_suffix}\n")
                 sys.stdout.flush()
             else:
                 sys.stdout.write("  No hay agente en ejecución.\n")

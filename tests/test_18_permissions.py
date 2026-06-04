@@ -22,7 +22,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import DEFAULT_CONFIG
 from tools.permissions import PermissionManager
-from mcp_servers.oocode_assistant import _TOOLS
+from mcp_servers.oocode_assistant import _TOOLS as _OO_TOOLS
+from mcp_servers.devops_assistant import _TOOLS as _DEVOPS_TOOLS
+_TOOLS = _OO_TOOLS + _DEVOPS_TOOLS
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────

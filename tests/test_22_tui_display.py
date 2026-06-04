@@ -575,6 +575,188 @@ class TestShowToolRunningHeaderTUI:
         lines = self._run_header(loop, "grep_code", {})
         assert any("◐" in l for l in lines)
 
+    def test_spawn_subagent_flushes_live_block_first(self):
+        """spawn_subagent en TUI cierra el live block del mensaje anterior antes de
+        imprimir su header → el subagente es un mensaje NUEVO, no queda enterrado en
+        el bloque de tools previo (no se ve hasta el flush)."""
+        loop = _make_loop()
+        loop._status_cb = lambda x: None
+        loop._webui_queue = None
+        loop._sub_lines_shown = 5
+        flushed = []
+        loop._flush_live_block_cb = lambda s="": None
+        loop._flush_turn_block = lambda: flushed.append(True)
+        agent_id = "coding"  # _tgt=None → fallback emoji/name (sin agentes en cfg default)
+        lines = self._run_header(loop, "spawn_subagent",
+                                 {"agent_id": agent_id, "task": "haz X"})
+        # Se cerró el live block del mensaje anterior ANTES de imprimir el header
+        assert flushed == [True]
+        # El header ● del subagente se imprimió en la conversación (mensaje nuevo)
+        assert any("●" in l and "spawn_subagent" in l for l in lines)
+        # Reseteó el buffer de líneas del subagente
+        assert loop._sub_lines_shown == 0
+
+    def test_spawn_subagent_does_not_feed_previous_live_block(self):
+        """El update del live block (que enterraría el header en _live_block_body del ●
+        anterior) NO se invoca para spawn_subagent en TUI."""
+        loop = _make_loop()
+        loop._status_cb = lambda x: None
+        loop._webui_queue = None
+        loop._sub_lines_shown = 0
+        loop._flush_live_block_cb = lambda s="": None
+        loop._flush_turn_block = lambda: None
+        live_updates = []
+        loop._update_live_tool_start_cb = lambda label, prev: live_updates.append(label)
+        agent_id = "coding"  # _tgt=None → fallback emoji/name (sin agentes en cfg default)
+        self._run_header(loop, "spawn_subagent",
+                         {"agent_id": agent_id, "task": "haz X"})
+        # spawn_subagent NO alimenta el live block del mensaje anterior
+        assert live_updates == []
+
+    @pytest.mark.parametrize("tool", ["explore", "create_team", "run_team", "spawn_fanout"])
+    def test_orchestration_tools_flush_live_block(self, tool):
+        """Todas las tools de orquestación cierran el live block del mensaje anterior
+        antes de ejecutar → su streaming │ no queda enterrado en el ● previo."""
+        loop = _make_loop()
+        loop._status_cb = lambda x: None
+        loop._webui_queue = None
+        flushed = []
+        loop._flush_live_block_cb = lambda s="": None
+        loop._flush_turn_block = lambda: flushed.append(True)
+        live_updates = []
+        loop._update_live_tool_start_cb = lambda label, prev: live_updates.append(label)
+        self._run_header(loop, tool, {"task": "x", "team_id": "t", "agent_id": "a",
+                                      "task_chunks": ["a"], "subtasks": []})
+        assert flushed == [True]
+        # NO alimentan el live block del mensaje anterior
+        assert live_updates == []
+
+
+class TestSubagentLinePrintCap:
+    """El streaming │ del subagente tiene un cap _MAX_SUB_LINES *por turno*.
+
+    Regresión: el cap se reseteaba solo una vez por run() completo, así que un
+    subagente multi-turno congelaba tras 12 líneas y ocultaba toda la actividad
+    posterior. El bucle de turnos (run()) ahora resetea _sub_lines_shown por turno
+    para que las líneas nuevas sigan apareciendo (las antiguas hacen scroll arriba).
+    """
+
+    def _sub_loop(self, monkeypatch, max_lines=3):
+        from unittest.mock import MagicMock
+        import agent.loop as _loop_mod
+        loop = _make_loop()
+        loop.is_subagent = True
+        loop.capture_output = False
+        loop._webui_queue = None
+        loop._subagent_color_idx = 0
+        loop._sub_lines_shown = 0
+        loop._MAX_SUB_LINES = max_lines
+        printed = []
+        fake_console = MagicMock()
+        fake_console.print = lambda *a, **k: printed.append(a[0] if a else "")
+        monkeypatch.setattr(_loop_mod, "console", fake_console)
+        return loop, printed
+
+    def test_subagent_suppresses_after_cap(self, monkeypatch):
+        loop, printed = self._sub_loop(monkeypatch, max_lines=3)
+        for i in range(6):
+            loop._print(f"line {i}")
+        # 3 líneas reales + 1 aviso "buffer lleno"; el resto se suprime
+        real = [p for p in printed if "buffer lleno" not in str(p)]
+        assert len(real) == 3
+        assert any("buffer lleno" in str(p) for p in printed)
+
+    def test_per_turn_reset_resumes_streaming(self, monkeypatch):
+        loop, printed = self._sub_loop(monkeypatch, max_lines=3)
+        for i in range(5):
+            loop._print(f"t1 {i}")
+        n_after_turn1 = len([p for p in printed if "buffer lleno" not in str(p)])
+        # El reset por turno (lo que hace el bucle de run() en cada iteración)
+        loop._sub_lines_shown = 0
+        loop._print("t2 nueva linea")
+        n_after_turn2 = len([p for p in printed if "buffer lleno" not in str(p)])
+        # Tras el reset vuelven a imprimirse líneas nuevas (no quedó congelado)
+        assert n_after_turn2 == n_after_turn1 + 1
+
+    def test_reset_only_for_subagent_in_loop(self):
+        """El reset por turno solo aplica a subagentes (el agente principal no usa cap)."""
+        import inspect
+        from agent.loop import AgentLoop
+        src = inspect.getsource(AgentLoop.run)
+        assert "if self.is_subagent:" in src
+        assert "self._sub_lines_shown = 0" in src
+
+
+class TestSubagentBulletAlignment:
+    """El ● de texto de un subagente pasa por _print (prefijo │ alineado), no por
+    console.print directo en columna 0 (desalineado respecto a sus líneas de tool)."""
+
+    def _sub_loop(self, monkeypatch):
+        from unittest.mock import MagicMock
+        import agent.loop as _loop_mod
+        loop = _make_loop()
+        loop.is_subagent = True
+        loop.capture_output = False
+        loop._webui_queue = None
+        loop._subagent_color_idx = 0
+        loop._sub_lines_shown = 0
+        loop._MAX_SUB_LINES = 20
+        loop._start_live_block_cb = None
+        calls = []
+        fake = MagicMock()
+        fake.print = lambda *a, **k: calls.append(a)
+        monkeypatch.setattr(_loop_mod, "console", fake)
+        return loop, calls
+
+    def test_subagent_bullet_uses_pipe_prefix(self, monkeypatch):
+        loop, calls = self._sub_loop(monkeypatch)
+        loop._turn_display_bullet(
+            "Tarea 6 activa: Documentar.\nVoy a crear la doc.", [])
+        assert calls, "no se imprimió nada"
+        # Todas las líneas llevan el prefijo │ como primer arg de console.print
+        assert all("│" in str(c[0]) for c in calls if c)
+        first = " ".join(str(x) for x in calls[0])
+        assert "●" in first and "Tarea 6 activa" in first
+
+    def test_subagent_bullet_continuation_indented(self, monkeypatch):
+        loop, calls = self._sub_loop(monkeypatch)
+        loop._turn_display_bullet("Cabecera.\nContinuación.", [])
+        # 2 líneas: ● cabecera + continuación; ambas con │
+        assert len(calls) == 2
+        assert "●" in " ".join(str(x) for x in calls[0])
+        assert "Continuación" in " ".join(str(x) for x in calls[1])
+
+    def test_main_agent_bullet_not_pipe_wrapped(self, monkeypatch):
+        loop, calls = self._sub_loop(monkeypatch)
+        loop.is_subagent = False  # agente principal → rama else, columna propia
+        loop._turn_display_bullet("Mensaje principal.", [])
+        joined = " ".join(str(x) for c in calls for x in c)
+        assert "│" not in joined
+        assert "●" in joined and "Mensaje principal" in joined
+
+
+class TestOrchestrationToolFooter:
+    """El footer ⎿ de explore/team/fanout se imprime ESTÁTICO (no se bufferiza en el
+    live block ya cerrado, donde se perdería)."""
+
+    def test_explore_prints_static_footer(self):
+        loop = _make_loop()
+        loop._status_cb = lambda x: None
+        loop._webui_queue = None
+        loop._live_tool_count = 0
+        loop._update_live_tools_cb = lambda n: (_ for _ in ()).throw(
+            AssertionError("no debe tocar el contador del live block"))
+        loop._update_live_current_tool_cb = None
+        lines = []
+        loop._print = lambda msg, *a, **k: lines.append(msg)
+        loop._show_tool_block("explore", {"task": "mapear x"},
+                              "Hallazgos de la exploración\nlínea 2",
+                              allowed=True, pre_shown=True)
+        # Footer ⎿ impreso directamente (no enterrado en _turn_block)
+        assert any("⎿" in l for l in lines)
+        # No se bufferizó en _turn_block (que ya no tiene live block)
+        assert loop._turn_block == []
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LSP plugin — nuevas tools registradas

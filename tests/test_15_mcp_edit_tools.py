@@ -20,6 +20,11 @@ from mcp_servers.oocode_assistant import (
     _tool_smart_replace,
     _tool_context_before_edit,
     _tool_patch_apply,
+    _tool_build_symbol_index,
+    _tool_find_symbol,
+    _tool_list_symbols,
+)
+from mcp_servers.devops_assistant import (
     _tool_symlink_create,
     _tool_readlink,
     _tool_chmod_file,
@@ -34,9 +39,6 @@ from mcp_servers.oocode_assistant import (
     _tool_git_pull,
     _tool_git_push,
     _tool_git_tag,
-    _tool_build_symbol_index,
-    _tool_find_symbol,
-    _tool_list_symbols,
     _tool_pip_tool,
     _tool_npm_tool,
 )

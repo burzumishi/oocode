@@ -6,16 +6,16 @@ import sys
 import argparse
 from pathlib import Path
 from rich.prompt import IntPrompt
-import ollama
 
 from config import OOConfig, CONFIG_DIR, MEMORY_DIR, VERSION
 from agent.branches import BranchManager
-from agent.embeddings import EmbeddingClient
 import agent.logger as log
 from agent.loop import AgentLoop
-from agent.memory import MemorySystem
 from agent.runtime import RuntimeSettings
 from agent.scheduler import Scheduler
+from agent.services import (
+    build_workspace_manager, build_embedding_client, build_memory_system,
+)
 from agent.session import SessionManager
 from agent.subagent import SubAgentRunner
 from agent.tasks import TaskManager
@@ -34,21 +34,12 @@ from ui.repl import run_repl
 
 
 def select_model_interactive(config: OOConfig) -> None:
-    client = ollama.Client(host=config.ollama_host)
+    from api.ollama import list_ollama_models
     try:
-        data = client.list()
-        models = data.get("models", []) if isinstance(data, dict) else list(data.models)
-        if not models:
+        model_list = list_ollama_models(config.ollama_host)
+        if not model_list:
             console.print(f"  [red]No hay modelos en {config.ollama_host}[/red]")
             sys.exit(1)
-        model_list = [
-            {
-                "name": m.model if hasattr(m, "model") else m["name"],
-                "size": m.size if hasattr(m, "size") else m.get("size", 0),
-                "details": m.details.model_dump() if hasattr(m, "details") and m.details else {},
-            }
-            for m in models
-        ]
         print_model_selector(model_list)
         idx = IntPrompt.ask(f"\n  Elige un modelo (1-{len(model_list)})", default=1)
         idx = max(1, min(idx, len(model_list)))
@@ -178,8 +169,10 @@ def build_registry(workdir: str, config=None) -> ToolRegistry:
             _tool_affected_files  as _mcp_affected_files,
             _tool_code_outline    as _mcp_code_outline,
             _tool_read_sections   as _mcp_read_sections,
-            _tool_python_exec     as _mcp_python_exec,
             _tool_ls_dir          as _mcp_ls_dir,
+        )
+        from mcp_servers.devops_assistant import (
+            _tool_python_exec     as _mcp_python_exec,
         )
 
         def grep_code(
@@ -380,6 +373,8 @@ def build_registry(workdir: str, config=None) -> ToolRegistry:
             _tool_find_file  as _mcp_find_file,
             _tool_find_files as _mcp_find_files,
             _tool_find_dir   as _mcp_find_dir,
+        )
+        from mcp_servers.devops_assistant import (
             _tool_file_stat  as _mcp_file_stat,
         )
 
@@ -626,8 +621,12 @@ def main() -> None:
 
     log.info("session_start", agent=config.agent_id, model=config.model or "")
 
-    # Runtime se crea aquí para que el banner use el color guardado
-    runtime = RuntimeSettings(accent_color=config.accent_color)
+    # Runtime se crea aquí para que el banner use el color guardado.
+    # ctx_mode se inicializa desde config.context.ctxMode (mini|full); /ctx lo cambia en runtime.
+    runtime = RuntimeSettings(
+        accent_color=config.accent_color,
+        ctx_mode=getattr(config, "ctx_mode", "mini"),
+    )
     # Cargar preferencias de razonamiento guardadas para el modelo activo
     if config.model:
         _tl, _r = config.get_model_thinking(config.model)
@@ -637,15 +636,7 @@ def main() -> None:
     print_banner(config)
 
     # Inicializar workspace si no existe
-    ws_manager = WorkspaceManager(
-        config.workspace,
-        config.agent_name,
-        config.agent_emoji,
-        ollama_host=config.ollama_host,
-        permissions=config.permissions,
-        max_memory_lines=config.ws_max_memory_lines,
-        max_daily_chars=config.ws_max_daily_chars,
-    )
+    ws_manager = build_workspace_manager(config)
     if not ws_manager.exists():
         created = ws_manager.init()
         console.print(f"  [green]✓[/green]  Workspace inicializado: {', '.join(created)}")
@@ -677,15 +668,7 @@ def main() -> None:
         console.print()
 
     permissions = PermissionManager(config.permissions)
-    embed_client = EmbeddingClient(
-        host=config.effective_embed_host,
-        model=config.embed_model,
-        max_input_chars=config.embed_max_input_chars,
-        disk_cache_enabled=config.embed_disk_cache_enabled,
-        disk_cache_dir=config.embed_disk_cache_dir,
-        disk_cache_max=config.embed_disk_cache_max,
-        ram_cache_max=config.embed_ram_cache_max,
-    )
+    embed_client = build_embedding_client(config)
     # Directorio de memoria por agente: evita mezcla de memorias entre agentes
     agent_memory_dir = MEMORY_DIR / config.agent_id
     agent_memory_dir.mkdir(parents=True, exist_ok=True)
@@ -702,13 +685,7 @@ def main() -> None:
                 import shutil as _sh
                 _sh.copy2(_f, _dst)
 
-    memory = MemorySystem(
-        embed_client=embed_client if config.memory_embed_enabled else None,
-        similarity_threshold=config.embed_similarity_threshold,
-        snippet_chars=config.embed_snippet_chars,
-        top_k=config.embed_top_k,
-        memory_dir=agent_memory_dir,
-    )
+    memory = build_memory_system(config, embed_client)
 
     # WorkspaceRAG: auto-indexación semántica del proyecto en background
     _workspace_rag = None
@@ -932,46 +909,25 @@ def main() -> None:
     if config.hooks_enabled:
         _load_oocode_md_hooks(registry.hooks, config)
 
-    # MCP: arrancar servidores configurados y registrar sus tools
+    # MCP: arrancar servidores configurados y registrar sus tools.
+    # El límite de truncado de salida (tools.mcpMaxOutputChars) lo lee cada MCP
+    # directamente de oocode.json al arrancar — no se propaga por entorno.
     _mcp_pool = None
     # Servidores del usuario (mcp.servers en oocode.json)
     _active_mcp_servers = [s for s in config.mcp_servers if s.get("enabled", True)]
     # Nombres ya presentes — los bundled solo se añaden si no están listados explícitamente
     _active_names = {s.get("name") for s in _active_mcp_servers}
-    if config.mcp_oocode_assistant_enabled and "oocode-assistant" not in _active_names:
-        _bundled_path = str(Path(__file__).parent / "mcp_servers" / "oocode_assistant.py")
-        if Path(_bundled_path).exists():
-            _active_mcp_servers = [
-                {"name": "oocode-assistant", "cmd": [sys.executable, _bundled_path]}
-            ] + _active_mcp_servers
-            _active_names.add("oocode-assistant")
-    if config.mcp_system_assistant_enabled and "system-assistant" not in _active_names:
-        _sys_path = str(Path(__file__).parent / "mcp_servers" / "system_assistant.py")
-        if Path(_sys_path).exists():
-            _active_mcp_servers.append(
-                {"name": "system-assistant", "cmd": [sys.executable, _sys_path]}
-            )
-            _active_names.add("system-assistant")
-    if config.mcp_home_office_assistant_enabled and "home-office-assistant" not in _active_names:
-        _ho_path = str(Path(__file__).parent / "mcp_servers" / "home_office_assistant.py")
-        if Path(_ho_path).exists():
-            _active_mcp_servers.append(
-                {"name": "home-office-assistant", "cmd": [sys.executable, _ho_path]}
-            )
-            _active_names.add("home-office-assistant")
-    if config.mcp_security_assistant_enabled and "security-assistant" not in _active_names:
-        _sec_path = str(Path(__file__).parent / "mcp_servers" / "security_assistant.py")
-        if Path(_sec_path).exists():
-            _active_mcp_servers.append(
-                {"name": "security-assistant", "cmd": [sys.executable, _sec_path]}
-            )
-            _active_names.add("security-assistant")
-    if config.mcp_iot_assistant_enabled and "iot-assistant" not in _active_names:
-        _iot_path = str(Path(__file__).parent / "mcp_servers" / "iot_assistant.py")
-        if Path(_iot_path).exists():
-            _active_mcp_servers.append(
-                {"name": "iot-assistant", "cmd": [sys.executable, _iot_path]}
-            )
+    # Bundled (8 servidores) vía helper compartido con el WebUI (agent/services.py):
+    # única fuente de verdad para que TUI y WebUI arranquen el mismo conjunto.
+    from agent.services import bundled_mcp_servers
+    _bundled = bundled_mcp_servers(config, _active_names)
+    # oocode-assistant primero (precedencia histórica del TUI sobre servidores de usuario);
+    # el resto se añade detrás de los servidores del usuario.
+    _active_mcp_servers = (
+        [s for s in _bundled if s["name"] == "oocode-assistant"]
+        + _active_mcp_servers
+        + [s for s in _bundled if s["name"] != "oocode-assistant"]
+    )
     if _active_mcp_servers:
         _srv_names = [s.get("name", "mcp") for s in _active_mcp_servers]
         console.print(

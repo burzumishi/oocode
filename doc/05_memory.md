@@ -14,6 +14,10 @@ OOCode tiene dos niveles de memoria: el **contexto de conversación** (en RAM, s
 La memoria está separada por agente (`agent_id`), evitando mezcla entre agentes distintos.
 La búsqueda semántica usa **embeddings vectoriales locales** generados con Ollama.
 
+> **No confundir con la memoria del workspace.** OOCode tiene dos sistemas persistentes que comparten los nombres `memory/` y `MEMORY.md`:
+> - **Memoria semántica** (este documento): `~/.oocode/memory/<id>/` — la escribe la tool `mem_save`, se recupera por embeddings (top-K por turno).
+> - **Memoria del workspace**: `~/.oocode/workspace/<id>/memory/` (diario) + `MEMORY.md` (largo plazo) — la escribe `workspace_remember` y se inyecta como bloques "Memoria clave"/"Sesión de hoy" del contexto `mini`. Ver doc 16.
+
 ## Comandos de memoria
 
 ### Listar memorias

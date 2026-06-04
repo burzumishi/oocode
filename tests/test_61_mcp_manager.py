@@ -179,10 +179,10 @@ class TestAddServer:
     def test_add_preserves_other_config_sections(self, tmp_path):
         from agent.mcp_manager import add_server
         f = tmp_path / "oocode.json"
-        f.write_text(json.dumps({"ollama": {"host": "http://localhost:11434"}}))
+        f.write_text(json.dumps({"api": {"host": "http://localhost:11434"}}))
         add_server({"name": "x", "cmd": ["x"]}, config_file=f)
         cfg = json.loads(f.read_text())
-        assert cfg["ollama"]["host"] == "http://localhost:11434"
+        assert cfg["api"]["host"] == "http://localhost:11434"
 
 
 class TestRemoveServer:
@@ -243,6 +243,41 @@ class TestSetServerEnabled:
     def test_toggle_missing_config_returns_false(self, tmp_path):
         from agent.mcp_manager import set_server_enabled
         assert set_server_enabled("x", True, config_file=tmp_path / "nope.json") is False
+
+    def test_enable_bundled_devops(self, tmp_path):
+        from agent.mcp_manager import set_server_enabled
+        f = tmp_path / "oocode.json"
+        f.write_text(json.dumps({"mcp": {"servers": [], "devopsAssistant": {"enabled": False}}}))
+        result = set_server_enabled("devops-assistant", True, config_file=f)
+        assert result is True
+        data = json.loads(f.read_text())
+        assert data["mcp"]["devopsAssistant"]["enabled"] is True
+
+    def test_disable_bundled_database(self, tmp_path):
+        from agent.mcp_manager import set_server_enabled
+        f = tmp_path / "oocode.json"
+        f.write_text(json.dumps({"mcp": {"servers": [], "databaseAssistant": {"enabled": True}}}))
+        set_server_enabled("database-assistant", False, config_file=f)
+        data = json.loads(f.read_text())
+        assert data["mcp"]["databaseAssistant"]["enabled"] is False
+
+    def test_enable_bundled_creates_key_if_missing(self, tmp_path):
+        from agent.mcp_manager import set_server_enabled
+        f = tmp_path / "oocode.json"
+        f.write_text(json.dumps({"mcp": {"servers": []}}))
+        result = set_server_enabled("home-office-assistant", True, config_file=f)
+        assert result is True
+        data = json.loads(f.read_text())
+        assert data["mcp"]["homeOfficeAssistant"]["enabled"] is True
+
+    def test_bundled_server_map_coverage(self):
+        from agent.mcp_manager import _BUNDLED_SERVER_MAP
+        expected = {
+            "oocode-assistant", "system-assistant", "devops-assistant",
+            "database-assistant", "home-office-assistant",
+            "security-assistant", "iot-assistant", "http-client-assistant",
+        }
+        assert expected == set(_BUNDLED_SERVER_MAP.keys())
 
 
 # ── Construcción de cmd ───────────────────────────────────────────────────────

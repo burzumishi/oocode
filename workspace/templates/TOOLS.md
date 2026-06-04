@@ -1,9 +1,9 @@
 # TOOLS.md — Entorno Local de OOCode
 
-## Servidor Ollama
+## Servidor LLM (backend)
 
-- **Host:** `http://localhost:11434`
-- **Config:** `~/.oocode/oocode.json`
+- **Backend:** `api.type` en `~/.oocode/oocode.json` (ollama | openai | anthropic)
+- **Host:** `api.host` (p.ej. `http://localhost:11434` para Ollama)
 
 ## Servidor SearXNG
 
@@ -38,6 +38,10 @@ docker_exec(container="nombre", command='cat > /ruta/fichero << "EOF"\ncontenido
 1. `/vault unlock` para desbloquear
 2. `vault_list()` → ver credenciales disponibles
 3. `vault_get(name)` → obtener credencial completa
+
+## Notas
+
+_(Personaliza aquí tus usos de herramientas: qué tool prefieres para cada tarea, alias, nombres de dispositivos, convenciones propias. Lo que escribas en esta sección se carga en el contexto del agente — los placeholders no.)_
 
 ---
 *Actualiza este fichero con las URLs reales y permisos específicos del entorno.*

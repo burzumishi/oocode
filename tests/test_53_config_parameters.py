@@ -19,7 +19,7 @@ class TestDefaultConfig(unittest.TestCase):
 
     def test_required_sections_present(self):
         required = {
-            "ollama", "agents", "permissions", "context", "embeddings",
+            "api", "agents", "permissions", "context", "embeddings",
             "tools", "workspace", "logging", "appearance", "plugins",
             "pluginOptions", "skills", "models", "fallback",
             "mcp", "hooks", "snapshots", "rag", "vision", "chatlog",
@@ -437,18 +437,27 @@ class TestMultiHostOllama(unittest.TestCase):
 
     def test_default_config_ollama_extra_hosts(self):
         from config import DEFAULT_CONFIG
-        self.assertIn("extraHosts", DEFAULT_CONFIG["ollama"])
-        self.assertEqual(DEFAULT_CONFIG["ollama"]["extraHosts"], [])
+        self.assertIn("extraHosts", DEFAULT_CONFIG["api"])
+        self.assertEqual(DEFAULT_CONFIG["api"]["extraHosts"], [])
 
     def test_default_config_ollama_embed_host(self):
         from config import DEFAULT_CONFIG
-        self.assertIn("embedHost", DEFAULT_CONFIG["ollama"])
-        self.assertEqual(DEFAULT_CONFIG["ollama"]["embedHost"], "")
+        self.assertIn("embedHost", DEFAULT_CONFIG["api"])
+        self.assertEqual(DEFAULT_CONFIG["api"]["embedHost"], "")
 
     def test_default_config_ollama_subagent_routing(self):
         from config import DEFAULT_CONFIG
-        self.assertIn("subagentRouting", DEFAULT_CONFIG["ollama"])
-        self.assertEqual(DEFAULT_CONFIG["ollama"]["subagentRouting"], "round-robin")
+        self.assertIn("subagentRouting", DEFAULT_CONFIG["api"])
+        self.assertEqual(DEFAULT_CONFIG["api"]["subagentRouting"], "round-robin")
+
+    def test_default_config_api_host(self):
+        from config import DEFAULT_CONFIG
+        self.assertIn("host", DEFAULT_CONFIG["api"])
+        self.assertEqual(DEFAULT_CONFIG["api"]["host"], "http://localhost:11434")
+
+    def test_default_config_no_legacy_ollama_block(self):
+        from config import DEFAULT_CONFIG
+        self.assertNotIn("ollama", DEFAULT_CONFIG)
 
     # ── OOConfig defaults ─────────────────────────────────────────────────────
 
@@ -517,16 +526,21 @@ class TestMultiHostOllama(unittest.TestCase):
     # ── load() ────────────────────────────────────────────────────────────────
 
     def test_load_extra_hosts(self):
-        cfg = self._load_from({"ollama": {"extraHosts": ["http://gpu2:11434"]}})
+        cfg = self._load_from({"api": {"extraHosts": ["http://gpu2:11434"]}})
         self.assertEqual(cfg.ollama_extra_hosts, ["http://gpu2:11434"])
 
     def test_load_embed_host(self):
-        cfg = self._load_from({"ollama": {"embedHost": "http://cpu:11434"}})
+        cfg = self._load_from({"api": {"embedHost": "http://cpu:11434"}})
         self.assertEqual(cfg.ollama_embed_host, "http://cpu:11434")
 
     def test_load_subagent_routing_primary_only(self):
-        cfg = self._load_from({"ollama": {"subagentRouting": "primary-only"}})
+        cfg = self._load_from({"api": {"subagentRouting": "primary-only"}})
         self.assertEqual(cfg.ollama_subagent_routing, "primary-only")
+
+    def test_load_host_feeds_both_ollama_and_base_url(self):
+        cfg = self._load_from({"api": {"host": "http://gpu:11434"}})
+        self.assertEqual(cfg.ollama_host, "http://gpu:11434")
+        self.assertEqual(cfg.api_base_url, "http://gpu:11434")
 
     def test_load_backward_compat_no_extra_keys(self):
         """JSON sin extraHosts/embedHost carga con los defaults sin error."""

@@ -9,7 +9,6 @@ from rich.markdown import Markdown
 from rich.padding import Padding
 from rich.table import Table
 from rich import box
-import ollama
 import requests
 
 import agent.logger as log
@@ -572,38 +571,38 @@ def _cmd_checkpoint(agent_loop) -> None:
 # ── Kill ──────────────────────────────────────────────────────────────────────
 
 def _cmd_kill(args: str, agent_loop) -> None:
-    """/kill — interrumpe el turno actual; /kill all mata jobs y tareas activos."""
-    if args.strip().lower() == "all":
-        agent_loop._kill_requested = True
-        killed_parts = []
+    """/kill — interrumpe el turno actual + subagentes/equipos al momento (aborta la
+    llamada LLM en vuelo). /kill all — además deshabilita jobs del scheduler y resetea
+    tareas wip."""
+    is_all = args.strip().lower() == "all"
 
-        # Deshabilitar todos los jobs del scheduler
-        if agent_loop.scheduler:
-            jobs = [j for j in agent_loop.scheduler.all_jobs() if j.get("enabled")]
-            for job in jobs:
-                agent_loop.scheduler.toggle(job["id"])
-            if jobs:
-                killed_parts.append(f"{len(jobs)} jobs del scheduler deshabilitados")
+    # request_kill: marca _kill_requested, cierra a la fuerza el socket del LLM en
+    # curso (también el de los subagentes, que comparten el pool del padre) y mata
+    # todos los subagentes/equipos activos vía kill_all().
+    summary = agent_loop.request_kill()
+    killed_parts = []
+    if summary.get("subagents"):
+        killed_parts.append(f"{summary['subagents']} subagente(s)/equipo(s)")
 
-        # Marcar tareas wip → todo
-        if agent_loop.tasks:
-            wip = agent_loop.tasks.all_tasks(status="wip")
-            for t in wip:
-                agent_loop.tasks.update(t["id"], status="todo")
-            if wip:
-                killed_parts.append(f"{len(wip)} tareas wip → todo")
+    if is_all:
+        # Extras de /kill all (scheduler + tareas wip), compartidos con el botón Kill
+        # de la WebUI vía AgentLoop.kill_all_extras().
+        extras = agent_loop.kill_all_extras()
+        if extras.get("jobs"):
+            killed_parts.append(f"{extras['jobs']} jobs del scheduler deshabilitados")
+        if extras.get("wip"):
+            killed_parts.append(f"{extras['wip']} tareas wip → todo")
 
-        summary = "  ·  ".join(killed_parts) if killed_parts else "sin jobs ni tareas activos"
+        summary_str = "  ·  ".join(killed_parts) if killed_parts else "sin tareas activas"
         console.print(
             f"\n  [bold yellow]↯[/bold yellow]  [bold]Kill all[/bold]  "
-            f"[dim]{summary}[/dim]\n"
+            f"[dim]{summary_str}[/dim]\n"
         )
     else:
-        agent_loop._kill_requested = True
+        extra = ("  ·  " + "  ·  ".join(killed_parts)) if killed_parts else ""
         console.print(
-            "\n  [yellow]↯[/yellow]  Señal de kill enviada — "
-            "el agente se detendrá al finalizar la operación actual.\n"
-            "  [dim](Para interrumpir la llamada LLM usa Ctrl+C)[/dim]\n"
+            f"\n  [yellow]↯[/yellow]  Kill enviado — turno y subagentes detenidos "
+            f"al momento.{extra}\n"
         )
 
 
@@ -854,19 +853,11 @@ def _cmd_fast(args: str, config, rt: RuntimeSettings) -> None:
     if args == "on":
         if not rt.fast_model:
             try:
-                import ollama as _ol
-                _cl = _ol.Client(host=config.ollama_host)
-                try:
-                    data = _cl.list()
-                finally:
-                    _cl.close()
-                models = data.get("models", []) if isinstance(data, dict) else list(data.models)
+                from api.ollama import list_ollama_models
+                models = list_ollama_models(config.ollama_host)
                 if models:
-                    smallest = min(
-                        models,
-                        key=lambda m: m.size if hasattr(m, "size") else m.get("size", 9e18)
-                    )
-                    rt.fast_model = smallest.model if hasattr(smallest, "model") else smallest["name"]
+                    smallest = min(models, key=lambda m: m["size"] or 9e18)
+                    rt.fast_model = smallest["name"]
             except Exception:
                 console.print("  [red]✗[/red]  No se pudo detectar modelo fast.")
                 return
@@ -979,12 +970,107 @@ def _emoji_for_role(desc: str) -> str:
     return "🤖"
 
 
+# Perfiles de dominio: guían la personalización de la persona del agente para que
+# su flujo de trabajo encaje con su función (no asume programación). Cada perfil
+# describe el ciclo Reúne→Actúa→Verifica en términos del dominio.
+_AGENT_DOMAIN_PROFILES: dict[str, dict] = {
+    "code": {
+        "label":  "programación",
+        "gather": "lee ficheros y busca con grep_code/lsp_symbols",
+        "act":    "edita o crea código con edit_file/write_file",
+        "verify": "ejecuta tests y linters (run_tests/lint_file/lsp_diagnostics)",
+        "areas":  "código fuente, tests, dependencias, git",
+    },
+    "office": {
+        "label":  "ofimática y documentos",
+        "gather": "revisa plantillas, datos de origen y requisitos del documento",
+        "act":    "genera o edita documentos (Word/Excel/PowerPoint/PDF)",
+        "verify": "comprueba formato, datos, fórmulas y que no queden campos sin rellenar",
+        "areas":  "documentos, hojas de cálculo, presentaciones, correo, calendario",
+    },
+    "security": {
+        "label":  "seguridad y análisis defensivo",
+        "gather": "reconoce el objetivo y reúne información (recon, fuentes)",
+        "act":    "analiza, audita o aplica controles según la tarea autorizada",
+        "verify": "contrasta hallazgos, valora severidad y documenta evidencias",
+        "areas":  "recon, análisis web, criptografía, CTF, controles defensivos",
+    },
+    "iot": {
+        "label":  "IoT y domótica",
+        "gather": "consulta el estado de dispositivos y su configuración",
+        "act":    "controla o configura dispositivos (luces, sensores, MQTT, HA)",
+        "verify": "confirma el nuevo estado del dispositivo tras cada acción",
+        "areas":  "dispositivos, sensores, MQTT, Home Assistant, ESPHome",
+    },
+    "web": {
+        "label":  "investigación web y extracción de datos",
+        "gather": "busca fuentes, hace fetch/crawl de páginas y consulta APIs",
+        "act":    "extrae, sintetiza y estructura la información encontrada",
+        "verify": "contrasta varias fuentes y verifica la fiabilidad de los datos",
+        "areas":  "páginas web, APIs, feeds, documentos online",
+    },
+    "data": {
+        "label":  "datos y análisis",
+        "gather": "explora los datos y su esquema (consultas, estadísticas)",
+        "act":    "transforma, consulta o modela los datos",
+        "verify": "valida resultados con cifras concretas y comprueba consistencia",
+        "areas":  "bases de datos, CSV/hojas, métricas, modelos",
+    },
+    "devops": {
+        "label":  "DevOps e infraestructura",
+        "gather": "revisa el estado de servicios, contenedores y configuración",
+        "act":    "despliega, configura o gestiona la infraestructura",
+        "verify": "comprueba salud de servicios, logs y readiness tras cada cambio",
+        "areas":  "Docker/compose, despliegues, servicios, CI/CD, redes",
+    },
+    "general": {
+        "label":  "asistencia general",
+        "gather": "reúne el contexto necesario para la tarea",
+        "act":    "realiza la acción solicitada con las herramientas adecuadas",
+        "verify": "comprueba que el resultado es correcto y completo",
+        "areas":  "según la tarea del usuario",
+    },
+}
+
+
+def _classify_agent_domain(desc: str) -> str:
+    """Clasifica el dominio principal de un agente a partir de su descripción/nombre.
+
+    Devuelve una clave de `_AGENT_DOMAIN_PROFILES`. Determinista, sin LLM.
+    """
+    d = (desc or "").lower()
+    if any(w in d for w in ("security", "seguridad", "pentest", "hacking", "ctf",
+                            "vuln", "exploit", "forense", "malware")):
+        return "security"
+    if any(w in d for w in ("iot", "domotica", "domótica", "sensor", "arduino",
+                            "esp", "mqtt", "home assistant", "tapo", "alexa", "device")):
+        return "iot"
+    if any(w in d for w in ("office", "ofici", "document", "informe", "word",
+                            "excel", "powerpoint", "ppt", "pdf", "ofimática", "ofimatica",
+                            "correo", "email", "calendar", "report")):
+        return "office"
+    if any(w in d for w in ("crawl", "scrap", "webcrawler", "research", "investiga",
+                            "buscador", "noticias", "feed", "fetch", "extrae")):
+        return "web"
+    if any(w in d for w in ("devops", "docker", "kubernetes", "k8s", "deploy",
+                            "despliegue", "infra", "ci/cd", "pipeline", "nginx")):
+        return "devops"
+    if any(w in d for w in ("data", "datos", "analysis", "análisis", "analisis",
+                            "sql", "database", "base de datos", "métrica", "metrica",
+                            "ml", "machine learning", "modelo", "estadístic")):
+        return "data"
+    if any(w in d for w in ("code", "código", "codigo", "program", "develop",
+                            "desarrollo", "software", "backend", "frontend", "api",
+                            "refactor", "bug", "test", "compil")):
+        return "code"
+    return "general"
+
+
 def _cmd_agent_new(args: str, config, agent_loop=None) -> None:  # noqa: C901
     """Crea un nuevo agente con workspace propio.
 
     Uso: /agent new <id> [nombre] [descripción de la función]
     """
-    import shutil
     from config import CONFIG_DIR
     from workspace.manager import WorkspaceManager
 
@@ -1026,14 +1112,30 @@ def _cmd_agent_new(args: str, config, agent_loop=None) -> None:  # noqa: C901
     )
     created = ws.init(overwrite=False, use_examples=False)
 
-    # Si hay descripción y hay LLM disponible, personalizar con LLM
+    # Clasificar dominio para adaptar la persona (no asumir programación).
+    domain = _classify_agent_domain(description or agent_name)
+    if domain != "general":
+        console.print(f"  [dim]Dominio detectado:[/dim] {_AGENT_DOMAIN_PROFILES[domain]['label']}")
+
+    # Si hay descripción y hay LLM disponible, personalizar con LLM (consciente del dominio).
+    personalized = False
     if description and agent_loop is not None:
         console.print("  [dim]Consultando LLM para personalizar workspace…[/dim]")
         try:
             _personalize_workspace_with_llm(ws_path, agent_id, agent_name, emoji, description, config)
+            personalized = True
         except Exception as _e:
             console.print(f"  [yellow]⚠[/yellow]  LLM no disponible para personalización: {_e}")
+
+    # Fallback sin LLM: si el agente NO es de programación y no se personalizó,
+    # escribir un SOUL.md adaptado al dominio en lugar de la plantilla code-céntrica.
+    if not personalized and domain not in ("code", "general"):
+        if _write_domain_soul(ws_path, agent_name, emoji, description, domain):
+            console.print(f"    [dim green]✦[/dim green] SOUL.md adaptado a {_AGENT_DOMAIN_PROFILES[domain]['label']}")
+        else:
             console.print("  [dim]Workspace creado con plantillas estándar.[/dim]")
+    elif not personalized:
+        console.print("  [dim]Workspace creado con plantillas estándar.[/dim]")
 
     # Registrar agente en oocode.json
     _add_agent_to_config(agent_id, agent_name, emoji, ws_path, config)
@@ -1049,7 +1151,6 @@ def _cmd_agent_reset(args: str, config, agent_loop=None) -> None:  # noqa: C901
 
     Uso: /agent reset <id> [nueva_descripción]
     """
-    from config import CONFIG_DIR
     from workspace.manager import WorkspaceManager
 
     parts = args.strip().split(maxsplit=1) if args.strip() else []
@@ -1092,7 +1193,7 @@ def _cmd_agent_reset(args: str, config, agent_loop=None) -> None:  # noqa: C901
     )
     desc = new_desc or f"agente {target.id}"
     # Regenerar ficheros de identidad (overwrite=True, excepto MEMORY.md)
-    from workspace.manager import WORKSPACE_FILES, _identity, _soul, _user, _agents, _heartbeat, _tools, _memory
+    from workspace.manager import WORKSPACE_FILES, _identity, _soul, _user, _agents, _heartbeat, _tools
     ws_path = Path(target.workspace).expanduser()
     ws_path.mkdir(parents=True, exist_ok=True)
     (ws_path / "memory").mkdir(exist_ok=True)
@@ -1170,12 +1271,27 @@ def _personalize_workspace_with_llm(
     description: str, config
 ) -> None:
     """Llama al LLM para personalizar los ficheros del workspace según la descripción del agente."""
+    domain = _classify_agent_domain(description or agent_name)
+    prof = _AGENT_DOMAIN_PROFILES[domain]
+    _domain_guidance = (
+        f"DOMINIO PRINCIPAL de este agente: {prof['label']}.\n"
+        f"Adapta el \"## Flujo de Trabajo\" y las \"## Reglas\" de SOUL.md a ESTE dominio:\n"
+        f"- Reúne contexto: {prof['gather']}.\n"
+        f"- Actúa: {prof['act']}.\n"
+        f"- Verifica: {prof['verify']}.\n"
+        f"- Áreas de trabajo: {prof['areas']}.\n"
+        f"IMPORTANTE: NO asumas que es un agente de programación salvo que el dominio sea "
+        f"'programación'. Si el dominio NO es programación, NO incluyas reglas de tests, "
+        f"linters, git ni edición de código fuente — usa el flujo y la verificación propios "
+        f"del dominio indicado.\n\n"
+    )
     prompt = (
         f"Eres un asistente de configuración de OOCode. Genera el contenido personalizado para un agente con:\n"
         f"- ID: {agent_id}\n"
         f"- Nombre: {agent_name}\n"
         f"- Emoji: {emoji}\n"
         f"- Función/Descripción: {description}\n\n"
+        f"{_domain_guidance}"
         f"Genera los siguientes ficheros de workspace en formato Markdown. "
         f"Sé conciso, práctico y especializado en la función indicada.\n\n"
         f"Responde con exactamente este formato (usa los separadores exactos):\n\n"
@@ -1188,13 +1304,20 @@ def _personalize_workspace_with_llm(
         f"===TOOLS.md===\n"
         f"[sección inicial de TOOLS.md con notas de entorno específicas para este agente]\n"
     )
-    client = ollama.Client(host=config.ollama_host)
-    resp = client.chat(
-        model=config.model or "qwen3:latest",
-        messages=[{"role": "user", "content": prompt}],
-        options={"temperature": 0.7, "num_predict": 2000},
-    )
-    content = resp.get("message", {}).get("content", "") if isinstance(resp, dict) else resp.message.content
+    # Usa la abstracción de backend para funcionar con cualquier api_type
+    # (ollama | openai | anthropic), no solo Ollama.
+    from api import build_client
+    client = build_client(config)
+    try:
+        resp = client.chat_sync(
+            model=config.model or "qwen3:latest",
+            messages=[{"role": "user", "content": prompt}],
+            tools=[],
+            model_params={"temperature": 0.7, "num_predict": 2000},
+        )
+        content = resp.text
+    finally:
+        client.close()
 
     # Parsear respuesta y escribir ficheros
     ws = Path(ws_path)
@@ -1217,6 +1340,72 @@ def _personalize_workspace_with_llm(
             console.print(f"    [dim green]✦[/dim green] {fname} personalizado por LLM")
 
 
+def _write_domain_soul(ws_path: str, agent_name: str, emoji: str,
+                       description: str, domain: str) -> bool:
+    """Escribe un SOUL.md adaptado al dominio SIN LLM (fallback determinista).
+
+    Se usa cuando el agente NO es de programación y no hubo personalización por
+    LLM, para que un agente de oficina/seguridad/web no herede la plantilla
+    code-céntrica por defecto. Devuelve True si escribió el fichero.
+    """
+    prof = _AGENT_DOMAIN_PROFILES.get(domain)
+    if not prof or domain == "code":
+        return False
+    desc_line = description.strip() or prof["label"]
+    soul = f"""# SOUL.md — {emoji} {agent_name}
+
+_Eres {agent_name}, un agente especializado en {prof['label']}. Un compañero de trabajo, no un chatbot._
+
+## Core
+
+1. **Ayuda genuinamente, no performativamente.** Sin "¡Claro!", "¡Por supuesto!" — solo ayuda.
+2. **Sé proactivo.** Reúne el contexto antes de preguntar.
+3. **Resultados > proceso.** No expliques lo que vas a hacer, hazlo — pero anuncia cada acción en una frase.
+4. **Honesto > cortés.** Si algo es mala idea, dilo directamente con alternativas.
+5. **Respeta su tiempo.** Cada palabra innecesaria es robo.
+6. **El contexto lo es todo.** Entiende antes de actuar.
+
+## Tu función
+
+{desc_line}
+
+Áreas de trabajo: {prof['areas']}.
+
+## Límites
+
+- **Privado = privado siempre.** No revelo información sensible sin permiso explícito.
+- **Pregunta antes de acciones externas e irreversibles** (enviar, publicar, borrar, sobrescribir).
+- **Nunca envíes respuestas a medias.** Si la respuesta es larga, la completo.
+
+## Flujo de Trabajo
+
+1. **Clasifica** — ¿basta una frase + acción, o necesita un plan numerado (≥3 pasos)?
+2. **Reúne contexto** — {prof['gather']}. Errores o datos desconocidos → `web_search` primero.
+3. **Actúa** — antes de cada acción que cambia algo, anuncia el objeto concreto en una frase; después describe qué cambió. {prof['act'].capitalize()}.
+4. **Verifica** — {prof['verify']}. Reporta el resultado con datos concretos.
+5. **Finaliza y reporta** — qué se hizo · qué se produjo o cambió · resultado de la verificación · advertencias.
+
+## Reglas de Oro
+
+- **Nunca inventes datos, rutas ni resultados.**
+- **El usuario NO ve las tools ni sus resultados — solo tu texto.** Comunica qué encuentras y qué haces.
+- **Nunca declares completado sin verificar** con los medios de tu dominio.
+- **Anti-bucle:** si una tool falla 2 veces con el mismo argumento, CAMBIA de estrategia.
+
+## Continuidad
+
+Estos ficheros son tu memoria. Léelos al arrancar. Actualízalos cuando aprendas algo nuevo.
+
+- **Diario:** `memory/YYYY-MM-DD.md` — logs de lo que pasó hoy
+- **Largo plazo:** `MEMORY.md` — recuerdos curados, decisiones, lecciones
+"""
+    try:
+        (Path(ws_path) / "SOUL.md").write_text(soul)
+        return True
+    except Exception:
+        return False
+
+
 def _add_agent_to_config(agent_id: str, agent_name: str, emoji: str, ws_path: str, config) -> None:
     """Añade el nuevo agente a ~/.oocode/oocode.json."""
     from config import CONFIG_FILE
@@ -1234,7 +1423,6 @@ def _add_agent_to_config(agent_id: str, agent_name: str, emoji: str, ws_path: st
     CONFIG_FILE.write_text(json.dumps(raw, indent=2, ensure_ascii=False))
     # Actualizar la lista en el config en memoria
     from config import AgentDef
-    from pathlib import Path as _P
     new_def = AgentDef(id=agent_id, name=agent_name, emoji=emoji, workspace=ws_path)
     if not any(a.id == agent_id for a in config.agents):
         config.agents.append(new_def)
@@ -1242,11 +1430,11 @@ def _add_agent_to_config(agent_id: str, agent_name: str, emoji: str, ws_path: st
 
 def _cmd_switch(args: str, config, agent_loop) -> None:
     """Cambia el agente activo en runtime recargando workspace, sesión y memoria."""
-    from config import OOConfig, MEMORY_DIR
-    from workspace.manager import WorkspaceManager
+    from config import OOConfig
     from agent.session import SessionManager
-    from agent.memory import MemorySystem
-    from agent.embeddings import EmbeddingClient
+    from agent.services import (
+        build_workspace_manager, build_embedding_client, build_memory_system,
+    )
 
     if not args.strip():
         ids = ", ".join(a.id for a in config.agents)
@@ -1274,39 +1462,15 @@ def _cmd_switch(args: str, config, agent_loop) -> None:
     new_cfg = OOConfig.load(agent_id=new_id)
 
     # Crear nuevo WorkspaceManager
-    new_ws = WorkspaceManager(
-        new_cfg.workspace,
-        new_cfg.agent_name,
-        new_cfg.agent_emoji,
-        ollama_host=new_cfg.ollama_host,
-        permissions=new_cfg.permissions,
-        max_memory_lines=new_cfg.ws_max_memory_lines,
-        max_daily_chars=new_cfg.ws_max_daily_chars,
-    )
+    new_ws = build_workspace_manager(new_cfg)
     if not new_ws.exists():
         created = new_ws.init()
         console.print(f"  [green]✓[/green]  Workspace inicializado: {', '.join(created)}")
 
     # Crear nueva sesión y memoria para el nuevo agente
     new_session = SessionManager(new_id)
-    agent_memory_dir = MEMORY_DIR / new_id
-    agent_memory_dir.mkdir(parents=True, exist_ok=True)
-    embed_client = EmbeddingClient(
-        host=new_cfg.ollama_host,
-        model=new_cfg.embed_model,
-        max_input_chars=new_cfg.embed_max_input_chars,
-        disk_cache_enabled=new_cfg.embed_disk_cache_enabled,
-        disk_cache_dir=new_cfg.embed_disk_cache_dir,
-        disk_cache_max=new_cfg.embed_disk_cache_max,
-        ram_cache_max=new_cfg.embed_ram_cache_max,
-    )
-    new_memory = MemorySystem(
-        embed_client=embed_client if new_cfg.memory_embed_enabled else None,
-        similarity_threshold=new_cfg.embed_similarity_threshold,
-        snippet_chars=new_cfg.embed_snippet_chars,
-        top_k=new_cfg.embed_top_k,
-        memory_dir=agent_memory_dir,
-    )
+    embed_client = build_embedding_client(new_cfg)
+    new_memory = build_memory_system(new_cfg, embed_client)
 
     # Actualizar agent_loop con el nuevo agente
     agent_loop.config  = new_cfg
@@ -1323,7 +1487,7 @@ def _cmd_switch(args: str, config, agent_loop) -> None:
 
     # Actualizar config global para el REPL (la referencia compartida)
     for attr in ("agent_id", "agent_name", "agent_emoji", "model", "workspace",
-                 "agent_instructions", "ollama_host"):
+                 "ollama_host"):
         setattr(config, attr, getattr(new_cfg, attr))
 
     # Iniciar nueva sesión
@@ -1341,7 +1505,7 @@ def _cmd_switch(args: str, config, agent_loop) -> None:
 def _cmd_agent_team(args: str, config, agent_loop=None) -> None:  # noqa: C901
     """Gestión de AgentTeams: list, status, create, add, done, run, delete."""
     from agent.tasks import (
-        AgentTeam, create_team, load_team, add_subtask as _add_subtask,
+        create_team, load_team, add_subtask as _add_subtask,
         complete_subtask as _complete_subtask, get_team_status,
         list_teams, delete_team,
     )
@@ -1575,7 +1739,18 @@ def _detect_input_types(minfo: dict, model_name: str) -> list[str]:
 
 
 def _auto_detect_model_config(config, model_name: str) -> None:
-    """Detecta contextWindow, maxTokens e input types vía ollama.show()."""
+    """Detecta contextWindow, maxTokens e input types vía ollama.show().
+
+    Solo aplica al backend Ollama: openai/anthropic no exponen estos metadatos por
+    ese protocolo. Para esos backends se sugiere configurar contextWindow/maxTokens
+    manualmente (models.configs en oocode.json o /model timeout para el timeout).
+    """
+    if getattr(config, "api_type", "ollama") != "ollama":
+        console.print(
+            f"  [dim]Backend [cyan]{config.api_type}[/cyan]: sin autodetección de parámetros.  "
+            f"Configura contextWindow/maxTokens en models.configs si hace falta.[/dim]"
+        )
+        return
     console.print(f"  [dim]Detectando parámetros de {model_name}…[/dim]")
     minfo    = _fetch_model_info(config, model_name)
     modelinfo = minfo.get("modelinfo", {})
@@ -1776,8 +1951,10 @@ def _cmd_model(args: str, config, agent_loop=None) -> None:
     # ── /model (sin args): mostrar info del modelo activo + fallback ───────────
     model_name = config.model or "(ninguno)"
     cfg = config.active_model_config
+    _api_type = getattr(config, "api_type", "ollama")
     console.print()
-    console.print(f"  [bold]Modelo principal:[/bold]  [bold cyan]{model_name}[/bold cyan]")
+    _backend_note = "" if _api_type == "ollama" else f"  [dim](backend: {_api_type})[/dim]"
+    console.print(f"  [bold]Modelo principal:[/bold]  [bold cyan]{model_name}[/bold cyan]{_backend_note}")
     if cfg:
         ctx_w      = cfg.get("contextWindow", "—")
         max_t      = cfg.get("maxTokens", "—")
@@ -1820,25 +1997,20 @@ def _cmd_model(args: str, config, agent_loop=None) -> None:
 
 
 def _cmd_models(config, agent_loop=None) -> None:
+    # /models lista modelos del servidor Ollama; openai/anthropic no exponen listado.
+    if getattr(config, "api_type", "ollama") != "ollama":
+        console.print(
+            f"  [yellow]/models solo está disponible con el backend Ollama.[/yellow]\n"
+            f"  [dim]Backend actual: [cyan]{config.api_type}[/cyan].  "
+            f"Usa[/dim] [cyan]/model <nombre>[/cyan] [dim]para fijar el modelo manualmente.[/dim]"
+        )
+        return
     try:
-        client = ollama.Client(host=config.ollama_host)
-        #try:
-        data = client.list()
-        #finally:
-        #    return True
-        #    client.close()
-        raw = data.get("models", []) if isinstance(data, dict) else list(data.models)
-        if not raw:
+        from api.ollama import list_ollama_models
+        model_list = list_ollama_models(config.ollama_host)
+        if not model_list:
             console.print("  [yellow]No hay modelos en el servidor Ollama.[/yellow]")
             return
-        model_list = [
-            {
-                "name": m.model if hasattr(m, "model") else m["name"],
-                "size": m.size if hasattr(m, "size") else m.get("size", 0),
-                "details": m.details.model_dump() if hasattr(m, "details") and m.details else {},
-            }
-            for m in raw
-        ]
         print_model_selector(model_list)
         choice = _tui_ask("Nombre del modelo (Enter para cancelar)", default="")
         if choice.strip():
@@ -2507,10 +2679,17 @@ def _cmd_color(args: str, rt: RuntimeSettings, config=None) -> None:
         if config is not None:
             config.accent_color = color
             config.save()
+        # Re-estilar la TUI full-screen en caliente (toolbar/prompt prompt_toolkit).
+        # El ● de la conversación (Rich) ya se recalcula por turno desde rt.accent_color.
+        _restyle = getattr(_agent_loop_ref, "_restyle_cb", None)
+        if callable(_restyle):
+            try:
+                _restyle(color)
+            except Exception as e:
+                log.debug("restyle_cb_error", error=str(e))
         rich_c = COLOR_PRESETS[color][1]
         console.print(
             f"  [green]✓[/green]  Tema → [bold {rich_c}]{color}[/bold {rich_c}]"
-            f"  [dim](el prompt se actualiza en el próximo input)[/dim]"
         )
 
     # /color  o  /color random — color aleatorio
@@ -2893,6 +3072,128 @@ _HO_PY_PKGS_ALL = [
 ]
 
 
+def _doctor_llm_backend_checks(config, ok, warn, fail) -> None:  # noqa: C901
+    """Chequeos del backend LLM + embeddings, conscientes de `api.type`.
+
+    - ollama: conecta a ollama_host, lista modelos y verifica modelo/embeddings/
+      fallback/hosts extra (routing de subagentes).
+    - openai/anthropic: verifica configuración (tipo, baseUrl, key, modelo) y
+      conectividad ligera. Las embeddings SIEMPRE usan protocolo Ollama, así que
+      se prueban contra effective_embed_host independientemente del backend de chat.
+
+    Compartido por run_doctor_standalone (--doctor) y _cmd_doctor (/doctor).
+    """
+    from api.ollama import ollama_model_names
+    api_type = getattr(config, "api_type", "ollama")
+
+    if api_type == "ollama":
+        try:
+            _mn = ollama_model_names(config.ollama_host)
+            ok("Ollama", f"Conectado en {config.ollama_host}  ({len(_mn)} modelos)")
+            if config.model:
+                if config.model in _mn:
+                    ok("Ollama", f"Modelo [cyan]{config.model}[/cyan] disponible")
+                else:
+                    fail("Ollama", f"Modelo configurado no encontrado: {config.model}")
+            else:
+                warn("Ollama", "Sin modelo configurado — usa /model")
+            if config.fallback_active_config:
+                if config.fallback_model in _mn:
+                    ok("Ollama", f"Fallback [cyan]{config.fallback_model}[/cyan] disponible  "
+                                 f"[dim](timeout {config.fallback_timeout}s)[/dim]")
+                else:
+                    fail("Ollama", f"Fallback model no encontrado: {config.fallback_model}")
+            elif config.fallback_model:
+                warn("Ollama", f"Fallback configurado pero desactivado: {config.fallback_model}")
+        except Exception as _e:
+            fail("Ollama", f"No se puede conectar con {config.ollama_host}: {_e}")
+
+        # Routing de subagentes + hosts extra (solo tiene sentido con Ollama)
+        _routing = getattr(config, "ollama_subagent_routing", "round-robin")
+        _extra_hosts = getattr(config, "ollama_extra_hosts", [])
+        if _routing == "primary-only":
+            if _extra_hosts:
+                ok("Ollama+", f"Routing subagentes: [cyan]{_routing}[/cyan]  "
+                              f"[dim]({len(_extra_hosts)} host(s) extra — no se prueban en primary-only)[/dim]")
+            else:
+                warn("Ollama+", "Sin hosts extra configurados  [dim](api.extraHosts en oocode.json)[/dim]")
+        else:
+            for _xhost in _extra_hosts:
+                if not _xhost:
+                    continue
+                try:
+                    _xmn = ollama_model_names(_xhost)
+                    ok("Ollama+", f"Host extra {_xhost}  ({len(_xmn)} modelos)")
+                except Exception as _xe:
+                    warn("Ollama+", f"Host extra no responde — {_xhost}: {_xe}")
+            if _extra_hosts:
+                ok("Ollama+", f"Routing subagentes: [cyan]{_routing}[/cyan]  "
+                              f"[dim]({len(_extra_hosts)} host(s) extra)[/dim]")
+            else:
+                warn("Ollama+", "Sin hosts extra configurados  [dim](api.extraHosts en oocode.json)[/dim]")
+    else:
+        # ── Backend OpenAI-compatible / Anthropic (experimentales) ──────────────
+        _label = "OpenAI-compatible" if api_type == "openai" else "Anthropic"
+        ok("Backend LLM", f"Tipo: [cyan]{api_type}[/cyan]  [dim]({_label} — experimental)[/dim]")
+        if config.model:
+            ok("Backend LLM", f"Modelo configurado: [cyan]{config.model}[/cyan]")
+        else:
+            warn("Backend LLM", "Sin modelo configurado — usa /model")
+
+        if api_type == "anthropic":
+            if config.api_key:
+                ok("Backend LLM", "API key configurada  [dim](api.key)[/dim]")
+            else:
+                fail("Backend LLM", "Falta API key (api.key) — requerida por Anthropic")
+            try:
+                import anthropic  # noqa: F401
+                ok("Backend LLM", "Paquete [cyan]anthropic[/cyan] instalado")
+            except ImportError:
+                fail("Backend LLM", "Paquete anthropic no instalado  [dim]pip install anthropic[/dim]")
+        else:  # openai-compatible
+            if config.api_base_url:
+                ok("Backend LLM", f"baseUrl: [dim]{config.api_base_url}[/dim]")
+            else:
+                warn("Backend LLM", "Sin baseUrl configurado  [dim](api.host en oocode.json)[/dim]")
+            if config.api_key:
+                ok("Backend LLM", "API key configurada  [dim](api.key)[/dim]")
+            else:
+                warn("Backend LLM", "Sin API key  [dim](OK para servidores locales: llama.cpp/LM Studio/vLLM)[/dim]")
+            # Conectividad ligera contra /models del servidor OpenAI-compatible
+            if config.api_base_url:
+                try:
+                    import httpx as _hx
+                    _hdr = {"Authorization": f"Bearer {config.api_key}"} if config.api_key else {}
+                    _r = _hx.get(f"{config.api_base_url.rstrip('/')}/models", headers=_hdr, timeout=5)
+                    if _r.status_code < 400:
+                        ok("Backend LLM", f"Conectado en {config.api_base_url}")
+                    elif _r.status_code in (401, 403):
+                        warn("Backend LLM", f"baseUrl responde pero rechaza la key (HTTP {_r.status_code})")
+                    else:
+                        warn("Backend LLM", f"baseUrl respondió HTTP {_r.status_code} en /models")
+                except ImportError:
+                    warn("Backend LLM", "httpx no instalado — no se verifica conectividad  [dim]pip install httpx[/dim]")
+                except Exception as _e:
+                    warn("Backend LLM", f"No se pudo verificar baseUrl: {_e}")
+
+    # ── Embeddings (siempre protocolo Ollama, sea cual sea el backend de chat) ──
+    if getattr(config, "memory_embed_enabled", True):
+        _eh = config.effective_embed_host
+        _dedic = " [dim](host dedicado)[/dim]" if config.ollama_embed_host else ""
+        try:
+            _emn = ollama_model_names(_eh)
+            if config.embed_model in _emn:
+                ok("Embeddings", f"[cyan]{config.embed_model}[/cyan] disponible en {_eh}{_dedic}")
+            else:
+                warn("Embeddings", f"{config.embed_model} no encontrado en {_eh}{_dedic}  "
+                                   f"[dim](ollama pull {config.embed_model})[/dim]")
+        except Exception as _e:
+            warn("Embeddings", f"Host Ollama de embeddings no responde — {_eh}: {_e}  "
+                               f"[dim](memoria/RAG semántico degradado)[/dim]")
+    else:
+        warn("Embeddings", "Desactivados  [dim](memory.embed.enabled=false)[/dim]")
+
+
 def run_doctor_standalone(config) -> bool:  # noqa: C901
     """Doctor sin agent_loop — para oocode --doctor antes de entrar al REPL."""
     import importlib.metadata
@@ -2911,65 +3212,8 @@ def run_doctor_standalone(config) -> bool:  # noqa: C901
 
     def _which(cmd): return _sh.which(cmd)
 
-    # ── Ollama ─────────────────────────────────────────────────────────────────
-    import ollama as _oll  # siempre disponible (está en _REQUIRED_PACKAGES)
-    _mn: list[str] = []
-    try:
-        _cl = _oll.Client(host=config.ollama_host)
-        _d  = _cl.list()
-        _ms = _d.get("models", []) if isinstance(_d, dict) else list(_d.models)
-        _mn = [(m.model if hasattr(m, "model") else m["name"]) for m in _ms]
-        ok("Ollama", f"Conectado en {config.ollama_host}  ({len(_mn)} modelos)")
-        if config.model:
-            if config.model in _mn:
-                ok("Ollama", f"Modelo [cyan]{config.model}[/cyan] disponible")
-            else:
-                fail("Ollama", f"Modelo configurado no encontrado: {config.model}")
-        else:
-            warn("Ollama", "Sin modelo configurado — usa /model")
-        if config.embed_model in _mn:
-            ok("Ollama", f"Embeddings [cyan]{config.embed_model}[/cyan] disponible")
-        else:
-            warn("Ollama", f"Embedding model no encontrado: {config.embed_model}  "
-                           f"[dim](ollama pull {config.embed_model})[/dim]")
-        if config.fallback_active_config:
-            if config.fallback_model in _mn:
-                ok("Ollama", f"Fallback [cyan]{config.fallback_model}[/cyan] disponible  "
-                             f"[dim](timeout {config.fallback_timeout}s)[/dim]")
-            else:
-                fail("Ollama", f"Fallback model no encontrado: {config.fallback_model}")
-        elif config.fallback_model:
-            warn("Ollama", f"Fallback configurado pero desactivado: {config.fallback_model}")
-        if config.ollama_embed_host:
-            ok("Ollama", f"Embeddings en host dedicado: {config.ollama_embed_host}")
-    except Exception as _e:
-        fail("Ollama", f"No se puede conectar con {config.ollama_host}: {_e}")
-
-    _routing = getattr(config, "ollama_subagent_routing", "round-robin")
-    _extra_hosts = getattr(config, "ollama_extra_hosts", [])
-    if _routing == "primary-only":
-        if _extra_hosts:
-            ok("Ollama+", f"Routing subagentes: [cyan]{_routing}[/cyan]  "
-                          f"[dim]({len(_extra_hosts)} host(s) extra — no se prueban en primary-only)[/dim]")
-        else:
-            warn("Ollama+", f"Sin hosts extra configurados  [dim](ollama.extraHosts en oocode.json)[/dim]")
-    else:
-        for _xhost in _extra_hosts:
-            if not _xhost:
-                continue
-            try:
-                _xcl = _oll.Client(host=_xhost)
-                _xd  = _xcl.list()                               # una sola llamada
-                _xms = _xd.get("models", []) if isinstance(_xd, dict) else list(_xd.models)
-                _xmn = [(m.model if hasattr(m, "model") else m["name"]) for m in _xms]
-                ok("Ollama+", f"Host extra {_xhost}  ({len(_xmn)} modelos)")
-            except Exception as _xe:
-                warn("Ollama+", f"Host extra no responde — {_xhost}: {_xe}")
-        if _extra_hosts:
-            ok("Ollama+", f"Routing subagentes: [cyan]{_routing}[/cyan]  "
-                          f"[dim]({len(_extra_hosts)} host(s) extra)[/dim]")
-        else:
-            warn("Ollama+", f"Sin hosts extra configurados  [dim](ollama.extraHosts en oocode.json)[/dim]")
+    # ── Backend LLM (ollama | openai | anthropic) + embeddings ─────────────────
+    _doctor_llm_backend_checks(config, ok, warn, fail)
 
     # ── Python packages requeridos ─────────────────────────────────────────────
     for _pkg in _REQUIRED_PACKAGES:
@@ -3344,70 +3588,8 @@ def _cmd_doctor(config, agent_loop) -> None:  # noqa: C901
 
     def _which(cmd: str): return _sh.which(cmd)
 
-    # ── 1. Servidor Ollama ────────────────────────────────────────────────────
-    _model_names: list[str] = []
-    try:
-        _client = ollama.Client(host=config.ollama_host)
-        _data   = _client.list()
-        _models = _data.get("models", []) if isinstance(_data, dict) else list(_data.models)
-        _model_names = [(m.model if hasattr(m, "model") else m["name"]) for m in _models]
-        ok("Ollama", f"Conectado en {config.ollama_host}  ({len(_model_names)} modelos)")
-
-        if not config.model:
-            warn("Ollama", "Sin modelo configurado — usa /model o /models")
-        elif config.model in _model_names:
-            ok("Ollama", f"Modelo principal [cyan]{config.model}[/cyan] disponible")
-        else:
-            fail("Ollama", f"Modelo configurado no encontrado: {config.model}")
-
-        if config.embed_model in _model_names:
-            ok("Ollama", f"Embeddings [cyan]{config.embed_model}[/cyan] disponible")
-        else:
-            warn("Ollama", f"Embedding model no encontrado: {config.embed_model}  "
-                           f"[dim](ollama pull {config.embed_model})[/dim]")
-
-        if config.fallback_active_config:
-            if config.fallback_model in _model_names:
-                ok("Ollama", f"Fallback [cyan]{config.fallback_model}[/cyan] disponible  "
-                             f"[dim](timeout {config.fallback_timeout}s)[/dim]")
-            else:
-                fail("Ollama", f"Fallback model no encontrado: {config.fallback_model}")
-        elif config.fallback_model:
-            warn("Ollama", f"Fallback configurado pero desactivado: {config.fallback_model}")
-
-        if config.ollama_embed_host:
-            ok("Ollama", f"Embeddings en host dedicado: {config.ollama_embed_host}")
-        #_client.close()
-    except Exception as _e:
-        fail("Ollama", f"No se puede conectar con {config.ollama_host}: {_e}")
-
-    _routing_full = getattr(config, "ollama_subagent_routing", "round-robin")
-    _extra_full   = getattr(config, "ollama_extra_hosts", [])
-    if _routing_full == "primary-only":
-        if _extra_full:
-            ok("Ollama+", f"Routing subagentes: [cyan]{_routing_full}[/cyan]  "
-                          f"[dim]({len(_extra_full)} host(s) extra — no se prueban en primary-only)[/dim]")
-        else:
-            warn("Ollama+", "Sin hosts extra configurados  "
-                            "[dim](ollama.extraHosts en oocode.json)[/dim]")
-    else:
-        for _xhost in _extra_full:
-            if not _xhost:
-                continue
-            try:
-                _xcl  = ollama.Client(host=_xhost)
-                _xd   = _xcl.list()
-                _xms  = _xd.get("models", []) if isinstance(_xd, dict) else list(_xd.models)
-                _xmn  = [(m.model if hasattr(m, "model") else m["name"]) for m in _xms]
-                ok("Ollama+", f"Host extra {_xhost}  ({len(_xmn)} modelos)")
-            except Exception as _xe:
-                warn("Ollama+", f"Host extra no responde — {_xhost}: {_xe}")
-        if _extra_full:
-            ok("Ollama+", f"Routing subagentes: [cyan]{_routing_full}[/cyan]  "
-                          f"[dim]({len(_extra_full)} host(s) extra)[/dim]")
-        else:
-            warn("Ollama+", "Sin hosts extra configurados  "
-                            "[dim](ollama.extraHosts en oocode.json)[/dim]")
+    # ── 1. Backend LLM (ollama | openai | anthropic) + embeddings ─────────────
+    _doctor_llm_backend_checks(config, ok, warn, fail)
 
     # ── 2. MCP — servidores bundled y externos ────────────────────────────────
     _mcp_pool = getattr(agent_loop, "_mcp_pool", None)
@@ -4031,52 +4213,26 @@ def _cmd_doctor(config, agent_loop) -> None:  # noqa: C901
 # ── /config panel ─────────────────────────────────────────────────────────────
 
 def _fetch_models_list(config) -> list[dict]:
-    """Obtiene modelos del servidor Ollama. Devuelve lista de dicts."""
+    """Obtiene modelos del servidor Ollama. Devuelve lista de dicts.
+
+    Solo el backend Ollama expone un listado de modelos; openai/anthropic no, así
+    que se devuelve [] (el llamador permite introducir el nombre de modelo a mano).
+    """
+    if getattr(config, "api_type", "ollama") != "ollama":
+        return []
     try:
-        client = ollama.Client(host=config.ollama_host)
-        #try:
-        data = client.list()
-        #finally:
-        #    return True
-        #    client.close()
-        raw = data.get("models", []) if isinstance(data, dict) else list(data.models)
-        return [
-            {
-                "name":    m.model if hasattr(m, "model") else m["name"],
-                "size":    m.size if hasattr(m, "size") else m.get("size", 0),
-                "details": m.details.model_dump() if hasattr(m, "details") and m.details else {},
-            }
-            for m in raw
-        ]
+        from api.ollama import list_ollama_models
+        return list_ollama_models(config.ollama_host)
     except Exception as e:
         console.print(f"  [red]✗[/red]  No se puede conectar con Ollama: {e}")
         return []
 
 
 def _fetch_model_info(config, model_name: str) -> dict:
-    """Obtiene info de un modelo concreto vía ollama.show()."""
+    """Obtiene info de un modelo concreto vía la capa única api.ollama."""
+    from api.ollama import model_info
     try:
-        client = ollama.Client(host=config.ollama_host)
-        #try:
-        info = client.show(model_name)
-        #finally:
-        #    return True
-        #    client.close()
-        # Extraer parámetros del modelfile (cadena "key value\n...")
-        params: dict = {}
-        raw_params = getattr(info, "parameters", None) or ""
-        if raw_params:
-            for line in raw_params.strip().splitlines():
-                parts = line.split(None, 1)
-                if len(parts) == 2:
-                    params[parts[0].lower()] = parts[1]
-        details = {}
-        if hasattr(info, "details") and info.details:
-            details = info.details.model_dump() if hasattr(info.details, "model_dump") else {}
-        modelinfo = {}
-        if hasattr(info, "modelinfo") and info.modelinfo:
-            modelinfo = dict(info.modelinfo)
-        return {"params": params, "details": details, "modelinfo": modelinfo}
+        return model_info(config.ollama_host, model_name)
     except Exception as e:
         console.print(f"  [dim]No se pudo obtener info del modelo: {e}[/dim]")
         return {"params": {}, "details": {}, "modelinfo": {}}
@@ -4803,6 +4959,7 @@ def _cmd_webserver(args: str, config, agent_loop) -> None:
     _host = getattr(config, "webui_host", "0.0.0.0")
     _port = int(getattr(config, "webui_port", 4000))
     _log_file_str = getattr(config, "webui_log_file", "")
+    _log_max  = int(getattr(config, "webui_log_max_size", 5))
     _log_path = (
         Path(_log_file_str).expanduser()
         if _log_file_str
@@ -4877,7 +5034,7 @@ def _cmd_webserver(args: str, config, agent_loop) -> None:
         import subprocess as _subprocess
         _server_mod = str(Path(__file__).parent.parent / "webui" / "server.py")
         _proc = _subprocess.Popen(
-            [_sys.executable, _server_mod, _host, str(_port), str(_log_path)],
+            [_sys.executable, _server_mod, _host, str(_port), str(_log_path), str(_log_max)],
             stdout=_subprocess.DEVNULL,
             stderr=_subprocess.DEVNULL,
             stdin=_subprocess.DEVNULL,
@@ -5306,7 +5463,7 @@ def _cmd_mcp(args: str, agent_loop) -> None:
 
     # ── /mcp enable/disable <name> ────────────────────────────────────────────
     if sub in ("enable", "disable"):
-        _cmd_mcp_toggle(rest, sub == "enable", pool)
+        _cmd_mcp_toggle(rest, sub == "enable", pool, agent_loop)
         return
 
     # ── /mcp reload <name> ────────────────────────────────────────────────────
@@ -5336,38 +5493,81 @@ def _cmd_mcp(args: str, agent_loop) -> None:
         return
 
     # ── /mcp → estado general ─────────────────────────────────────────────────
-    if pool is None:
-        console.print(
-            "  [dim]Sin servidores MCP activos.[/dim]  "
-            "[dim cyan]/mcp catalog[/dim cyan] para ver servidores disponibles  ·  "
-            "[dim cyan]/mcp install <id>[/dim cyan] para añadir uno"
-        )
-        return
+    cfg = getattr(agent_loop, "config", None)
+
+    # Tabla completa de servidores bundled con su estado de config
+    _BUNDLED_INFO: list[tuple[str, str, str]] = [
+        # (server-name, config-attr, script-filename)
+        ("oocode-assistant",       "mcp_oocode_assistant_enabled",        "oocode_assistant.py"),
+        ("system-assistant",       "mcp_system_assistant_enabled",        "system_assistant.py"),
+        ("devops-assistant",       "mcp_devops_assistant_enabled",        "devops_assistant.py"),
+        ("database-assistant",     "mcp_database_assistant_enabled",      "database_assistant.py"),
+        ("home-office-assistant",  "mcp_home_office_assistant_enabled",   "home_office_assistant.py"),
+        ("security-assistant",     "mcp_security_assistant_enabled",      "security_assistant.py"),
+        ("iot-assistant",          "mcp_iot_assistant_enabled",           "iot_assistant.py"),
+        ("http-client-assistant",  "mcp_http_client_assistant_enabled",   "http_client_assistant.py"),
+    ]
 
     console.print()
-    servers = pool.status()
-    if not servers:
-        console.print("  [dim]Sin servidores MCP activos.[/dim]")
-        return
 
-    t = Table(title="Servidores MCP", box=box.SIMPLE, header_style="bold cyan")
+    # ── Servidores bundled (activos + inactivos) ──────────────────────────────
+    t = Table(title="Servidores MCP bundled", box=box.SIMPLE, header_style="bold cyan")
     t.add_column("Nombre",    style="cyan")
-    t.add_column("Cmd",       style="dim", max_width=30)
-    t.add_column("Estado",    width=8)
+    t.add_column("Estado",    width=10)
+    t.add_column("Activo",    width=8)
     t.add_column("Tools",     width=7)
     t.add_column("Resources", width=10)
     t.add_column("Prompts",   width=9)
-    t.add_column("Error",     style="dim red", max_width=40)
-    for s in servers:
-        estado = "[green]●[/green]" if s["alive"] else "[red]✗[/red]"
-        res    = str(s.get("resources", 0)) if s.get("resources") else "[dim]0[/dim]"
-        prmt   = str(s.get("prompts",   0)) if s.get("prompts")   else "[dim]0[/dim]"
-        t.add_row(s["name"], s["cmd"], estado, str(s["tools"]),
-                  res, prmt, s.get("error", ""))
+    t.add_column("Error",     style="dim red", max_width=35)
+
+    running_names = {s["name"] for s in (pool.status() if pool else [])}
+    pool_by_name  = {s["name"]: s for s in (pool.status() if pool else [])}
+
+    for srv_name, cfg_attr, _script in _BUNDLED_INFO:
+        enabled = bool(getattr(cfg, cfg_attr, False)) if cfg else False
+        if srv_name in running_names:
+            s      = pool_by_name[srv_name]
+            alive  = "[green]●[/green]" if s["alive"] else "[red]✗[/red]"
+            tools  = str(s["tools"])
+            res    = str(s.get("resources", 0)) if s.get("resources") else "[dim]0[/dim]"
+            prmt   = str(s.get("prompts",   0)) if s.get("prompts")   else "[dim]0[/dim]"
+            err    = s.get("error", "")
+            act    = "[green]enabled[/green]"
+        else:
+            alive  = "[dim]○[/dim]"
+            tools  = "[dim]—[/dim]"
+            res    = "[dim]—[/dim]"
+            prmt   = "[dim]—[/dim]"
+            err    = ""
+            act    = "[green]enabled[/green]" if enabled else "[dim]disabled[/dim]"
+        t.add_row(srv_name, alive, act, tools, res, prmt, err)
     console.print(t)
+
+    # ── Servidores externos (mcp.servers[]) ───────────────────────────────────
+    if pool:
+        external = [s for s in pool.status() if s["name"] not in {b[0] for b in _BUNDLED_INFO}]
+        if external:
+            t2 = Table(title="Servidores MCP externos", box=box.SIMPLE, header_style="bold cyan")
+            t2.add_column("Nombre",    style="cyan")
+            t2.add_column("Cmd",       style="dim", max_width=30)
+            t2.add_column("Estado",    width=8)
+            t2.add_column("Tools",     width=7)
+            t2.add_column("Resources", width=10)
+            t2.add_column("Prompts",   width=9)
+            t2.add_column("Error",     style="dim red", max_width=35)
+            for s in external:
+                alive = "[green]●[/green]" if s["alive"] else "[red]✗[/red]"
+                res   = str(s.get("resources", 0)) if s.get("resources") else "[dim]0[/dim]"
+                prmt  = str(s.get("prompts",   0)) if s.get("prompts")   else "[dim]0[/dim]"
+                t2.add_row(s["name"], s["cmd"], alive, str(s["tools"]),
+                           res, prmt, s.get("error", ""))
+            console.print(t2)
+
+    n_tools = pool.tool_count if pool else 0
+    n_srv   = pool.client_count if pool else 0
     console.print(
-        f"\n  {pool.client_count} servidor(es) · {pool.tool_count} tools  ·  "
-        "[dim]/mcp catalog · /mcp install <id> · /mcp reload/restart <nombre>[/dim]\n"
+        f"\n  {n_srv} servidor(es) activos · {n_tools} tools  ·  "
+        "[dim]/mcp enable|disable <nombre> · /mcp catalog · /mcp install <id>[/dim]\n"
     )
 
 
@@ -5537,8 +5737,20 @@ def _cmd_mcp_remove(name: str, pool) -> None:
         console.print(f"  [red]✗[/red]  Servidor '{name}' no encontrado en oocode.json.")
 
 
-def _cmd_mcp_toggle(name: str, enable: bool, pool) -> None:
-    """Activa o desactiva un servidor en oocode.json."""
+_BUNDLED_CONFIG_ATTR: dict[str, str] = {
+    "oocode-assistant":      "mcp_oocode_assistant_enabled",
+    "system-assistant":      "mcp_system_assistant_enabled",
+    "devops-assistant":      "mcp_devops_assistant_enabled",
+    "database-assistant":    "mcp_database_assistant_enabled",
+    "home-office-assistant": "mcp_home_office_assistant_enabled",
+    "security-assistant":    "mcp_security_assistant_enabled",
+    "iot-assistant":         "mcp_iot_assistant_enabled",
+    "http-client-assistant": "mcp_http_client_assistant_enabled",
+}
+
+
+def _cmd_mcp_toggle(name: str, enable: bool, pool, agent_loop=None) -> None:
+    """Activa o desactiva un servidor en oocode.json y en la config en memoria."""
     from agent.mcp_manager import set_server_enabled
     if not name:
         action = "enable" if enable else "disable"
@@ -5546,6 +5758,12 @@ def _cmd_mcp_toggle(name: str, enable: bool, pool) -> None:
         return
     found = set_server_enabled(name, enable)
     if found:
+        # Actualizar también el objeto OOConfig en memoria para servidores bundled
+        attr = _BUNDLED_CONFIG_ATTR.get(name)
+        if attr and agent_loop is not None:
+            config = getattr(agent_loop, "config", None)
+            if config is not None and hasattr(config, attr):
+                setattr(config, attr, enable)
         state = "[green]activado[/green]" if enable else "[dim]desactivado[/dim]"
         console.print(f"  [green]✓[/green]  Servidor [cyan]{name}[/cyan] {state} en oocode.json.")
         console.print("  [dim]Reinicia OOCode para aplicar.[/dim]")
@@ -5866,6 +6084,7 @@ def run_webserver_standalone(cmd: str, config) -> bool:
     _host       = getattr(config, "webui_host", "0.0.0.0")
     _port       = int(getattr(config, "webui_port", 4000))
     _log_file   = getattr(config, "webui_log_file", "")
+    _log_max    = int(getattr(config, "webui_log_max_size", 5))
     _log_path   = (
         _P(_log_file).expanduser()
         if _log_file
@@ -5917,7 +6136,7 @@ def run_webserver_standalone(cmd: str, config) -> bool:
         _save_config(True)
         _server_mod = str(_P(__file__).parent.parent / "webui" / "server.py")
         _proc = _subprocess.Popen(
-            [_sys.executable, _server_mod, _host, str(_port), str(_log_path)],
+            [_sys.executable, _server_mod, _host, str(_port), str(_log_path), str(_log_max)],
             stdout=_subprocess.DEVNULL,
             stderr=_subprocess.DEVNULL,
             stdin=_subprocess.DEVNULL,

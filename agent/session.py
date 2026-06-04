@@ -12,6 +12,64 @@ SESSIONS_ROOT.mkdir(parents=True, exist_ok=True)  # garantizar que existe al imp
 
 _RESULT_PREVIEW_CHARS = 200   # chars de preview del resultado en el log de sesión
 
+# ── Historial de input del prompt (compartido TUI ↔ WebUI) ────────────────────
+# El TUI usa prompt_toolkit FileHistory sobre este fichero. Para que el WebUI
+# escriba/lea el MISMO historial, estos helpers replican exactamente su formato:
+#   \n# <timestamp>\n   seguido de una línea  +<contenido>  por cada línea de la
+#   entrada. Al leer, las líneas '+' consecutivas forman una entrada (se unen con
+#   '\n'); cualquier línea sin '+' cierra la entrada. Así los mensajes multilínea
+#   se preservan y las respuestas del agente NUNCA se mezclan en el input.
+INPUT_HISTORY_FILE = CONFIG_DIR / "history"
+
+
+def append_input_history(text: str) -> None:
+    """Añade una entrada de input del usuario a ~/.oocode/history (formato prompt_toolkit).
+
+    Cada línea del texto se escribe con prefijo '+' para que los mensajes
+    multilínea sean compatibles con el FileHistory que lee el TUI.
+    """
+    if not text:
+        return
+    try:
+        INPUT_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with INPUT_HISTORY_FILE.open("a", encoding="utf-8") as f:
+            f.write(f"\n# {_now_iso()}\n")
+            for line in text.split("\n"):
+                f.write(f"+{line}\n")
+    except Exception:
+        pass
+
+
+def load_input_history(limit: int = 200) -> list[str]:
+    """Lee ~/.oocode/history (formato prompt_toolkit) y devuelve las últimas `limit`
+    entradas de input del usuario, de la más antigua a la más reciente.
+
+    Misma lógica de parseo que `prompt_toolkit.history.FileHistory.load_history_strings`
+    (líneas '+' acumuladas → entrada; el último '\\n' se descarta).
+    """
+    if not INPUT_HISTORY_FILE.exists():
+        return []
+    entries: list[str] = []
+    lines: list[str] = []
+
+    def _flush() -> None:
+        if lines:
+            entries.append("".join(lines)[:-1])
+
+    try:
+        with INPUT_HISTORY_FILE.open("r", encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                if raw.startswith("+"):
+                    lines.append(raw[1:])
+                else:
+                    _flush()
+                    lines.clear()
+            _flush()
+    except Exception:
+        return []
+    # Descartar entradas vacías; devolver las últimas `limit`
+    return [e for e in entries if e.strip()][-limit:]
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()

@@ -1,8 +1,9 @@
 """Tests de tools MCP misceláneas sin cobertura previa (sin LLM).
 
 Cubre: write_file, env_check, count_lines, tree, json_validate, yaml_validate,
-jq_query, port_check, process_list, http_get, template_fill, search_todos,
+jq_query, port_check, process_list, template_fill, search_todos,
 read_project_file, list_recent_files, run_quick_check, code_compare, multi_grep.
+(http_get movido a http_client_assistant — ver test_70_http_client_mcp.py)
 
 NOTA: tmp_path está definido en conftest.py como ~/.oocode/_test_tmp para evitar
 el bloqueo de _safe_path que rechaza rutas fuera del home del usuario.
@@ -27,7 +28,6 @@ from mcp_servers.oocode_assistant import (
     _tool_jq_query,
     _tool_port_check,
     _tool_process_list,
-    _tool_http_get,
     _tool_template_fill,
     _tool_search_todos,
     _tool_read_project_file,
@@ -248,18 +248,6 @@ class TestProcessList:
 
     def test_nonexistent_filter(self):
         result = _tool_process_list({"filter": "_oocode_nonexistent_xyz_"})
-        assert isinstance(result, str)
-
-
-# ── http_get ──────────────────────────────────────────────────────────────────
-
-class TestHttpGet:
-    def test_missing_url(self):
-        result = _tool_http_get({})
-        assert "error" in result.lower() or "requer" in result.lower() or "url" in result.lower()
-
-    def test_invalid_url_schema(self):
-        result = _tool_http_get({"url": "ftp://example.com"})
         assert isinstance(result, str)
 
 

@@ -23,8 +23,10 @@ Muestra el estado detallado del contexto:
 
 ### `/ctx [mini|full]`
 Cambia el modo de contexto del workspace inyectado en el system prompt:
-- `mini` (~150 tokens): OOCODE.md + índice de memoria + log diario reciente
-- `full` (~800 tokens): todo el workspace completo
+- `mini` (~150 tokens): resumen de identidad (IDENTITY/SOUL/USER) + índice de memoria + log diario + sección `## Notas` de TOOLS.md/AGENTS.md si la personalizas
+- `full` (~800 tokens): todos los ficheros del workspace completos
+
+`OOCODE.md` (instrucciones del proyecto) se carga aparte y siempre. Ver doc 16.
 
 ### `/compact [fast]`
 Compacta el historial cuando supera el umbral de contexto:
@@ -66,7 +68,7 @@ Sin argumento: muestra el modelo activo.
 Con nombre: cambia el modelo y lo guarda en `oocode.json`.
 
 ### `/models`
-Lista todos los modelos disponibles en el servidor Ollama. Permite seleccionar uno interactivamente.
+Lista todos los modelos disponibles en el servidor Ollama y permite seleccionar uno interactivamente. Solo disponible con el backend Ollama; con OpenAI/Anthropic usa `/model <nombre>` para fijar el modelo a mano.
 
 ### `/spawn <id> <tarea>`
 Lanza un subagente con el ID especificado para ejecutar una tarea en contexto aislado.
@@ -205,9 +207,10 @@ Control del daemon WebUI (Flask + SSE en puerto 4000):
 ## Sistema y diagnóstico
 
 ### `/doctor`
-Diagnóstico completo del sistema:
-- Conectividad con Ollama y versión
-- Disponibilidad del modelo configurado y el de embeddings
+Diagnóstico completo del sistema, **adaptado al backend configurado** (`api.type`):
+- Backend LLM: con Ollama comprueba conectividad y lista de modelos; con OpenAI verifica `baseUrl`/key y conecta a `/models`; con Anthropic verifica key y paquete instalado
+- Disponibilidad del modelo configurado y el de embeddings (las embeddings se prueban siempre contra el host Ollama efectivo)
+- Fallback y hosts extra (routing de subagentes, solo Ollama)
 - SearXNG (si configurado)
 - Ficheros de configuración y workspaces
 - Plugins y skills cargados
@@ -215,14 +218,24 @@ Diagnóstico completo del sistema:
 - LSP servers y agentes disponibles
 - Hooks activos
 
+> También disponible como `oocode --doctor` (antes de entrar al REPL) y en la página *Doctor* del WebUI.
+
 ### `/init [ruta]`
 Genera un fichero `OOCODE.md` en el workspace o en la ruta especificada, analizando el proyecto con el LLM.
 
 ### `/steer`
 Inyecta instrucciones al agente en el turno actual, redirigiendo su comportamiento sin perder el contexto.
 
+### `/kill` · `/kill all`
+Interrumpe el turno activo **al momento**, incluidos todos los subagentes y equipos que haya lanzado. No espera a que termine la operación en curso: aborta la llamada al LLM en vuelo cerrando a la fuerza el socket (también el de los subagentes, que comparten el pool del agente principal) y dispara `kill_all()` sobre todos los subagentes/equipos activos. Equivale al botón **Kill** de la WebUI y a `Ctrl+C` en el TUI.
+
+- `/kill` — detiene el turno y sus subagentes/equipos.
+- `/kill all` — además deshabilita todos los jobs del scheduler y resetea las tareas `wip → todo`.
+
+> Antes, `/kill` solo marcaba una señal que el bucle detectaba *entre* operaciones, así que durante el prompt-eval de un LLM o mientras corría un subagente/equipo no surtía efecto inmediato. Ahora el corte es inmediato. Los miembros de un equipo (`run_team`), que antes eran inmatables, ahora se registran con su propia `kill_event` y aparecen en `/subagents`.
+
 ### `/config`
-Muestra la configuración completa en tablas por sección.
+Muestra la configuración completa en tablas por sección, incluyendo la sección **Backend (api)** (tipo, host/baseUrl, key enmascarada, embedHost) y la sección **Subagentes** (concurrencia, timeouts, prioridad).
 
 ### `/config edit`
 Panel interactivo para editar la configuración sección por sección. Los cambios se guardan en `oocode.json`.

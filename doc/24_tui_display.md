@@ -312,6 +312,56 @@ En modo REPL se usa `_run_animated_header()` en `ui/loop_tui.py`: anima el `◐`
 
 ---
 
+## Streaming `│` del sub-agente (presupuesto por turno)
+
+Un sub-agente **no** usa el live block del padre: renderiza su propio bloque en la conversación mediante `console.print` con prefijo `│` coloreado (color rotativo por turno). `AgentLoop._print()`, cuando `is_subagent=True`, envuelve cada línea en `│` y la cuenta contra `_MAX_SUB_LINES` (12). Al alcanzar el límite imprime una vez `… buffer lleno (ctrl+o para ver completo)` y suprime el resto de líneas de ese turno.
+
+El cap es **por turno**, no por ejecución completa. El contador `_sub_lines_shown` se resetea al inicio de cada iteración del bucle `run()` (en `agent/loop.py`, junto al incremento de color `_subagent_color_idx`, gateado por `is_subagent`):
+
+```
+while True:                       # bucle de turnos del sub-agente
+    ...
+    self._subagent_color_idx += 1
+    if self.is_subagent:
+        self._sub_lines_shown = 0  # presupuesto │ fresco para este turno
+```
+
+Sin este reset por turno (comportamiento previo), un sub-agente multi-turno consumía su presupuesto en el primer turno y **congelaba** el resto de su ejecución mostrando solo las líneas más antiguas. Como las líneas `│` se imprimen al buffer estático scrollable del padre (cap 80 KB, ver §2), las antiguas hacen scroll hacia arriba a medida que llegan las nuevas, así el usuario sigue viendo la actividad reciente del sub-agente. La traza completa de todos los turnos queda disponible expandiendo con `Ctrl+O`.
+
+Cubierto por `tests/test_22_tui_display.py::TestSubagentLinePrintCap`.
+
+### Alineación del `●` de texto del sub-agente
+
+Como el sub-agente no tiene live block (sus callbacks son `None`), su `●` de texto caía en la rama `console.print` directa de `_turn_display_bullet` → **columna 0**, desalineado respecto a sus líneas de tool (`  │  …`). `_turn_display_bullet` ahora hace early-return a `_render_subagent_bullet` cuando `is_subagent`: imprime el `●` y su continuación vía `self._print` (prefijo `│`, respeta `_MAX_SUB_LINES`). Los avisos de retry XML usan el helper `_notice` (indenta para el principal, `│` para sub-agentes). Todo el bloque del sub-agente queda alineado bajo su columna `│`:
+
+```
+  │ ● Tarea 6 activa: Documentar cambios en doc/interaccion_social.md.
+  │   Voy a crear la documentación con todos los cambios del Sprint 9.
+  │   ◐  Write(interaccion_social.md)
+  │   │  Fichero escrito: /ruta/doc.md (8292 caracteres)
+```
+
+Cubierto por `tests/test_22_tui_display.py::TestSubagentBulletAlignment`.
+
+---
+
+## Render del `task` de orquestación (Markdown)
+
+Los headers de `spawn_subagent` (`● spawn_subagent 💬 emoji nombre: …`) y de `explore` (`🔍 Explorando: …`) muestran el `task` que el agente principal delega. Cuando ese `task` es un bloque markdown multilínea (contexto, listas numeradas, **negritas**…), el header **no** debe volcarlo en crudo.
+
+- **1.ª línea → inline en el header**, escapada con `rich.markup.escape` (para que el markup Rich del texto no se interprete como tags).
+- **Resto → `Padding(Markdown(...), (0,0,0,4))`** justo debajo, de modo que negritas, viñetas y listas numeradas se renderizan correctamente.
+
+Antes, todo el `task` iba por `_esc()` en un único f-string. `_esc()` escapa el markup Rich pero **no** interpreta markdown, así que `**Contexto actual:**`, `- bullets`, etc. aparecían literales en pantalla —escapando al formato de la conversación—. En `explore` la 1.ª línea iba además **sin escapar**, de modo que un `[texto]` en el task se interpretaba como tag Rich. Implementado en `agent/loop.py` (header de spawn) y `agent/subagent.py` (`explore`). Cubierto por `tests/test_79_subagent_task_markdown.py`.
+
+> El mismo patrón (1.ª línea inline + resto como `Markdown`) lo usa `_turn_display_bullet` para el texto del agente; aquí se aplica al `task` delegado.
+
+## `% ctx` del panel de subagentes
+
+El header del panel de subagentes (`⏵⏵ Subagentes Activos … N% ctx`) muestra un porcentaje de contexto que corresponde al **subagente activo**, no al agente principal. `OOCodeApp._get_subagent_panel_text` toma `ctx_pct` del subagente en estado `running` (o del último que reporte contexto); si ninguno ha completado aún su 1.ª petición al LLM (`ctx_pct == 0`), el header no muestra `%`. Cada línea de subagente ya mostraba su propio `ctx_pct` (actualizado por el subagente vía `_sub_stats_ref` en `agent/loop.py`); el `%` del agente principal vive en el toolbar inferior, no en este panel.
+
+---
+
 ## SYSTEM_RULES — regla de anuncio pre-escritura
 
 Para que el split sea innecesario la mayoría de las veces, `SYSTEM_RULES` incluye:

@@ -311,6 +311,78 @@ class TestShowCompactReset:
 
         assert loop._session_mems == []
 
+    def test_last_message_recovered_after_compaction(self, loop):
+        """El último mensaje del agente se re-muestra tras compactar (no se pierde)."""
+        loop._session_reads   = []
+        loop._session_mems    = []
+        loop._clear_output_cb = lambda: None
+        loop._last_response   = ("Resumen del sprint completado.\n"
+                                 "¿Continúo con el siguiente sprint?")
+        captured = []
+
+        with patch("ui.renderer.print_compact_banner"), \
+             patch("ui.console.console") as mock_con:
+            mock_con.print = lambda *a, **kw: captured.append(" ".join(str(x) for x in a))
+            loop._show_compact_reset(5, 1000, True)
+
+        full = " ".join(captured)
+        assert "último mensaje del agente" in full
+        # El texto del resumen se renderiza (vía Markdown/Padding) tras el aviso
+        assert any("Resumen del sprint" in c or "Markdown" in c or "Padding" in c
+                   for c in captured)
+
+    def test_no_recovery_block_when_last_response_empty(self, loop):
+        """Sin _last_response no se imprime el bloque de recuperación."""
+        loop._session_reads   = []
+        loop._session_mems    = []
+        loop._clear_output_cb = lambda: None
+        loop._last_response   = ""
+        captured = []
+
+        with patch("ui.renderer.print_compact_banner"), \
+             patch("ui.console.console") as mock_con:
+            mock_con.print = lambda *a, **kw: captured.append(" ".join(str(x) for x in a))
+            loop._show_compact_reset(2, 300, False)
+
+        full = " ".join(captured)
+        assert "último mensaje del agente" not in full
+
+    def test_missing_last_response_attr_does_not_crash(self, loop):
+        """_show_compact_reset es robusto si _last_response no está inicializado."""
+        loop._session_reads   = []
+        loop._session_mems    = []
+        loop._clear_output_cb = lambda: None
+        # No fijamos loop._last_response — getattr(..., "") debe protegerlo
+
+        with patch("ui.renderer.print_compact_banner"), \
+             patch("ui.console.console"):
+            loop._show_compact_reset(1, 100, False)  # no debe lanzar
+
+    def test_last_agent_msg_takes_precedence_over_last_response(self, loop):
+        """El bloque de recuperación usa _last_agent_msg (reciente), no _last_response.
+
+        Regresión: al compactar a mitad de turno (auto-continue), _last_response es
+        del run() anterior (obsoleto). _last_agent_msg refleja el último bloque real.
+        """
+        loop._session_reads   = []
+        loop._session_mems    = []
+        loop._clear_output_cb = lambda: None
+        loop._last_response   = "MENSAJE OBSOLETO de un run anterior"
+        loop._last_agent_msg  = "MENSAJE RECIENTE antes de esta compactación"
+        captured = []
+
+        with patch("ui.renderer.print_compact_banner"), \
+             patch("ui.console.console") as mock_con:
+            mock_con.print = lambda *a, **kw: captured.append(" ".join(str(x) for x in a))
+            loop._show_compact_reset(5, 1000, True)
+
+        full = " ".join(captured)
+        assert "último mensaje del agente" in full
+        assert any("MENSAJE RECIENTE" in c or "Markdown" in c or "Padding" in c
+                   for c in captured)
+        # El obsoleto NO debe aparecer como texto renderizado directamente
+        assert "MENSAJE OBSOLETO" not in full
+
     def test_execute_mem_save_registers_in_session_mems(self, loop, tmp_mem_dir):
         """_execute_mem_save añade el nombre a _session_mems."""
         loop._execute_mem_save({"name": "my_fact", "content": "important"})

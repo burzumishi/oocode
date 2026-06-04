@@ -578,7 +578,9 @@ class TestPermissions:
 class TestCounts:
     def test_total_tools_count(self):
         from mcp_servers.oocode_assistant import _TOOLS
-        assert len(_TOOLS) == 120, f"Se esperaban 120 tools, hay {len(_TOOLS)}"
+        from mcp_servers.devops_assistant import _TOOLS as _DEVOPS_TOOLS
+        total = len(_TOOLS) + len(_DEVOPS_TOOLS)
+        assert total == 119, f"Se esperaban 119 tools (oocode+devops), hay {total}"
 
     def test_total_prompts_count(self):
         from mcp_servers.oocode_assistant import _PROMPTS
@@ -586,4 +588,4 @@ class TestCounts:
 
     def test_total_resources_count(self):
         from mcp_servers.oocode_assistant import _RESOURCES
-        assert len(_RESOURCES) == 25, f"Se esperaban 25 resources, hay {len(_RESOURCES)}"
+        assert len(_RESOURCES) == 21, f"Se esperaban 21 resources en oocode-assistant, hay {len(_RESOURCES)}"

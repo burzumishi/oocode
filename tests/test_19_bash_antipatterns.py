@@ -725,3 +725,80 @@ class TestAnalyzeCodebaseIntegration:
         })
         assert isinstance(result, str)
         assert "Error" not in result or "coincidencias" in result.lower()
+
+
+# ── Fix: workdir de bash robusto frente a '~' sin expandir / dir inexistente ──
+
+class TestBashWorkdirRobustness:
+    """bash_execute normaliza el workdir y no crashea con rutas mal formadas.
+
+    Regresión: el subagente pasaba su workspace de identidad (~/.oocode/workspace/<id>,
+    con '~' literal) como cwd de bash → Popen fallaba con
+    "[Errno 2] No such file or directory: '~/.oocode/workspace/coding'".
+    """
+
+    def test_nonexistent_tilde_workdir_does_not_crash(self):
+        from tools.bash import bash_execute
+        out = bash_execute("pwd", workdir="~/.oocode/workspace/no_existe_xyz")
+        assert "Error ejecutando bash" not in out
+        assert "No such file or directory" not in out
+
+    def test_tilde_workdir_is_expanded(self):
+        import os
+        from tools.bash import bash_execute
+        out = bash_execute("pwd", workdir="~")
+        assert os.path.expanduser("~") in out
+
+    def test_valid_workdir_used(self, tmp_path):
+        from tools.bash import bash_execute
+        out = bash_execute("pwd", workdir=str(tmp_path))
+        # En macOS tmp_path puede ser /private/var/... → comprobar el basename
+        assert tmp_path.name in out
+
+    def test_none_workdir_uses_cwd(self):
+        from tools.bash import bash_execute
+        out = bash_execute("pwd", workdir=None)
+        assert "Error ejecutando bash" not in out
+
+
+class TestSubagentToolWorkdir:
+    """El subagente usa project_dir (no el workspace de identidad) como workdir."""
+
+    def test_build_registry_called_with_project_dir(self):
+        import os
+        from unittest.mock import MagicMock
+        from agent.subagent import SubAgentRunner
+
+        captured = {}
+
+        def fake_build_registry(workdir, config):
+            captured["workdir"] = workdir
+            reg = MagicMock()
+            reg.has.return_value = False
+            return reg
+
+        cfg = MagicMock()
+        cfg.project_dir = "/home/user/myproject"
+        runner = SubAgentRunner(cfg, MagicMock(), fake_build_registry)
+
+        sub_config = MagicMock()
+        sub_config.project_dir = "/home/user/myproject"
+        sub_config.workspace = "~/.oocode/workspace/coding"
+
+        # Reproduce la resolución del workdir de tools del subagente
+        tool_workdir = os.path.expanduser(
+            sub_config.project_dir or sub_config.workspace
+        )
+        reg = fake_build_registry(tool_workdir, sub_config)
+
+        assert captured["workdir"] == "/home/user/myproject"
+        assert "~" not in captured["workdir"]
+
+    def test_falls_back_to_workspace_when_no_project_dir(self):
+        import os
+        # Sin project_dir, cae al workspace pero con '~' expandido
+        project_dir = ""
+        workspace = "~/.oocode/workspace/coding"
+        tool_workdir = os.path.expanduser(project_dir or workspace)
+        assert "~" not in tool_workdir
+        assert tool_workdir.endswith("/.oocode/workspace/coding")

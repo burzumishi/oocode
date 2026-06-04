@@ -6,14 +6,20 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from agent.context import _CHARS_PER_TOKEN
+from agent.context import _CPT_TOOL, _CPT_CALLS, _CPT_THINK, _CPT_TEXT, _CPT_SYS, _CPT_DEFLT
 from config import DEFAULT_CONFIG
 
 
 class TestContextConfiguration:
-    def test_chars_per_token_value(self):
-        assert isinstance(_CHARS_PER_TOKEN, float)
-        assert _CHARS_PER_TOKEN == 3.0
+    def test_chars_per_token_values(self):
+        # Tool results / JSON payloads: más densos → ratio más bajo
+        assert _CPT_TOOL < _CPT_TEXT
+        assert _CPT_CALLS < _CPT_TEXT
+        # Thinking: lenguaje natural → ratio más alto
+        assert _CPT_THINK > _CPT_TEXT
+        # Todos son floats positivos
+        for cpt in (_CPT_TOOL, _CPT_CALLS, _CPT_THINK, _CPT_TEXT, _CPT_SYS, _CPT_DEFLT):
+            assert isinstance(cpt, float) and cpt > 0
 
     def test_context_section_exists(self):
         assert "context" in DEFAULT_CONFIG

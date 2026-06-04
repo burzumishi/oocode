@@ -1,6 +1,6 @@
-# 19 — WebUI *(beta / experimental)*
+# 19 — WebUI *(beta)*
 
-> **Estado:** El WebUI está en desarrollo activo. Es funcional pero aún le falta trabajo para igualar el TUI en stabilidad y fidelidad de salida. El **TUI es la interfaz de referencia**; el WebUI puede mostrar diferencias en el formato de la conversación, herramientas y planes. Se aceptan issues y PRs.
+> **Estado:** El WebUI ha alcanzado el estado **beta** (v0.4.0). La interfaz es estable, está cubierta por la suite de tests y la paridad de características con el TUI es completa. El **TUI sigue siendo la interfaz de referencia** en rendimiento; el WebUI es la opción recomendada para uso desde navegador o extensiones de editor. Se aceptan issues y PRs.
 
 ## Descripción
 
@@ -35,18 +35,22 @@ python oocode.py --webserver stop
 ## Características
 
 - Chat en tiempo real con streaming via SSE
+- **Salida idéntica al TUI**: mismos símbolos `●/│/◐/⎿/◈/✔/◼/◻`, fuente monoespaciada, bloques de tools colapsables al estilo pipa
+- **Indicador "Pensando"** encima del prompt: palabras inventadas ciclantes (`Cavilando…`, `Tokenizando…`…) y frases de preflight. Es **estado puro**: NO muestra títulos de herramientas — el detalle de cada tool aparece en su bloque dentro de la conversación (corrección 2026-06-04)
+- **Status bar reubicada bajo el prompt (paridad TUI)** — orden de arriba abajo: indicador "Pensando" → prompt → team-bar → **status bar** (agente · modelo · barra de contexto `▱▱▱▱▱▱▱▱▱▱` · tareas · badges MCP/LSP/MEM/RAG/EMBED/VIS/ELEV · tokens) → filas de detalle MCP/LSP. Igual que el toolbar del TUI (línea principal arriba, detalle MCP/LSP debajo). Es una barra única (antes había una superior duplicada; se eliminó en v0.4.2)
+- **Team-bar de una sola línea (cabecera de equipo)** — cuando hay subagentes activos, muestra una cabecera compacta: `📋 Agente principal 💬 💻 Subagente · N subagente(s)` (con `✓` delante de los terminados). El **detalle largo** de cada subagente (su tarea, plan, texto y herramientas) vive en su **bloque dentro de la conversación**, no en la barra de status. Auto-descubre también los subagentes de `team`/`fanout`. La tarea encomendada se siembra al principio del bloque del subagente al arrancar (`subagent_start`)
+- Planes multi-tarea con estado `✔/◼/◻` actualizables en tiempo real
 - Markdown-to-HTML con resaltado de código
-- Archivos adjuntos
+- Archivos adjuntos (imágenes y ficheros de texto)
 - Panel MCP/LSP status con estado de servidores activos
-- Barra de contexto (tokens usados/disponibles)
-- Modo "Pensando" durante ejecución de herramientas
+- Barra de contexto (tokens usados/disponibles) con alerta visual al acercarse al límite
 - Panel de task progress con estado de tareas activas
 - Temas claro/oscuro
 - Diseño responsive para móvil
 - Historial de sesiones
 - Gestión de agentes (ver, lanzar, controlar)
-- Diagnóstico del sistema
-- Configuración visual de `oocode.json`
+- Diagnóstico del sistema (consciente del backend: ollama/openai/anthropic)
+- **Configuración visual completa** de `oocode.json`: Backend LLM (api: type/key/host/extraHosts/embedHost/routing/retry), Modelo, WebUI, Contexto, Herramientas, RAG, Embeddings, SearXNG, MCP Servers, Hooks, Subagentes (incl. autoContMax/inferenceTimeout/defaultTimeout), Backups, Snapshots, Logging, Visión, Chat log, Fallback, Apariencia
 
 ## Páginas
 
@@ -73,7 +77,9 @@ Todos los endpoints devuelven JSON salvo los SSE:
 | `/api/chat/send` | POST | Enviar mensaje (inicia streaming) |
 | `/api/chat/stream` | GET | SSE: recibe chunks del streaming activo |
 | `/api/chat/status` | GET | Estado del chat: modelo, agente, contexto % |
-| `/api/chat/history` | GET | Historial de mensajes de la sesión |
+| `/api/chat/history` | GET | Historial de mensajes de la conversación de la sesión |
+| `/api/chat/input_history` | GET | Historial de input del prompt (flecha arriba), **compartido con el TUI** (`~/.oocode/history`) |
+| `/api/chat/load_session` | POST | Restaura una sesión pasada (contexto + conversación), reusando `AgentLoop.restore_session` |
 | `/api/chat/clear` | POST | Limpiar historial de la sesión |
 
 #### Ejemplo: enviar mensaje síncrono
@@ -119,17 +125,18 @@ es.onmessage = (e) => {
 | Tipo | Descripción |
 |------|-------------|
 | `text` | Chunk de texto del LLM |
-| `tool_start` | Inicio de ejecución de herramienta (incluye nombre y args) |
+| `tool_start` | Inicio de ejecución de herramienta (incluye nombre y args). `spawn_subagent` **no** emite este evento del agente principal: se representa con `subagent_start` + su propio bloque |
 | `tool_done` | Fin de ejecución de herramienta (incluye resultado resumido y `file_path` si aplica) |
 | `plan` | Actualización del plan multi-tarea (`◈`) |
 | `subagent_start` | Inicio de un subagente (incluye `agent_id`, `task`) |
 | `subagent_text` | Chunk de texto producido por un subagente |
 | `subagent_tool` | Tool call de un subagente (en bloque expandible) |
 | `subagent_done` | Subagente terminado (incluye resultado) |
+| `inference_done` | Fin de inferencia (muestra "⚡ Inferencia completada." en el chat) |
 | `done` | Fin del turno |
 | `error` | Error durante la ejecución |
 
-El output de los subagentes fluye al WebUI via SSE en tiempo real, de la misma forma que en el TUI. Las herramientas de los subagentes aparecen en un bloque expandible con encabezado `↳ Subagente 💻 coding` que el usuario puede plegar/desplegar. Al finalizar, el resultado del subagente se muestra como una tarjeta con el texto completo.
+El output de los subagentes fluye al WebUI via SSE en tiempo real, de la misma forma que en el TUI. Cada subagente vive en **un único bloque expandible** dentro de la conversación, con encabezado `💻 Subagente` que el usuario puede plegar/desplegar. Al arrancar (`subagent_start`) el bloque se siembra con la **tarea encomendada**; luego se llenan ahí su texto, su plan y sus herramientas mientras corre — todo se mantiene dentro del mismo bloque (sin que se "escapen" textos fuera). La cabecera de equipo de la status bar solo muestra el resumen de una línea (ver *Características*). `spawn_subagent` ya no genera un bloque de herramienta huérfano del agente principal.
 
 ### Sesiones
 
@@ -137,6 +144,11 @@ El output de los subagentes fluye al WebUI via SSE en tiempo real, de la misma f
 |----------|--------|-------------|
 | `/api/sessions` | GET | Lista de sesiones del agente activo |
 | `/api/status` | GET | Estado completo del sistema |
+
+**Persistencia y recuperación (paridad TUI):**
+
+- **Sesiones (conversación):** TUI y WebUI persisten cada sesión en el mismo JSONL (`~/.oocode/sessions/<agent_id>/<id>.jsonl`) vía `SessionManager`. El panel 📚 *Sesiones* del WebUI restaura una sesión pasada con el botón *Cargar* (`POST /api/chat/load_session`) o con `/session <id>` en el chat; ambos reusan `AgentLoop.restore_session` igual que el `/session` del TUI, recargando el contexto del LLM y re-renderizando la conversación.
+- **Historial de input del prompt (flecha arriba):** compartido con el TUI en `~/.oocode/history` (formato `prompt_toolkit FileHistory`). El WebUI lo lee al conectar (`/api/chat/input_history`) y escribe **solo** lo que teclea el usuario, con cada línea prefijada por `+` para que los mensajes multilínea sean compatibles. Las respuestas del agente nunca se mezclan ahí.
 
 ### Agentes
 

@@ -21,7 +21,8 @@ Esta guía documenta la implementación de estilos y formatos para documentos O3
 |-------------|-------------|---------------------|
 | **python-docx** | Manipulación de documentos .docx | `add_paragraph`, `add_table`, `run_formatting` |
 | **openpyxl** | Manipulación de hojas Excel | `CellStyle`, `Font`, `PatternFill`, `Border`, `Alignment` |
-| **matplotlib** | Gráficos dinámicos | Exportación a .png, .pdf, .svg |
+| **python-pptx** | Presentaciones .pptx | slides, layouts, gráficas nativas |
+| **Gráficas OOXML (DrawingML)** | Gráficas nativas editables en Office | `insert_chart`, `xlsx_insert_chart`, `pptx_insert_chart` |
 | **Pillow** | Manipulación de imágenes | Carga y procesamiento de imágenes |
 
 ---
@@ -264,7 +265,7 @@ gradient = GradientFill(
 1. **Fuente Calibri**: Es la fuente predeterminada de O365. Usarla garantiza máxima compatibilidad.
 2. **Colores RGB**: Ambos soportan colores en formato RGB (000000 = negro, FFFFFFF = blanco).
 3. **Bordes diagonales**: Soportados en ambos, pero pueden variar ligeramente en renderizado.
-4. **Gráficos**: Los gráficos generados con matplotlib se exportan como PNG y son compatibles.
+4. **Gráficos**: Las gráficas son objetos OOXML nativos (DrawingML), editables en Office — no imágenes PNG.
 5. **Formatos condicionales**: Mejor soporte en O365, limitado en LibreOffice.
 
 ---
@@ -380,63 +381,34 @@ def crear_hoja_formateada():
     return wb
 ```
 
-### Ejemplo 3: Gráfico con Matplotlib
+### Ejemplo 3: Gráfica OOXML nativa en Word
 
-```python
-import matplotlib.pyplot as plt
-import matplotlib
-matplotlib.use('Agg')  # Evitar ventanas de gráficos en GUI
+La gráfica se inserta como objeto editable de Word (DrawingML), no como imagen. Con la tool `insert_chart`:
 
-def crear_grafico():
-    fig, ax = plt.subplots(figsize=(8, 6))
-    
-    # Datos
-    categorias = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo']
-    valores = [12000, 15000, 18000, 22000, 25000]
-    
-    # Gráfico de barras
-    ax.bar(categorias, valores, color='#4472C4', alpha=0.8)
-    ax.set_title('Evolución Mensual', fontsize=14, fontweight='bold')
-    ax.set_xlabel('Meses', fontsize=12)
-    ax.set_ylabel('Valor', fontsize=12)
-    
-    # Guardar como PNG
-    plt.savefig('/tmp/grafico.png', dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    return '/tmp/grafico.png'
+```json
+{
+  "path": "/tmp/informe.docx",
+  "chart_type": "bar",
+  "title": "Evolución Mensual",
+  "data": {
+    "categories": ["Enero", "Febrero", "Marzo", "Abril", "Mayo"],
+    "series": [{"label": "Valor", "values": [12000, 15000, 18000, 22000, 25000]}]
+  }
+}
 ```
 
-### Ejemplo 4: Integración Completo
+O dentro de `doc_create`, como un bloque más de `content_blocks`:
 
-```python
-from docx import Document
-from openpyxl import Workbook
-import matplotlib.pyplot as plt
-import matplotlib
-matplotlib.use('Agg')
-
-def generar_reporte_completo():
-    # 1. Crear documento .docx
-    doc = Document()
-    
-    # Título
-    doc.add_paragraph("📊 Informe Financiero Mensual")
-    doc.add_paragraph("Generado automáticamente por OOCode")
-    
-    # 2. Crear hoja Excel
-    wb = Workbook()
-    ws = wb.active
-    
-    # 3. Generar gráfico
-    grafico_path = crear_grafico()
-    
-    # 4. Guardar todo
-    doc.save('/tmp/informe.docx')
-    wb.save('/tmp/informe.xlsx')
-    
-    return doc, wb, grafico_path
+```json
+{"type": "chart", "chart_type": "bar", "title": "Evolución Mensual",
+ "data": {"categories": ["Ene","Feb","Mar"],
+          "series": [{"label": "Valor", "values": [12000, 15000, 18000]}]}}
 ```
+
+### Ejemplo 4: Informe completo nativo
+
+Una sola llamada a `doc_create` con `content_blocks` (título, tabla, gráfica nativa) genera el
+documento Word completo con estilos O365 — sin pasos intermedios ni imágenes PNG.
 
 ---
 
@@ -446,20 +418,10 @@ def generar_reporte_completo():
 
 ```bash
 # Instalar todas las dependencias necesarias
-pip install python-docx openpyxl matplotlib pillow
+pip install python-docx python-pptx openpyxl pillow docxtpl
 
 # Verificar instalación
-python -c "import docx; import openpyxl; import matplotlib; print('✅ Todas las librerías instaladas')"
-```
-
-### ⚙️ Configuración Recomendada
-
-```python
-# Configuración de matplotlib para exportación
-matplotlib.rcParams['figure.dpi'] = 300  # Alta resolución
-matplotlib.rcParams['savefig.dpi'] = 300
-matplotlib.rcParams['pdf.fonttype'] = 42  # PDF con fuentes embebidas
-matplotlib.rcParams['ps.fonttype'] = 3
+python -c "import docx, openpyxl, pptx, docxtpl; print('✅ Todas las librerías instaladas')"
 ```
 
 ### 🎨 Paleta de Colores O365
@@ -499,9 +461,8 @@ fill_o365 = {
 
 ### ⚠️ Limitaciones
 
-- **python-docx**: No soporta gráficos incrustados directamente (requiere Pillow).
+- **Gráficas**: se generan como OOXML nativo (DrawingML); tipos soportados en Word: bar, column, line, line_markers, area, pie, doughnut, scatter, stacked_bar, stacked_column, radar.
 - **openpyxl**: Formatos condicionales limitados en versiones antiguas.
-- **Matplotlib**: Gráficos en documentos requieren exportación externa.
 - **LibreOffice**: Algunos estilos avanzados pueden no renderizarse correctamente.
 
 ### 🔧 Solución de Problemas
@@ -526,7 +487,7 @@ print(openpyxl.__version__)  # >= 3.0.0
 
 - [python-docx documentación](https://python-docx.readthedocs.io/)
 - [openpyxl documentación](https://openpyxl.readthedocs.io/)
-- [Matplotlib documentación](https://matplotlib.org/)
+- [python-pptx documentación](https://python-pptx.readthedocs.io/)
 - [Pillow documentación](https://pillow.readthedocs.io/)
 
 ---

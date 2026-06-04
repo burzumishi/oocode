@@ -68,7 +68,7 @@ def _search_rg(pattern, root, file_type, context_lines,
         )
         lines, stderr_lines = [], []
         seen_files: set[str] = set()
-        import select as _select, sys as _sys
+        import select as _select
         deadline = __import__("time").time() + 20
         while True:
             if __import__("time").time() > deadline:

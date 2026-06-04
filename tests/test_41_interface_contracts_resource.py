@@ -34,7 +34,7 @@ class TestInterfaceContractsResourceRegistration:
 
     def test_total_resources_25(self):
         from mcp_servers.oocode_assistant import _RESOURCES
-        assert len(_RESOURCES) == 25
+        assert len(_RESOURCES) == 21
 
     def test_resource_fns_match_resources(self):
         from mcp_servers.oocode_assistant import _RESOURCES, _RESOURCE_FNS

@@ -35,3 +35,7 @@ Si hay sesión reciente: leer `memory/YYYY-MM-DD.md`. No releer si el contexto y
 
 ## OOCODE.md
 Cada proyecto tiene su `OOCODE.md` en su directorio principal. Actualizar con los avances.
+
+## Notas
+
+_(Personaliza aquí cómo trabajas con otros agentes: cuándo delegar, en qué agente, qué subtareas prefieres repartir. Lo que escribas en esta sección se carga en el contexto del agente — los placeholders no.)_

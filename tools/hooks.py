@@ -570,29 +570,58 @@ def _backup_pending() -> dict[str, str]:
     return d
 
 
-def _get_backup_dir() -> "Path":
-    """Devuelve el directorio de backups desde config, creándolo si no existe."""
+def _load_backup_cfg() -> dict:
+    """Lee el bloque `backup` de oocode.json (con defaults) en un dict normalizado.
+
+    Devuelve: {enabled, dir(Path), extensions(set), max_files(int)}.
+    Los hooks corren fuera del objeto OOConfig, por eso se relee el JSON;
+    aquí se centraliza para que `enabled`/`extensions`/`maxFiles`/`dir` —todos
+    campos de config— se respeten en un único punto.
+    """
     from pathlib import Path as _Path
+    block: dict = {}
     try:
-        from config import CONFIG_DIR, CONFIG_FILE
+        from config import CONFIG_FILE, DEFAULT_CONFIG
         import json as _json
-        if CONFIG_FILE.exists():
-            _raw = _json.loads(CONFIG_FILE.read_text())
-            _bd = _raw.get("backup", {}).get("dir", "")
-            if _bd:
-                d = _Path(_bd).expanduser()
-                d.mkdir(parents=True, exist_ok=True)
-                return d
+        _defaults = DEFAULT_CONFIG.get("backup", {})
+        _raw = (
+            _json.loads(CONFIG_FILE.read_text()).get("backup", {})
+            if CONFIG_FILE.exists() else {}
+        )
+        block = {**_defaults, **_raw}
+    except Exception:
+        block = {}
+
+    enabled = bool(block.get("enabled", True))
+    _bd = block.get("dir", "")
+    bdir = _Path(_bd).expanduser() if _bd else _Path.home() / ".oocode" / "backup"
+    _exts = block.get("extensions") or []
+    exts = frozenset(e.lower() for e in _exts) if _exts else _BACKUP_EXTS
+    try:
+        max_files = int(block.get("maxFiles", 50))
+    except (TypeError, ValueError):
+        max_files = 50
+    return {"enabled": enabled, "dir": bdir, "extensions": exts, "max_files": max_files}
+
+
+def _prune_backups(backup_dir: "Path", max_files: int) -> None:
+    """Conserva solo los `max_files` .bak más recientes en backup_dir."""
+    if max_files <= 0:
+        return
+    try:
+        baks = sorted(backup_dir.glob("*.bak"), key=lambda p: p.stat().st_mtime)
+        for old in baks[:-max_files]:
+            old.unlink(missing_ok=True)
     except Exception:
         pass
-    d = _Path.home() / ".oocode" / "backup"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
 
 
 def _builtin_backup_pre(tool_name: str, args: dict) -> Optional[dict]:
-    """Pre-hook: crea copia .bak en ~/.oocode/backup/ antes de modificar ficheros."""
+    """Pre-hook: crea copia .bak en el directorio de backups antes de modificar ficheros."""
     if not _is_modify_tool(tool_name):
+        return args
+    cfg = _load_backup_cfg()
+    if not cfg["enabled"]:
         return args
     paths: list[str] = []
     p = args.get("file_path") or args.get("path", "")
@@ -603,18 +632,23 @@ def _builtin_backup_pre(tool_name: str, args: dict) -> Optional[dict]:
             if isinstance(edit, dict) and edit.get("path"):
                 paths.append(edit["path"])
     pending = _backup_pending()
+    backup_dir = cfg["dir"]
+    made_backup = False
     for path in paths:
         try:
             from pathlib import Path as _Path
             src = _Path(path).expanduser().resolve()
-            if src.exists() and src.suffix.lower() in _BACKUP_EXTS:
-                backup_dir = _get_backup_dir()
+            if src.exists() and src.suffix.lower() in cfg["extensions"]:
+                backup_dir.mkdir(parents=True, exist_ok=True)
                 # Nombre único: <filename>.<ext>.bak (sobreescribe la versión anterior)
                 bak = backup_dir / (src.name + ".bak")
                 _shutil.copy2(src, bak)
                 pending[str(src)] = str(bak)
+                made_backup = True
         except Exception:
             pass
+    if made_backup:
+        _prune_backups(backup_dir, cfg["max_files"])
     return args
 
 
@@ -1759,7 +1793,6 @@ def _builtin_security_audit_log(tool_name: str, args: dict, result: str) -> Opti
         return None
 
     import datetime as _dt
-    import os as _os
     from pathlib import Path as _P
 
     log_path = _P.home() / ".oocode" / "logs" / "security_audit.log"

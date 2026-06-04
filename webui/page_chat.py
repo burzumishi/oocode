@@ -1,7 +1,7 @@
 """Blueprint /chat — TUI completo CSS+HTML+JS."""
 from flask import Blueprint
 
-from webui.helpers import _get_or_create_sid, _load_ooconfig
+from webui.helpers import _load_ooconfig
 from webui.templates import _render
 
 bp = Blueprint("page_chat", __name__)
@@ -46,14 +46,18 @@ body {{ overflow:hidden; }}
   70%  {{ opacity:1; transform:scale(1); }}
   100% {{ opacity:0; transform:scale(.95); }}
 }}
-/* Team / subagent bar */
+/* Team / subagent bar — SOLO cabecera de una línea (status, bajo el prompt).
+   El detalle por subagente (tarea/tools/texto) vive en su bloque en la conversación. */
 #tui-team-bar {{
   font-size: .73rem; color: #4fd6be;
-  padding: 2px 12px; background: rgba(20,70,60,.10);
+  padding: 3px 12px; background: rgba(20,70,60,.10);
+  border-top: 1px solid rgba(79,214,190,.10);
   border-bottom: 1px solid rgba(79,214,190,.10);
-  display: flex; align-items: center; gap: 5px; flex-wrap: wrap;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }}
-.team-agent {{ color: #cdd6f4; }}
+.team-hdr {{ color: #4fd6be; font-weight: 600; white-space: nowrap; }}
+.team-sub {{ color: #cdd6f4; }}
+.team-sub.done {{ color: #3a8a5a; }}
 .team-chat {{
   display: inline-block;
   animation: teamChatBlink .65s ease-in-out infinite alternate;
@@ -106,6 +110,18 @@ body {{ overflow:hidden; }}
 /* Override md-body inside subagent for smaller fonts */
 .tui-subagent-text.md-body {{ font-size:.83rem; color:#9aa3b0; }}
 .tui-subagent-text.md-body h1,.tui-subagent-text.md-body h2,.tui-subagent-text.md-body h3 {{ font-size:.88rem; }}
+/* Tarea del subagente — sembrada en su bloque de conversación al arrancar (subagent_start) */
+.tui-subagent-task {{
+  font-size:.8rem; color:#8a96a4; line-height:1.5;
+  padding:5px 10px 5px 10px;
+  border-bottom:1px dashed rgba(79,214,190,.12);
+}}
+.tui-subagent-task-label {{
+  display:inline-block; font-size:.64rem; font-weight:700;
+  color:#4fd6be; text-transform:uppercase; letter-spacing:.05em;
+  margin-right:6px;
+}}
+.tui-subagent-task.md-body p {{ margin:.2em 0; }}
 /* Preview text inside tool rows */
 .tui-tool-result {{
   display:block; color:#5a8fa8; font-size:.72rem; font-family:monospace;
@@ -146,27 +162,6 @@ body {{ overflow:hidden; }}
 .tui-ifc-dl.edited {{ background:#89b4fa; }}
 </style>
 <div class="tui-chat-wrap" id="tui-wrap">
-  <!-- Status header -->
-  <div class="tui-statusbar" id="tui-statusbar">
-    <span class="tui-sb-agent" id="sb-agent">🤖 OOCode</span>
-    <span class="tui-sb-sep">│</span>
-    <span class="tui-sb-model" id="sb-model">—</span>
-    <span class="tui-sb-sep">│</span>
-    <span class="tui-sb-ctx" id="sb-ctx">▱▱▱▱▱▱▱▱▱▱  0%</span>
-    <span id="sb-compact-hint" style="display:none;font-size:.68rem;margin-left:4px;font-weight:600"></span>
-    <span class="tui-sb-sep" id="sb-tasks-sep" style="display:none">│</span>
-    <span class="tui-sb-tasks" id="sb-tasks" style="display:none"></span>
-    <div class="tui-sb-right">
-      <span class="tui-sb-badge" id="sb-mcp"    title="Servidores MCP"    style="display:none">◎ MCP</span>
-      <span class="tui-sb-badge" id="sb-lsp"    title="LSP activo"        style="display:none">⟨⟩ LSP</span>
-      <span class="tui-sb-badge" id="sb-mem"    title="Memoria vectorial" style="display:none">⬡ MEM</span>
-      <span class="tui-sb-badge" id="sb-rag"    title="RAG indexado"      style="display:none">⬢ RAG</span>
-      <span class="tui-sb-badge" id="sb-embed"  title="Embeddings activos" style="display:none">◈ EMBED</span>
-      <span class="tui-sb-badge" id="sb-vision" title="Modelo con visión" style="display:none">👁 VIS</span>
-      <span class="tui-sb-badge elev-clickable" id="sb-elev" title="Click para cambiar permisos" onclick="cycleElevated()" style="display:none"></span>
-      <span id="sb-tokens" style="color:#334455;font-size:.72rem"></span>
-    </div>
-  </div>
   <!-- Agent selector row -->
   <div class="tui-agent-row">
     <label>Agente:</label>
@@ -192,6 +187,20 @@ body {{ overflow:hidden; }}
       </div>
     </div>
   </div>
+  <!-- Pensando — visible solo durante el turno activo, encima del prompt -->
+  <div id="tui-thinking-bar" style="display:none" class="tui-thinking-area">
+    <span class="tui-thinking-dot">●</span>
+    <span class="tui-thinking-word" id="tui-think-word">Cavilando</span>
+    <span class="tui-wave-bars">
+      <span class="tui-wave-bar"></span>
+      <span class="tui-wave-bar"></span>
+      <span class="tui-wave-bar"></span>
+      <span class="tui-wave-bar"></span>
+      <span class="tui-wave-bar"></span>
+      <span class="tui-wave-bar"></span>
+      <span class="tui-wave-bar"></span>
+    </span>
+  </div>
   <!-- Input -->
   <div class="tui-input-area">
     <div id="tui-pending-files" class="tui-pending-files" style="display:none"></div>
@@ -210,23 +219,35 @@ body {{ overflow:hidden; }}
       ⌘ Slash commands: /new &nbsp;/switch &lt;id&gt; &nbsp;/doctor &nbsp;/steer &nbsp;/compact &nbsp;/hooks &nbsp;/agents
     </div>
   </div>
-  <!-- Subagent team bar (visible cuando hay subagentes activos) -->
+  <!-- Subagent team bar (solo cabecera; el detalle va al bloque del subagente en la conversación) -->
   <div id="tui-team-bar" style="display:none"></div>
-  <!-- MCP/LSP detail rows (una línea cada uno) -->
+  <!-- Status bar (paridad con el toolbar del TUI: justo bajo el prompt y la team-bar, sobre MCP/LSP) -->
+  <div class="tui-statusbar" id="tui-statusbar" style="border-top:1px solid #1a2035;border-bottom:none">
+    <span class="tui-sb-agent" id="sb-agent">🤖 OOCode</span>
+    <span class="tui-sb-sep">│</span>
+    <span class="tui-sb-model" id="sb-model">—</span>
+    <span class="tui-sb-sep">│</span>
+    <span class="tui-sb-ctx" id="sb-ctx">▱▱▱▱▱▱▱▱▱▱  0%</span>
+    <span id="sb-compact-hint" style="display:none;font-size:.68rem;margin-left:4px;font-weight:600"></span>
+    <span class="tui-sb-sep" id="sb-tasks-sep" style="display:none">│</span>
+    <span class="tui-sb-tasks" id="sb-tasks" style="display:none"></span>
+    <div class="tui-sb-right">
+      <span class="tui-sb-badge" id="sb-mcp"    title="Servidores MCP"    style="display:none">◎ MCP</span>
+      <span class="tui-sb-badge" id="sb-lsp"    title="LSP activo"        style="display:none">⟨⟩ LSP</span>
+      <span class="tui-sb-badge" id="sb-mem"    title="Memoria vectorial" style="display:none">⬡ MEM</span>
+      <span class="tui-sb-badge" id="sb-rag"    title="RAG indexado"      style="display:none">⬢ RAG</span>
+      <span class="tui-sb-badge" id="sb-embed"  title="Embeddings activos" style="display:none">◈ EMBED</span>
+      <span class="tui-sb-badge" id="sb-vision" title="Modelo con visión" style="display:none">👁 VIS</span>
+      <span class="tui-sb-badge elev-clickable" id="sb-elev" title="Click para cambiar permisos" onclick="cycleElevated()" style="display:none"></span>
+      <span id="sb-tokens" style="color:#334455;font-size:.72rem"></span>
+    </div>
+  </div>
+  <!-- MCP/LSP detail rows (una línea cada uno, bajo la status bar — como en el toolbar del TUI) -->
   <div class="tui-bottom-bar tui-sb2" id="tui-sb2-mcp" style="display:none">
     <span id="sb-mcp-names" style="color:#00aacc"></span>
   </div>
   <div class="tui-bottom-bar tui-sb2" id="tui-sb2-lsp" style="display:none">
     <span id="sb-lsp-langs" style="color:#89b4fa"></span>
-  </div>
-  <!-- Bottom statusbar -->
-  <div class="tui-bottom-bar">
-    <span class="bb-agent" id="bb-agent">🤖</span>
-    <span class="bb-sep">│</span>
-    <span class="bb-model" id="bb-model">—</span>
-    <span class="bb-sep">│</span>
-    <span class="bb-ctx" id="bb-ctx">▱▱▱▱▱▱▱▱▱▱  0%</span>
-    <span class="bb-hint">Enter=enviar · Shift+Enter=salto · /chat para volver al TUI</span>
   </div>
 </div>
 
@@ -251,9 +272,20 @@ let _agentMdTimer   = null;   // debounce: renderizar markdown tras pausa de 350
 let _busyTimeout    = null;   // safety: re-enable if done event never arrives
 let _killed         = false;  // kill en progreso: ignorar eventos del turno anterior
 let _activePlanTask = '';     // texto de la tarea activa del plan (para el indicador Pensando)
+// Palabras inventadas para el indicador de pensamiento (como en el TUI)
+const _TW  = ["Cavilando","Cogitando","Ruminando","Elucubrando","Maquinando","Ponderando",
+               "Discurriendo","Deliberando","Neuroneando","Sinaptizando","Tokenizando",
+               "Vectorizando","Inferenciando","Transformeando","Embedizando","Prompteando",
+               "Tensorando","Gradientando","Sampliando","Decodificando","Atteneando",
+               "Softmaxeando","Backproneando","Halucineando"];
+const _TWM = ["Planificando","Organizando","Orquestando","Coordinando",
+              "Secuenciando","Estructurando","Implementando","Ejecutando"];
+let _thinkWordIdx   = 0;
+let _thinkWordTimer = null;
 let _inputHistory  = [];     // mensajes enviados en esta sesión (historial de input)
 let _historyIdx    = -1;     // -1 = posición actual (no en modo historia)
 let _historyDraft  = '';     // borrador guardado al entrar en modo historia
+let _pendingSessionReload = false;  // true tras enviar /session <id>: recarga la conversación al done
 
 // ── Auto-resize textarea ───────────────────────────────────────────────────
 function autoResize(el) {{
@@ -287,9 +319,19 @@ function handleEvent(ev) {{
   // Ignorar eventos del turno anterior tras un kill (excepto 'done' que confirma el fin)
   if (_killed && ev.type !== 'done' && ev.type !== 'status' && ev.type !== 'heartbeat') return;
 
+  // Auto-descubrir subagentes para la team-bar: cualquier evento tagged 'subagent'
+  // (tool_start/tool_done/text/status) alimenta su detalle, también los de team/fanout
+  // que no emiten subagent_start. El ctx% se captura de sus eventos 'status'.
+  if (ev.subagent && ev.subagent_name) {{
+    const _se = _ensureSubagentEntry(ev.subagent_name, ev.subagent_emoji || '🤖', '', null);
+    if (_se && ev.type === 'status' && 'context_pct' in ev) _se.ctx = ev.context_pct || 0;
+    renderTeamBar();
+  }}
+
   switch (ev.type) {{
     case 'connected':
       loadHistory();
+      loadInputHistory();   // recall de flecha arriba compartido con el TUI
       loadStatus(15);  // retry: loop may still be initializing
       break;
 
@@ -301,42 +343,31 @@ function handleEvent(ev) {{
 
     case 'thinking':
       _finishAgentMsg();
-      // Preservar label del preflight si ya hay spinner activo (thinking llega justo después de preflight)
+      // Preservar label actual si ya hay palabra visible
       (function() {{
-        const existingLabel = (function() {{
-          const el = document.getElementById('tui-thinking');
-          if (!el) return '';
-          const lbl = el.querySelector('.tui-thinking-label');
-          return lbl ? lbl.textContent : '';
-        }})();
+        const wordEl = document.getElementById('tui-think-word');
+        const bar = document.getElementById('tui-thinking-bar');
+        const existingLabel = (wordEl && bar && bar.style.display !== 'none')
+          ? wordEl.textContent : '';
         removeThinking();
         appendThinking(existingLabel || undefined);
       }})();
       break;
 
     case 'preflight':
-      // Actualiza el label del spinner "Pensando" con frase contextual
-      // sin rehacer el elemento (mantiene la animación fluida)
-      (function() {{
-        const el = document.getElementById('tui-thinking');
-        if (el) {{
-          const lbl = el.querySelector('.tui-thinking-label');
-          if (lbl) lbl.textContent = ev.label || 'Pensando';
-        }} else {{
-          // Si el spinner aún no existe (race condition), recrearlo con el label
-          appendThinking(ev.label || '');
-        }}
-      }})();
+      // Frase contextual de ESTADO → barra "Pensando" encima del prompt (status).
+      // appendThinking crea el spinner (#tui-think-word) si aún no existe y fija el label.
+      appendThinking(ev.label || undefined);
       break;
 
     case 'tool_start':
       if (ev.subagent) {{
         appendSubagentToolStart(ev.tool, ev.subagent_emoji || '🤖', ev.subagent_name || '');
       }} else {{
-        // Actualizar label del spinner con el tool activo; NO eliminar thinking
-        // (evita el parpadeo cuando llegan tools rápidas en secuencia)
-        const _tctx = ev.context ? '  ' + ev.context.substring(0, 50) : '';
-        _setThinkingLabel('◐ ' + (ev.tool || '') + _tctx);
+        // El detalle del tool va al BLOQUE de tools en la conversación. La barra
+        // "Pensando" del prompt es status: NO se sobreescribe con el nombre del tool
+        // (sigue ciclando palabras/preflight) — antes los títulos de tools "salían"
+        // en el prompt en vez de en la conversación.
         appendToolStart(ev.tool, ev.context || '');
       }}
       break;
@@ -402,12 +433,20 @@ function handleEvent(ev) {{
       break;
 
     case 'subagent_start':
-      _activeSubagents.push({{id: ev.agent_id || '', emoji: ev.agent_emoji || '🤖', name: ev.agent_name || ev.agent_id || ''}});
+      _ensureSubagentEntry(ev.agent_name || ev.agent_id || '', ev.agent_emoji || '🤖',
+                           ev.task || '', ev.agent_id || '');
+      // El detalle largo (tarea) va al bloque del subagente en la CONVERSACIÓN, no a la
+      // team-bar del status (que solo muestra la cabecera y no cabría en una línea).
+      _seedSubagentTask(ev.agent_emoji || '🤖', ev.agent_name || '', ev.task || '');
       renderTeamBar();
       break;
 
     case 'subagent_done':
-      _activeSubagents = _activeSubagents.filter(a => a.id !== (ev.agent_id || ''));
+      {{
+        const _aid = ev.agent_id || '';
+        const e = _activeSubagents.find(a => a.id === _aid || a.name === _aid);
+        if (e) e.status = 'done';
+      }}
       renderTeamBar();
       break;
 
@@ -416,6 +455,7 @@ function handleEvent(ev) {{
       _activePlanTask = '';  // limpiar tarea activa al terminar el turno
       _planBlockTurn  = -1;
       _activeSubagents = [];  // limpiar equipo al terminar el turno
+      if (_teamTimer) {{ clearInterval(_teamTimer); _teamTimer = null; }}
       renderTeamBar();
       // Guardar si hubo contenido ANTES de que _finishAgentMsg limpie _agentBuf
       const _hadContent = _turnHadContent;
@@ -425,6 +465,13 @@ function handleEvent(ev) {{
       removeThinking();
       updateStatus(ev);
       setBusy(false);
+      // Si el turno fue un /session que restauró una sesión en el servidor,
+      // re-renderizar la conversación restaurada (reemplaza la vista actual).
+      if (_pendingSessionReload) {{
+        _pendingSessionReload = false;
+        loadHistory();
+        break;
+      }}
       // Fallback: solo mostrar ev.response si no hubo streaming/texto este turno
       if (ev.response && !_hadContent) {{
         appendAgentBlock(ev.response);
@@ -432,8 +479,25 @@ function handleEvent(ev) {{
       break;
     }}
 
+    case 'inference_done':
+      // El turno terminó: mostrar mensaje de finalización de inferencia (como en TUI)
+      if (_agentDiv) {{
+        const body = _agentDiv.querySelector('.tui-msg-body');
+        if (body) {{
+          const currentText = body.innerHTML;
+          if (!currentText.endsWith('\\n⚡ Inferencia completada.')) {{
+            body.innerHTML = currentText + '\\n⚡ Inferencia completada.';
+          }}
+        }}
+      }}
+      // También limpiar la barra de pensando si aún está visible
+      removeThinking();
+      break;
+
     case 'status':
-      updateStatus(ev);
+      // Los status tagged 'subagent' alimentan su ctx% en la team-bar (hook de arriba),
+      // NO la barra principal — si no, el ctx del subagente pisaría el del agente.
+      if (!ev.subagent) updateStatus(ev);
       break;
 
     case 'error':
@@ -480,12 +544,13 @@ function _getOrCreateToolBlock() {{
 
   const header = document.createElement('div');
   header.className = 'tui-tool-block-header';
+  // El header muestra ⎿/◐ + resumen compacto (igual que TUI)
   header.innerHTML =
     '<span class="tui-tool-block-icon running" id="tb-icon-' + _turnId + '">◐</span>'
     + '<span class="tui-tool-block-summary" id="tb-sum-' + _turnId + '">Ejecutando…</span>'
-    + '<span class="tui-tool-block-toggle" id="tb-tog-' + _turnId + '">▲ Ocultar</span>';
+    + '<span class="tui-tool-block-toggle" id="tb-tog-' + _turnId + '">▼</span>';
   header.onclick = () => _toggleToolBlock(wrapper);
-  // El bloque comienza EXPANDIDO; se colapsa automáticamente al terminar el turno
+  // El bloque comienza EXPANDIDO para ver las filas mientras corren
   wrapper.classList.add('expanded');
 
   const inner = document.createElement('div');
@@ -508,8 +573,7 @@ function _getOrCreateToolBlock() {{
 function _toggleToolBlock(wrapper) {{
   const expanded = wrapper.classList.toggle('expanded');
   const tog = wrapper.querySelector('.tui-tool-block-toggle');
-  if (tog) tog.textContent = expanded ? '▲ Ocultar' : '▼ Ver';
-  // Sincronizar texto del toggle en subbloque de subagente si aplica
+  if (tog) tog.textContent = expanded ? '▲' : '▼';
 }}
 
 function _updateToolBlockHeader(tool, running) {{
@@ -519,17 +583,18 @@ function _updateToolBlockHeader(tool, running) {{
   if (!sumEl) return;
   if (running) {{
     const n = _toolTotalCount;
+    // Mientras corre: ◐ nombre_tool (+ N más)
     sumEl.textContent = tool + (n > 1 ? '  +' + (n-1) + ' más' : '');
     if (iconEl) {{ iconEl.className = 'tui-tool-block-icon running'; iconEl.textContent = '◐'; }}
   }} else {{
-    // Deduplicar: "Read · Read · Read" → "Read (+3)"
+    // Deduplicar: "Read · Read · Read" → "Read (+3)" — idéntico al TUI _make_compact_summary
     const counts = {{}};
     for (const t of _toolNames) counts[t] = (counts[t] || 0) + 1;
     const unique = Object.keys(counts);
-    const shown  = unique.slice(0, 5);
+    const shown  = unique.slice(0, 6);
     const extra  = unique.length - shown.length;
     const names  = shown.map(t => counts[t] > 1 ? t + ' (+' + counts[t] + ')' : t).join('  ·  ')
-                   + (extra > 0 ? '  +' + extra : '');
+                   + (extra > 0 ? '  ·  +' + extra : '');
     const count  = _toolDoneCount;
     sumEl.textContent = names || (count + ' herramienta' + (count !== 1 ? 's' : ''));
     if (iconEl) {{ iconEl.className = 'tui-tool-block-icon'; iconEl.textContent = '⎿'; }}
@@ -537,15 +602,15 @@ function _updateToolBlockHeader(tool, running) {{
 }}
 
 function _finishToolBlock() {{
-  // Al terminar el turno: colapsar quitando .expanded y marcar .done
+  // Al terminar: mostrar ⎿ summary y colapsar las filas de detalle (como en TUI)
   if (_toolBlockWrapper && _toolBlockTurn >= 0) {{
     _updateToolBlockHeader('', false);
     const iconEl = document.getElementById('tb-icon-' + _toolBlockTurn);
     if (iconEl) {{ iconEl.className = 'tui-tool-block-icon'; iconEl.textContent = '⎿'; }}
-    _toolBlockWrapper.classList.remove('expanded');  // ← colapsa el inner y file cards
+    _toolBlockWrapper.classList.remove('expanded');  // colapsa inner y file cards
     _toolBlockWrapper.classList.add('done');
     const tog = document.getElementById('tb-tog-' + _toolBlockTurn);
-    if (tog) tog.textContent = '▼ Ver';
+    if (tog) tog.textContent = '▼';
   }}
   _toolBlockWrapper = null;
   _toolBlockInner   = null;
@@ -562,11 +627,13 @@ function appendToolStart(tool, ctx) {{
 
   const row = document.createElement('div');
   row.className = 'tui-tool';
-  const ctxStr = ctx ? '<span class="tui-tool-ctx">  ' + _esc(ctx.substring(0,70)) + '</span>' : '';
-  row.innerHTML = '<span class="tui-tool-icon" style="color:#0088aa">◐</span>'
-    + '<span class="tui-tool-name" style="color:#4499bb">' + _esc(tool) + '</span>'
+  // Estilo TUI: │  ◐ tool: ctx …
+  const ctxStr = ctx ? '<span class="tui-tool-ctx">' + _esc(ctx.substring(0,70)) + '</span>' : '';
+  row.innerHTML = '<span class="tui-tool-pipe">│  </span>'
+    + '<span class="tui-tool-icon running">◐</span>'
+    + '<span class="tui-tool-name"> ' + _esc(tool) + ':</span>'
     + ctxStr
-    + '<span style="color:#336677;margin-left:6px;font-size:.76rem">…</span>';
+    + '<span class="tui-running-dots"> …</span>';
   row.dataset.tool = tool;
   row.dataset.pending = '1';
   inner.appendChild(row);
@@ -577,7 +644,10 @@ function appendToolDone(tool, ctx, ok, nLines, preview) {{
   const inner = (_toolBlockInner && _toolBlockInner.isConnected) ? _toolBlockInner : _getOrCreateToolBlock();
   _toolDoneCount++;
   _toolNames.push(tool);
-  _updateToolBlockHeader(tool, false);
+  // Solo actualizar el header si no hay tools en ejecución (para no mostrar el resumen de tools completadas)
+  if (_toolTotalCount <= 0) {{
+    _updateToolBlockHeader(tool, false);
+  }}
 
   // Buscar la fila pending de esta tool
   let row = null;
@@ -591,14 +661,16 @@ function appendToolDone(tool, ctx, ok, nLines, preview) {{
     inner.appendChild(row);
   }}
   row.dataset.pending = '0';
+  // Estilo TUI: │  ⎿ tool: ctx   o   │  ✗ tool
   const sym    = ok ? '⎿' : '✗';
-  const symCol = ok ? '#00cc66' : '#f38ba8';
-  const ctxStr = ctx ? '  <span class="tui-tool-ctx">' + _esc(ctx.substring(0,55)) + '</span>' : '';
-  const nlStr  = nLines > 1 ? '<span class="tui-tool-nlines">' + nLines + 'l</span>' : '';
-  row.innerHTML = '<span style="color:' + symCol + ';width:14px;flex-shrink:0">' + sym + '</span>'
-    + '<span class="tui-tool-name" style="color:' + (ok?'#00cc66':'#f38ba8') + '">' + _esc(tool) + '</span>'
+  const symCls = ok ? 'ok' : 'err';
+  const ctxStr = ctx ? '<span class="tui-tool-ctx"> ' + _esc(ctx.substring(0,55)) + '</span>' : '';
+  const nlStr  = nLines > 1 ? ' <span class="tui-tool-nlines">' + nLines + 'l</span>' : '';
+  row.innerHTML = '<span class="tui-tool-pipe">│  </span>'
+    + '<span class="tui-tool-icon ' + symCls + '">' + sym + '</span>'
+    + '<span class="tui-tool-name"> ' + _esc(tool) + '</span>'
     + ctxStr + nlStr;
-  // Línea de preview bajo la fila si hay resultado útil
+  // Preview bajo la fila si hay resultado útil
   if (preview && preview.length > 1 && ok) {{
     const prev = document.createElement('span');
     prev.className = 'tui-tool-result';
@@ -606,8 +678,8 @@ function appendToolDone(tool, ctx, ok, nLines, preview) {{
     row.appendChild(prev);
   }}
   scrollBottom();
-  // Actualizar label del spinner a "Pensando" sin recrearlo (evita parpadeo)
-  if (_busy) _setThinkingLabel('Pensando');
+  // Reanudar cycling de palabras (como TUI entre tools)
+  if (_busy) _resumeThinkingWords();
 }}
 
 function _fileIcon(name) {{
@@ -713,23 +785,26 @@ function appendPlan(tasks, n, summary, extra) {{
   d.className = 'tui-plan-block';
   d.dataset.planTurn = _turnId;
   _planBlockTurn = _turnId;
-  d.style.cssText = 'margin-bottom:12px;padding:8px 12px;border-left:3px solid #bb66ff;'
-    + 'background:rgba(187,102,255,.06);border-radius:0 6px 6px 0;';
-  let html = '<div data-plan-header style="color:#bb66ff;font-size:.8rem;font-weight:bold;margin-bottom:4px">'
-    + '◈  Plan de ejecución  <span data-plan-stats style="color:#556677;font-weight:normal">[1/' + n + ']'
-    + '  · 0 completadas · ' + (n-1) + ' pendientes</span></div>';
+  // Estilo TUI plano: ◈ Plan de ejecución  [1/N · N-1 pendientes]
+  let html = '<div data-plan-header class="tui-plan-header">'
+    + '<span class="tui-plan-icon">◈</span>'
+    + '  Plan de ejecución  '
+    + '<span data-plan-stats class="tui-plan-stats">[1/' + n + ' · ' + (n-1) + ' pendientes]</span>'
+    + '</div>';
   if (summary) {{
-    html += '<div style="color:#556677;font-size:.78rem;font-style:italic;margin-bottom:6px">'
-      + _esc(summary) + '</div>';
+    html += '<div class="tui-plan-summary">' + _esc(summary) + '</div>';
   }}
-  html += '<div data-plan-tasks style="display:flex;flex-direction:column;gap:3px">';
+  html += '<div data-plan-tasks class="tui-plan-tasks">';
   tasks.forEach((t, i) => {{
-    html += '<div data-task-idx="' + i + '" style="color:#667788;font-size:.82rem">  '
-      + '<span style="color:#445566">◻</span>  '
-      + _esc(t) + '</div>';
+    const isFirst = i === 0;
+    const cls  = isFirst ? 'active' : 'pending';
+    const sym  = isFirst ? '◼' : '◻';
+    html += '<div data-task-idx="' + i + '" class="tui-plan-task ' + cls + '">'
+      + '<span class="tui-task-sym">' + sym + '</span>'
+      + '  ' + _esc(t) + '</div>';
   }});
   if (extra > 0) {{
-    html += '<div style="color:#445566;font-size:.78rem">  … +' + extra + ' más</div>';
+    html += '<div class="tui-plan-extra">  … +' + extra + ' más</div>';
   }}
   html += '</div>';
   d.innerHTML = html;
@@ -738,14 +813,9 @@ function appendPlan(tasks, n, summary, extra) {{
 }}
 
 function updatePlanProgress(done, total, activeIdx, activeText, tasks) {{
-  // Guardar tarea activa para el indicador Pensando
+  // Guardar tarea activa para el indicador Pensando en la barra de estado
   _activePlanTask = (activeText && activeIdx < total) ? activeText : '';
-  // Actualizar el indicador Pensando si está visible
-  const thinkEl = document.getElementById('tui-thinking');
-  if (thinkEl && _activePlanTask) {{
-    const lbl = thinkEl.querySelector('.tui-thinking-label');
-    if (lbl) lbl.textContent = 'Tarea ' + (done + 1) + '/' + total + ': ' + _activePlanTask;
-  }}
+  // Si hay thinking activo, el siguiente ciclo usará _TWM automáticamente
   // Encontrar el bloque de plan del turno actual
   const block = document.querySelector('.tui-plan-block[data-plan-turn="' + _planBlockTurn + '"]');
   if (!block) return;
@@ -757,36 +827,34 @@ function updatePlanProgress(done, total, activeIdx, activeText, tasks) {{
     statsEl.textContent = '[' + cur + '/' + total + ']'
       + '  · ' + done + ' completadas · ' + pending + ' pendientes';
   }}
-  // Actualizar estado visual de cada tarea
+  // Actualizar estado visual de cada tarea — mismos símbolos que TUI: ✔/◼/◻
   const taskEls = block.querySelectorAll('[data-task-idx]');
   taskEls.forEach(el => {{
     const idx = parseInt(el.dataset.taskIdx);
     if (tasks && tasks[idx]) {{
       const status = tasks[idx].status;
-      const sym = el.querySelector('span');
+      const sym = el.querySelector('.tui-task-sym');
       if (status === 'done') {{
-        el.style.color = '#3a7a4a';
-        if (sym) {{ sym.textContent = '✓'; sym.style.color = '#3a7a4a'; }}
+        el.className = 'tui-plan-task done';
+        if (sym) sym.textContent = '✔';
       }} else if (status === 'active') {{
-        el.style.color = '#bb99ff';
-        if (sym) {{ sym.textContent = '◈'; sym.style.color = '#bb66ff'; }}
+        el.className = 'tui-plan-task active';
+        if (sym) sym.textContent = '◼';
       }} else {{
-        el.style.color = '#445566';
-        if (sym) {{ sym.textContent = '◻'; sym.style.color = '#334455'; }}
+        el.className = 'tui-plan-task pending';
+        if (sym) sym.textContent = '◻';
       }}
     }}
   }});
-  // Si todas las tareas completadas → cabecera en verde "Plan completado"
+  // Si todas completadas → ✔ Plan completado (verde, como TUI)
   if (done >= total && total > 0) {{
     const hdrEl = block.querySelector('[data-plan-header]');
     if (hdrEl) {{
-      hdrEl.style.color = '#3a7a4a';
-      hdrEl.innerHTML = '✓  Plan completado  '
-        + '<span data-plan-stats style="color:#2a5a3a;font-weight:normal">'
-        + '[' + total + '/' + total + '] · todas completadas</span>';
+      hdrEl.className = 'tui-plan-header done';
+      hdrEl.innerHTML = '<span class="tui-plan-icon done">✔</span>'
+        + '  Plan completado  '
+        + '<span data-plan-stats class="tui-plan-stats">[' + total + '/' + total + ' · todas completadas]</span>';
     }}
-    block.style.borderLeftColor = '#3a7a4a';
-    block.style.background = 'rgba(58,122,74,.06)';
   }}
 }}
 
@@ -804,11 +872,8 @@ function _mdToHtml(md) {{
     codeBlocks.push({{ lang: lang || '', code }});
     return '\\x00CODE' + idx + '\\x00';
   }});
-  // 2. Escapar HTML en el texto normal
-  s = s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  // 2.5. Proteger rutas de fichero ANTES de bold/italic para evitar que
-  //       los guiones bajos en nombres como "report_2026_final.docx" sean
-  //       interpretados como marcadores de cursiva.
+  // 2. Proteger rutas de fichero ANTES de escapar HTML (evita que _ en nombres como "report_2026_final.docx"
+  //       sean interpretados como marcadores de cursiva)
   const _FILE_EXT = 'docx|xlsx|pptx|pdf|csv|txt|py|js|ts|jsx|tsx|json|yaml|yml|sh|md|zip|gz|png|jpg|jpeg|svg|odt|ods|odp';
   const _FILE_RE  = new RegExp("((?:/home|/tmp|/root)[^\\\\s<>\\"'`]{{1,200}}\\.(" + _FILE_EXT + "))(?=[\\\\s<>\\"'`.,;:)\\\\]!?]|$)", 'gi');
   const filePaths = [];
@@ -817,6 +882,8 @@ function _mdToHtml(md) {{
     filePaths.push(path);
     return '\\x00FILE' + idx + '\\x00';
   }});
+  // 3. Escapar HTML en el texto normal
+  s = s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   // 3. Restaurar bloques de código con highlighting
   s = s.replace(/\\x00CODE(\\d+)\\x00/g, (_, i) => {{
     const b = codeBlocks[parseInt(i)];
@@ -885,98 +952,96 @@ function _mdToHtml(md) {{
 }}
 
 // ── Message rendering ──────────────────────────────────────────────────────
+// Muestra la línea "Pensando" encima del prompt con barras verticales ondulantes
 function appendThinking(overrideLabel) {{
   if (_streamEndTimer) {{ clearTimeout(_streamEndTimer); _streamEndTimer = null; }}
-  removeThinking();
-  const msgs = document.getElementById('tui-messages');
-  const d = document.createElement('div');
-  d.className = 'tui-thinking';
-  d.id = 'tui-thinking';
-  const label = overrideLabel || (_activePlanTask
-    ? 'Tarea: ' + _activePlanTask
-    : 'Pensando');
-  d.innerHTML = '<span class="tui-thinking-sym">●</span>'
-    + '<span class="tui-thinking-label">' + _esc(label) + '</span>'
-    + '<span class="tui-thinking-wave">'
-    + '<span class="tui-thinking-bar"></span>'
-    + '<span class="tui-thinking-bar"></span>'
-    + '<span class="tui-thinking-bar"></span>'
-    + '<span class="tui-thinking-bar"></span>'
-    + '<span class="tui-thinking-bar"></span>'
-    + '<span class="tui-thinking-bar"></span>'
-    + '<span class="tui-thinking-bar"></span>'
-    + '</span>';
-  msgs.appendChild(d);
-  // "Pensando" siempre debe ser visible: si el usuario está cerca del fondo, bajar
-  if (_scrollPinned) msgs.scrollTop = msgs.scrollHeight;
+  const bar = document.getElementById('tui-thinking-bar');
+  if (bar) bar.style.display = '';
+  if (overrideLabel) {{
+    _setThinkingLabel(overrideLabel);
+    return;
+  }}
+  // Ciclar palabras inventadas
+  if (_thinkWordTimer) clearInterval(_thinkWordTimer);
+  const words = _activePlanTask ? _TWM : _TW;
+  const wordEl = document.getElementById('tui-think-word');
+  if (wordEl) wordEl.textContent = words[_thinkWordIdx % words.length];
+  _thinkWordTimer = setInterval(() => {{
+    _thinkWordIdx = (_thinkWordIdx + 1) % _TW.length;
+    const w = _activePlanTask ? _TWM : _TW;
+    const l = document.getElementById('tui-think-word');
+    if (l) l.textContent = w[_thinkWordIdx % w.length];
+  }}, 1500);
 }}
 
 function removeThinking() {{
   if (_streamEndTimer) {{ clearTimeout(_streamEndTimer); _streamEndTimer = null; }}
-  const el = document.getElementById('tui-thinking');
-  if (el) el.remove();
+  if (_thinkWordTimer) {{ clearInterval(_thinkWordTimer); _thinkWordTimer = null; }}
+  const bar = document.getElementById('tui-thinking-bar');
+  if (bar) bar.style.display = 'none';
 }}
 
-// Mueve el nodo "Pensando" al último hijo de tui-messages (llamar tras cada appendChild al contenedor)
-function _pinThinkingToBottom() {{
-  const msgs = document.getElementById('tui-messages');
-  const el = document.getElementById('tui-thinking');
-  if (el && msgs && msgs.lastChild !== el) msgs.appendChild(el);
-}}
+// No-op: la barra de pensando siempre está encima del prompt
+function _pinThinkingToBottom() {{}}
 
-// Actualiza el label del spinner en lugar de recrearlo (evita parpadeo entre tools)
+// Muestra label de tool específico (detiene el cycling de palabras)
 function _setThinkingLabel(label) {{
-  const el = document.getElementById('tui-thinking');
-  if (el) {{
-    const lbl = el.querySelector('.tui-thinking-label');
-    if (lbl) {{ lbl.textContent = label; return; }}
-  }}
-  if (_busy) appendThinking(label);
+  if (_thinkWordTimer) {{ clearInterval(_thinkWordTimer); _thinkWordTimer = null; }}
+  const el = document.getElementById('tui-think-word');
+  if (el) el.textContent = label;
+}}
+
+// Reanuda el cycling de palabras (tras tool_done, entre tools)
+function _resumeThinkingWords() {{
+  if (!_busy || _thinkWordTimer) return;
+  const words = _activePlanTask ? _TWM : _TW;
+  const el = document.getElementById('tui-think-word');
+  if (el) el.textContent = words[_thinkWordIdx % words.length];
+  _thinkWordTimer = setInterval(() => {{
+    _thinkWordIdx = (_thinkWordIdx + 1) % words.length;
+    const l = document.getElementById('tui-think-word');
+    if (l) l.textContent = words[_thinkWordIdx % words.length];
+  }}, 1500);
 }}
 
 function _agentHdr(streaming) {{
-  // Header del mensaje de agente con nombre real desde config
-  const dot = '<span class="tui-msg-agent-dot' + (streaming ? ' streaming' : '') + '">●</span>';
-  return '<div class="tui-msg-hdr">' + dot + ' ' + _esc(_agentName) + '</div>';
+  // Estilo TUI: solo ● pulsante, sin header separado
+  return '<span class="tui-dot' + (streaming ? ' streaming' : '') + '">●</span>';
 }}
 
 function appendAgentText(text) {{
   _turnHadContent = true;
   _agentBuf += ((_agentBuf && !_agentBuf.endsWith('\\n')) ? '\\n' : '') + text;
   if (!_agentDiv) {{
-    // Auto-continue: si hay un bloque de tools activo, cerrarlo antes de
-    // crear el nuevo bubble para que el texto aparezca DESPUÉS de las tools.
     if (_toolBlockWrapper) _finishToolBlock();
     _agentDiv = document.createElement('div');
     _agentDiv.className = 'tui-msg tui-msg-agent';
+    // Estilo TUI: ● (dot) + body en flex-row
     _agentDiv.innerHTML = _agentHdr(false) + '<div class="tui-msg-body md-body"></div>';
     document.getElementById('tui-messages').appendChild(_agentDiv);
     _pinThinkingToBottom();
   }}
-  // text events son frases completas — renderizar como markdown directamente
   const body = _agentDiv.querySelector('.tui-msg-body');
   body.className = 'tui-msg-body md-body';
   body.innerHTML = _mdToHtml(_agentBuf);
   scrollBottom();
-  // Mantener "Pensando" al fondo si el agente sigue procesando (sin parpadeo)
-  if (_busy) _setThinkingLabel('Pensando');
+  if (_busy) _resumeThinkingWords();
 }}
 
 function appendStreamChunk(text) {{
   _turnHadContent = true;
   _agentBuf += text;
   if (!_agentDiv) {{
-    // Auto-continue: si hay un bloque de tools activo, cerrarlo antes de crear
-    // el nuevo bubble para que cada iteración texto→tools quede en orden correcto.
     if (_toolBlockWrapper) _finishToolBlock();
     _agentDiv = document.createElement('div');
     _agentDiv.className = 'tui-msg tui-msg-agent';
+    // Estilo TUI: ● streaming + body en flex-row
     _agentDiv.innerHTML = _agentHdr(true) + '<div class="tui-msg-body tui-streaming"></div>';
     document.getElementById('tui-messages').appendChild(_agentDiv);
     _pinThinkingToBottom();
   }} else {{
-    // Asegurar que el dot pulse mientras llegan tokens
-    const dot = _agentDiv.querySelector('.tui-msg-agent-dot');
+    // Mantener ● pulsante durante el streaming
+    const dot = _agentDiv.querySelector('.tui-dot');
     if (dot) dot.classList.add('streaming');
   }}
   const body = _agentDiv.querySelector('.tui-msg-body');
@@ -1002,7 +1067,9 @@ function appendStreamChunk(text) {{
   if (_busy) {{
     _streamEndTimer = setTimeout(() => {{
       _streamEndTimer = null;
-      if (_busy && !document.getElementById('tui-thinking')) appendThinking();
+      // Mostrar "Pensando" solo si la barra está oculta (no pisar un label visible).
+      const _tb = document.getElementById('tui-thinking-bar');
+      if (_busy && (!_tb || _tb.style.display === 'none')) appendThinking();
     }}, 200);
   }}
 }}
@@ -1050,6 +1117,20 @@ function _ensureSubBuf(emoji, name) {{
     }};
   }}
   return _subBufs[key];
+}}
+
+// Siembra la tarea del subagente como primera línea de su bloque (conversación).
+// Crea el bloque si no existe; idempotente por subagente.
+function _seedSubagentTask(emoji, name, task) {{
+  if (!name || !task) return;
+  const entry = _ensureSubBuf(emoji, name);
+  if (entry._taskSeeded) return;
+  entry._taskSeeded = true;
+  const d = document.createElement('div');
+  d.className = 'tui-subagent-task md-body';
+  d.innerHTML = '<span class="tui-subagent-task-label">Tarea</span>' + _mdToHtml(task);
+  entry.div.insertBefore(d, entry.div.firstChild);
+  scrollBottom();
 }}
 
 function appendSubagentText(text, emoji, name) {{
@@ -1219,10 +1300,10 @@ function appendSubagentPlan(tasks, n, summary, emoji, name) {{
 }}
 
 function _finishAgentMsg() {{
-  // Cancelar el debounce de markdown si hay un timer pendiente
   if (_agentMdTimer) {{ clearTimeout(_agentMdTimer); _agentMdTimer = null; }}
   if (_agentDiv) {{
-    const dot = _agentDiv.querySelector('.tui-msg-agent-dot');
+    // Detener pulsado del ● al finalizar el mensaje
+    const dot = _agentDiv.querySelector('.tui-dot');
     if (dot) dot.classList.remove('streaming');
     // Render final: si el body aún está en plain text (respuesta muy corta), convertir ahora
     if (_agentBuf) {{
@@ -1271,7 +1352,7 @@ function appendAgentBlock(text) {{
   scrollBottom();
 }}
 
-function appendUserMsg(text, isSlash) {{
+function appendUserMsg(text, isSlash, images) {{
   const msgs = document.getElementById('tui-messages');
   const d = document.createElement('div');
   d.className = 'tui-msg tui-msg-user';
@@ -1281,7 +1362,29 @@ function appendUserMsg(text, isSlash) {{
   }} else {{
     d.innerHTML = '<div class="tui-msg-hdr">▶ Tú</div><div class="tui-msg-body"></div>';
   }}
-  d.querySelector('.tui-msg-body').textContent = text;
+  
+  // Construir el contenido del mensaje
+  const bodyEl = d.querySelector('.tui-msg-body');
+  
+  // Añadir texto del mensaje
+  bodyEl.textContent = text;
+  
+  // Añadir imágenes adjuntas si las hay
+  if (images && images.length > 0) {{
+    images.forEach((img, idx) => {{
+      const imgEl = document.createElement('img');
+      imgEl.src = img;
+      imgEl.alt = 'Imagen adjunta';
+      imgEl.style.maxWidth = '100%';
+      imgEl.style.maxHeight = '400px';
+      imgEl.style.objectFit = 'contain';
+      imgEl.style.margin = '12px 0';
+      imgEl.style.borderRadius = '4px';
+      imgEl.style.border = '1px solid rgba(0,180,240,.3)';
+      bodyEl.appendChild(imgEl);
+    }});
+  }}
+  
   msgs.appendChild(d);
   scrollBottom();
 }}
@@ -1322,17 +1425,53 @@ function flashEmbed(op) {{
 }}
 
 // ── Subagent team bar ──────────────────────────────────────────────────────
+// Cada subagente: {{id, emoji, name, task, startTs, status:'running'|'done', ctx}}
 let _activeSubagents = [];
+let _teamTimer = null;
+
+function _startTeamTimer() {{
+  if (_teamTimer) return;
+  _teamTimer = setInterval(() => {{
+    if (!_activeSubagents.some(a => a.status === 'running')) {{
+      clearInterval(_teamTimer); _teamTimer = null;
+    }}
+    renderTeamBar();
+  }}, 1000);
+}}
+
+// Crea/actualiza la entrada de un subagente (auto-descubre los de team/fanout, que
+// no emiten subagent_start). Empareja por nombre, estable en todos los paths.
+function _ensureSubagentEntry(name, emoji, task, id) {{
+  if (!name) return null;
+  let e = _activeSubagents.find(a => a.name === name);
+  if (!e) {{
+    e = {{id: id || name, emoji: emoji || '🤖', name: name,
+          task: task || '', startTs: Date.now(), status: 'running', ctx: 0}};
+    _activeSubagents.push(e);
+    _startTeamTimer();
+  }} else {{
+    if (task && !e.task) e.task = task;
+    if (emoji && e.emoji === '🤖') e.emoji = emoji;
+    if (id && (!e.id || e.id === e.name)) e.id = id;
+  }}
+  return e;
+}}
+
 function renderTeamBar() {{
   const el = document.getElementById('tui-team-bar');
   if (!el) return;
   if (!_activeSubagents.length) {{ el.style.display = 'none'; return; }}
-  const me = (_agentEmoji || '🤖') + ' ' + (_agentName || 'OOCode');
+  // SOLO cabecera de una línea (status). Formato: «📋 Main 💬 💻 Sub · N subagente(s)».
+  // La tarea/tools/texto del subagente viven en su bloque en la conversación.
+  const me   = (_agentEmoji || '🤖') + ' ' + (_agentName || 'OOCode');
   const subs = _activeSubagents.map(a =>
-    '<span class="team-agent">' + _esc(a.emoji) + ' ' + _esc(a.name) + '</span>'
-  ).join(' <span style="color:#334455">·</span> ');
-  el.innerHTML = '<span class="team-agent">' + _esc(me) + '</span>'
-    + ' <span class="team-chat">💬</span> ' + subs;
+    '<span class="team-sub ' + a.status + '">'
+    + (a.status === 'done' ? '✓ ' : '')
+    + _esc(a.emoji) + ' ' + _esc(a.name) + '</span>'
+  ).join('  ·  ');
+  el.innerHTML = '<span class="team-hdr">' + _esc(me)
+    + ' <span class="team-chat">💬</span> ' + subs
+    + ' · ' + _activeSubagents.length + ' subagente(s)</span>';
   el.style.display = '';
 }}
 
@@ -1360,19 +1499,16 @@ function updateStatus(ev) {{
     const emoji = ev.agent_emoji || _agentEmoji || '🤖';
     const name  = ev.agent_name  || _agentName  || 'OOCode';
     document.getElementById('sb-agent').textContent = emoji + ' ' + name;
-    document.getElementById('bb-agent').textContent = emoji;
   }}
   if ('model' in ev) {{
     const model = (ev.model || '—').replace(/:latest$/, '');
     document.getElementById('sb-model').textContent = model;
-    document.getElementById('bb-model').textContent = model;
   }}
 
   // Context bar — solo si el evento trae context_pct
   // Formato: "ctx: ▰▰▱▱▱▱▱▱▱▱ 20%  ↻ cerca" (idéntico al TUI)
   if ('context_pct' in ev) {{
   const ctxEl   = document.getElementById('sb-ctx');
-  const ctxElBB = document.getElementById('bb-ctx');
   const pct    = ev.context_pct || 0;
   const thrPct = ev.compact_threshold_pct || 80;
   const hint   = ev.compact_hint || '';
@@ -1382,7 +1518,6 @@ function updateStatus(ev) {{
   const _barTxt  = 'ctx: ' + _barStr + ' ' + pct + '%';
   const ctxCls   = pct >= thrPct ? ' crit' : pct >= thrPct - 20 ? ' warn' : '';
   if (ctxEl)   {{ ctxEl.textContent   = _barTxt; ctxEl.className   = 'tui-sb-ctx' + ctxCls; }}
-  if (ctxElBB) {{ ctxElBB.textContent = _barTxt; ctxElBB.className = 'bb-ctx' + ctxCls; }}
   }} // end context_pct guard
 
   // Tasks—solo si el evento trae task_total
@@ -1514,13 +1649,28 @@ async function loadHistory() {{
       return;
     }}
     for (const h of hist) {{
-      if (h.role === 'user')      appendUserMsg(h.text, (h.text||'').startsWith('/'));
+      const imgs = h.images || [];
+      if (h.role === 'user')      appendUserMsg(h.text, (h.text||'').startsWith('/'), imgs);
       else if (h.role === 'assistant') appendAgentBlock(h.text);
     }}
     _forceScrollBottom();  // Tras cargar historial, bajar al fondo
   }} catch(e) {{
     msgs.innerHTML = '<div style="color:#334455;font-size:.8rem;padding:10px 0;text-align:center">Nueva sesión — escribe tu primer mensaje</div>';
   }}
+}}
+
+// Carga el historial de input del prompt (flecha arriba) COMPARTIDO con el TUI
+// (~/.oocode/history). Así el recall sobrevive a recargas y coincide con el TUI.
+async function loadInputHistory() {{
+  try {{
+    const r = await fetch('/api/chat/input_history?limit=200');
+    const d = await r.json();
+    if (Array.isArray(d.history)) {{
+      _inputHistory = d.history;
+      _historyIdx   = -1;
+      _historyDraft = '';
+    }}
+  }} catch(e) {{ /* sin historial compartido: se usa el de la sesión en curso */ }}
 }}
 
 // ── File attach & vision ──────────────────────────────────────────────────
@@ -1652,9 +1802,15 @@ async function killAgent() {{
   el.textContent = '↯ Turno interrumpido.';
   msgs.appendChild(el);
   scrollBottom();
-  // Notificar al backend en segundo plano (no esperamos la respuesta para el UX)
+  // Notificar al backend (kill all: turno + subagentes/equipos + scheduler + wip).
   try {{
-    await fetch('/api/chat/kill', {{method:'POST'}});
+    const r = await fetch('/api/chat/kill', {{method:'POST'}});
+    const j = await r.json();
+    const parts = [];
+    if (j.subagents) parts.push(j.subagents + ' subagente(s)/equipo(s)');
+    if (j.jobs)      parts.push(j.jobs + ' jobs deshabilitados');
+    if (j.wip)       parts.push(j.wip + ' tareas wip→todo');
+    if (parts.length) el.textContent = '↯ Kill all — ' + parts.join('  ·  ') + '.';
   }} catch(e) {{}}
 }}
 
@@ -1676,8 +1832,12 @@ async function sendMsg() {{
   inp.value = '';
   inp.style.height = 'auto';
 
+  // Preparar imágenes para enviar
+  const imgPaths = _pendingFiles.filter(f => f.type === 'image').map(f => f.previewUrl || f.path);
   const isSlash = text.startsWith('/');
-  appendUserMsg(text, isSlash);
+  // /session <id> restaura una sesión en el servidor → re-renderizar al terminar el turno
+  _pendingSessionReload = /^\/session\s+\S/.test(text);
+  appendUserMsg(text, isSlash, imgPaths);
 
   // Nuevo turno: incrementar ID, resetear kill flag, limpiar estado anterior
   _turnId++;
@@ -1692,7 +1852,6 @@ async function sendMsg() {{
 
   // Include pending images for vision models
   const payload = {{message: text, agent_id: _agentId}};
-  const imgPaths = _pendingFiles.filter(f => f.type === 'image').map(f => f.path);
   if (imgPaths.length) payload.images = imgPaths;
 
   // Clear pending files before sending
@@ -1835,15 +1994,28 @@ async function loadSessionsList() {{
 }}
 async function loadSession(sessionId, evt) {{
   if (evt) evt.stopPropagation();
+  if (_busy) {{ showToast('El agente está procesando — espera a que termine', false); return; }}
   closeSessionsPanel();
-  // Mostrar mensaje informativo
-  const msgs = document.getElementById('tui-messages');
-  const d = document.createElement('div');
-  d.style.cssText = 'background:#0a1020;border:1px solid #1e2d45;border-radius:6px;padding:10px 14px;margin:8px 0;font-size:.82rem;color:#556677;';
-  d.innerHTML = '<span style="color:#89b4fa">📚 Sesión ' + sessionId.slice(0,8) + '</span>'
-    + ' — Sesión del historial seleccionada. Para continuar una sesión pasada, usa <code style="color:#00e5ff">/session ' + sessionId.slice(0,8) + '</code> en el chat.';
-  msgs.appendChild(d);
-  scrollBottom();
+  try {{
+    const r = await fetch('/api/chat/load_session', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ session_id: sessionId, agent_id: _agentId }}),
+    }});
+    const d = await r.json();
+    if (!r.ok || d.error) {{
+      showToast('✗ No se pudo restaurar: ' + (d.error || 'error'), false);
+      return;
+    }}
+    // Restaurada en el servidor (contexto + sess.history) → re-renderizar conversación
+    _finishAgentMsg();
+    _finishToolBlock();
+    removeThinking();
+    await loadHistory();
+    showToast('📚 Sesión ' + sessionId.slice(0,8) + ' restaurada (' + (d.count || 0) + ' mensajes)', true);
+  }} catch(e) {{
+    showToast('✗ Error de red restaurando sesión: ' + e.message, false);
+  }}
 }}
 
 // ── Scroll pin detector ────────────────────────────────────────────────────

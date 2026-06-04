@@ -284,8 +284,8 @@ class TestXmlMalformedRetry(unittest.TestCase):
         # El retry específico para non-EOF debe estar presente
         self.assertIn("xml_malformed_retry", src)
         self.assertIn("not _is_eof_truncation", src)
-        # Debe hacer una segunda llamada a client.chat
-        self.assertIn("resp2", src)
+        # Debe hacer una segunda llamada al backend (chat_sync o resp2/_r2)
+        self.assertTrue("_r2" in src or "chat_sync" in src)
 
     def test_xml_retry_logs_warning(self):
         """La rama de retry logea xml_malformed_retry."""

@@ -103,7 +103,7 @@ def _get_or_create_sid() -> str:
 
 # ── Tamaño legible ────────────────────────────────────────────────────────────
 
-def _human_size(n: int) -> str:
+def _human_size(n: int | float) -> str:
     for unit in ("B", "KB", "MB", "GB"):
         if n < 1024:
             return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"

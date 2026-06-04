@@ -395,6 +395,36 @@ class TestCmdMcpToggle(unittest.TestCase):
             printed = " ".join(str(a) for a, _ in mc.print.call_args_list)
             self.assertIn("nope", printed)
 
+    def test_enable_bundled_devops_updates_json(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            cfg_file = Path(td) / "oocode.json"
+            cfg_file.write_text(json.dumps(
+                {"mcp": {"servers": [], "devopsAssistant": {"enabled": False}}}
+            ))
+            from ui.commands import _cmd_mcp_toggle
+            with _mocked_console(), patch("agent.mcp_manager._CONFIG_FILE", cfg_file):
+                _cmd_mcp_toggle("devops-assistant", True, None)
+            data = json.loads(cfg_file.read_text())
+            self.assertTrue(data["mcp"]["devopsAssistant"]["enabled"])
+
+    def test_enable_bundled_updates_config_attr(self):
+        import tempfile
+        from unittest.mock import MagicMock, patch
+        with tempfile.TemporaryDirectory() as td:
+            cfg_file = Path(td) / "oocode.json"
+            cfg_file.write_text(json.dumps(
+                {"mcp": {"servers": [], "databaseAssistant": {"enabled": False}}}
+            ))
+            fake_config = MagicMock()
+            fake_config.mcp_database_assistant_enabled = False
+            fake_loop = MagicMock()
+            fake_loop.config = fake_config
+            from ui.commands import _cmd_mcp_toggle
+            with _mocked_console(), patch("agent.mcp_manager._CONFIG_FILE", cfg_file):
+                _cmd_mcp_toggle("database-assistant", True, None, fake_loop)
+            self.assertTrue(fake_config.mcp_database_assistant_enabled)
+
 
 # ── _cmd_mcp (dispatch principal) ────────────────────────────────────────────
 
@@ -461,7 +491,7 @@ class TestCmdMcpDispatch(unittest.TestCase):
             loop = self._make_loop()
             with _mocked_console():
                 _cmd_mcp("enable my-srv", loop)
-            m.assert_called_once_with("my-srv", True, None)
+            m.assert_called_once_with("my-srv", True, None, loop)
 
     def test_dispatch_disable(self):
         with patch("ui.commands._cmd_mcp_toggle") as m:
@@ -469,15 +499,16 @@ class TestCmdMcpDispatch(unittest.TestCase):
             loop = self._make_loop()
             with _mocked_console():
                 _cmd_mcp("disable my-srv", loop)
-            m.assert_called_once_with("my-srv", False, None)
+            m.assert_called_once_with("my-srv", False, None, loop)
 
-    def test_no_args_no_pool_shows_hint(self):
+    def test_no_args_no_pool_shows_bundled_table(self):
         from ui.commands import _cmd_mcp
         loop = self._make_loop()
         with _mocked_console() as mc:
             _cmd_mcp("", loop)
+        # With no pool, bundled table is still shown
         printed = " ".join(str(a) for a, _ in mc.print.call_args_list)
-        self.assertIn("catalog", printed.lower())
+        self.assertTrue(len(printed) > 0)  # something was printed
 
     def test_reload_with_pool(self):
         from ui.commands import _cmd_mcp
@@ -521,14 +552,54 @@ class TestCmdMcpDispatch(unittest.TestCase):
         loop = self._make_loop()
         mock_pool = MagicMock()
         mock_pool.status.return_value = [
-            {"name": "test-srv", "cmd": "echo", "alive": True,
-             "tools": 3, "resources": 0, "prompts": 0, "error": ""},
+            {"name": "oocode-assistant", "cmd": "python3 oocode_assistant.py",
+             "alive": True, "tools": 53, "resources": 21, "prompts": 32, "error": ""},
+            {"name": "devops-assistant", "cmd": "python3 devops_assistant.py",
+             "alive": True, "tools": 66, "resources": 4, "prompts": 3, "error": ""},
+            {"name": "test-ext-srv", "cmd": "npx test", "alive": True,
+             "tools": 5, "resources": 0, "prompts": 0, "error": ""},
         ]
-        mock_pool.client_count = 1
-        mock_pool.tool_count   = 3
+        mock_pool.client_count = 3
+        mock_pool.tool_count   = 124
         loop._mcp_pool = mock_pool
         with _mocked_console():
-            _cmd_mcp("", loop)  # no crash
+            _cmd_mcp("", loop)  # no crash — shows bundled table + external table
+
+    def test_status_shows_all_bundled_servers(self):
+        """Todos los bundled aparecen en /mcp aunque estén desactivados."""
+        from ui.commands import _cmd_mcp
+        loop = self._make_loop()
+        # No pool → todos los bundled se muestran como disabled/○
+        with _mocked_console() as mc:
+            _cmd_mcp("", loop)
+        # Table is rendered — check via print calls (Rich Table is passed as arg)
+        self.assertTrue(mc.print.called)
+
+    def test_status_disabled_bundled_shown(self):
+        """database-assistant y http-client-assistant aparecen como disabled."""
+        from ui.commands import _cmd_mcp
+        loop = self._make_loop()
+        mock_cfg = MagicMock()
+        mock_cfg.mcp_oocode_assistant_enabled = True
+        mock_cfg.mcp_system_assistant_enabled = True
+        mock_cfg.mcp_devops_assistant_enabled = True
+        mock_cfg.mcp_database_assistant_enabled = False
+        mock_cfg.mcp_home_office_assistant_enabled = False
+        mock_cfg.mcp_security_assistant_enabled = False
+        mock_cfg.mcp_iot_assistant_enabled = False
+        mock_cfg.mcp_http_client_assistant_enabled = False
+        loop.config = mock_cfg
+        # With pool running only the enabled ones
+        mock_pool = MagicMock()
+        mock_pool.status.return_value = [
+            {"name": "oocode-assistant", "cmd": "p", "alive": True,
+             "tools": 53, "resources": 21, "prompts": 32, "error": ""},
+        ]
+        mock_pool.client_count = 1
+        mock_pool.tool_count = 53
+        loop._mcp_pool = mock_pool
+        with _mocked_console():
+            _cmd_mcp("", loop)  # no crash, shows disabled bundled servers too
 
 
 # ── Integración con handle_slash ──────────────────────────────────────────────

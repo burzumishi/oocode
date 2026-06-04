@@ -3,11 +3,9 @@
 Extraído de agent/loop.py para mantener loop.py manejable.
 Importar desde aquí directamente o a través de agent.loop (re-exporta todo).
 """
-import json
 import os
 import re
 import random
-import time
 import threading
 
 _SPINNER_FRAMES    = ["○", "◌", "◎", "◉", "●", "◉", "◎", "◌"]
@@ -21,6 +19,17 @@ _ANIM_JOIN_TIMEOUT     = 0.5   # segundos máximos de espera para unirse al hilo
 
 # Número máximo de tareas que _detect_tasks extrae de un plan y plan_create muestra
 _MAX_PLAN_TASKS = 12
+
+# Tools de orquestación de subagentes/equipos: tienen concurrencia interna propia
+# (spawn_background + join) y rendering especial que solo funciona en la rama
+# secuencial del dispatch (header ● [emoji nombre]: tarea, streaming │, spinner de
+# color del subagente). NUNCA deben ejecutarse dentro del ThreadPoolExecutor
+# paralelo: si se batchean con otras tools su output queda "encerrado" en el bloque
+# anterior y colisiona en el live block del padre. Su presencia fuerza modo
+# secuencial en _turn_dispatch_tools.
+_ORCHESTRATION_TOOLS = frozenset({
+    "spawn_subagent", "spawn_fanout", "create_team", "run_team", "explore",
+})
 
 # Umbral de ratio bash/total para activar el aviso de sobreuso (>40% = problema)
 _BASH_OVERUSE_RATIO = 0.4
@@ -99,6 +108,19 @@ _PF_GREETING_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ── Patrón de ARRANQUE EN FRÍO (saludo/reinicio a mitad de tarea) ────────────
+# Detecta cuando el agente, tras haber usado tools (p.ej. descargar un PDF),
+# responde como si la conversación empezara de cero ("¡Hola! Veo que has
+# compartido…", "¿en qué puedo ayudarte?"). Se usa para reorientarlo a la tarea.
+_COLD_START_RE = re.compile(
+    r'(^\s*(¡?\s*hola\b|hello\b|hi\b|buenas\b|saludos\b))'
+    r'|veo que (?:has|me has) (?:compartido|enviado|subido|adjuntado|pasado)'
+    r'|¿\s*en qu[eé] (?:puedo|te puedo) (?:ayud|asist)'
+    r'|¿\s*qu[eé] (?:necesitas|deseas|quieres|te gustar[ií]a)'
+    r'|¿\s*c[oó]mo (?:puedo|te) (?:ayud|asist)',
+    re.IGNORECASE,
+)
+
 # ── Patrones de ACCIÓN (qué va a hacer el agente) ────────────────────────────
 # Lista ordenada de (clave, patrón). Se puntúan TODOS (findall); gana el de mayor score.
 # Posición importa en empates: primero = mayor prioridad.
@@ -121,7 +143,9 @@ _PF_DOMAINS: list[tuple[str, str]] = [
     ("docker",   r'\b(docker|container|contenedor|imagen\s+docker|compose|dockerfile)\b'),
     ("git",      r'\b(git\b|commit|branch|rama\b|merge|diff\b|historial\s+git|stash|push\b|pull\b|rebase|tag\b)\b'),
     ("tests",    r'\b(test\b|tests\b|pytest|jest|mocha|cobertura|coverage|unit\s+test|suite\s+de\s+pruebas|pruebas?\b)\b'),
-    ("docs",     r'\b(plantilla|template|documento|word\b|excel\b|pdf\b|informe|report\b|presentaci[oó]n|docx|xlsx|pptx|word\b)\b'),
+    ("docs",     r'\b(plantilla|template|documento|word\b|excel\b|pdf\b|informe|report\b|presentaci[oó]n|docx|xlsx|pptx|word\b|hoja\s+de\s+c[aá]lculo)\b'),
+    ("web",      r'\b(web\b|crawl|crawler|scrap\w*|fetch|url\b|p[aá]gina\s+web|noticias?|feed\b|rss\b|sitio\s+web|navega\w*|investig\w*|research)\b'),
+    ("data",     r'\b(datos|data\b|sql\b|consulta\s+sql|base\s+de\s+datos|database|csv\b|m[eé]trica|estad[ií]stic\w*|dataset|tabla\s+de\s+datos)\b'),
     ("deploy",   r'\b(despliega|deploy|despliegue|kubernetes|k8s|nginx|aws|gcp|azure|ci\b|cd\b|pipeline|infraestructura)\b'),
     ("config",   r'\b(configuraci[oó]n|config\b|settings\b|oocode\.json|\.json\b|\.yaml\b|\.toml\b|\.ini\b|parámetro)\b'),
     ("lsp",      r'\b(lsp\b|s[ií]mbolo|symbol|diagn[oó]stico|diagnostic|definici[oó]n|referencia|autocompletado|clangd|pylsp|gopls)\b'),
@@ -159,10 +183,10 @@ _PF_PHRASES: dict[tuple[str, str | None], list[str]] = {
                           "Inspeccionando los paquetes — déjame localizar el problema…"],
 
     # EXPLAIN ─────────────────────────────────────────────────────────────────
-    ("explain", None):   ["Déjame leer el código para explicarte esto en detalle…",
+    ("explain", None):   ["Déjame revisarlo para explicarte esto en detalle…",
                           "Voy a analizarlo bien para responderte con la mayor precisión…",
                           "Ahora mismo lo estudio para explicarte cómo funciona…",
-                          "Leyendo el módulo — quiero entenderlo bien antes de explicarte…"],
+                          "Reuniendo el contexto — quiero entenderlo bien antes de explicarte…"],
     ("explain", "code"): ["Voy a leer el módulo para explicarte cómo funciona…",
                           "Déjame analizar ese código — luego te explico con detalle…",
                           "Estudiando la implementación para explicarte la lógica interna…"],
@@ -179,9 +203,9 @@ _PF_PHRASES: dict[tuple[str, str | None], list[str]] = {
     ("explain", "iot"):  ["Voy a revisar la configuración del dispositivo para explicarte cómo funciona…"],
 
     # SEARCH ──────────────────────────────────────────────────────────────────
-    ("search", None):    ["Voy a rastrear eso en el proyecto — enseguida te digo lo que encuentro…",
+    ("search", None):    ["Voy a rastrear eso — enseguida te digo lo que encuentro…",
                           "Buscando ahora mismo — te cuento todo lo que encuentre…",
-                          "Déjame explorar el código — ahora mismo te digo dónde está…",
+                          "Déjame explorar — ahora mismo te digo dónde está…",
                           "Voy a buscarlo — enseguida te tengo una respuesta…"],
     ("search", "code"):  ["Voy a rastrear ese símbolo en el código — dame un segundo…",
                           "Buscando en el repositorio — enseguida te digo dónde está…",
@@ -277,6 +301,26 @@ _PF_PHRASES: dict[tuple[str, str | None], list[str]] = {
     ("update", "deploy"):["Voy a actualizar la configuración de despliegue…"],
     ("update", "git"):   ["Voy a actualizar la rama — revisando el estado actual del repositorio…"],
     ("update", "iot"):   ["Voy a actualizar la configuración del dispositivo — déjame revisarla…"],
+
+    # WEB / investigación ───────────────────────────────────────────────────────
+    ("search", "web"):   ["Voy a rastrear eso en la web — enseguida te traigo lo que encuentre…",
+                          "Buscando fuentes online — te resumo lo relevante en un momento…"],
+    ("create", "web"):   ["Voy a recopilar la información de la web y estructurarla — dame un momento…",
+                          "Preparando la extracción — me pongo a recoger los datos ya…"],
+    ("explain", "web"):  ["Voy a consultar las fuentes para explicarte esto con precisión…"],
+    ("review", "web"):   ["Voy a revisar las fuentes y contrastarlas — dame un momento…"],
+
+    # DATA / análisis ─────────────────────────────────────────────────────────
+    ("search", "data"):  ["Voy a consultar los datos — enseguida te digo qué encuentro…"],
+    ("explain", "data"): ["Voy a explorar los datos y su esquema para explicártelo…"],
+    ("review", "data"):  ["Voy a analizar los datos en detalle — dame un momento…",
+                          "Revisando el conjunto de datos — te traigo las cifras enseguida…"],
+    ("create", "data"):  ["Voy a preparar la consulta/transformación — déjame ver el esquema primero…"],
+
+    # OFICINA / documentos (dominio 'docs') ──────────────────────────────────
+    ("explain", "docs"): ["Voy a revisar el documento para explicarte su contenido…"],
+    ("review", "docs"):  ["Voy a revisar el documento en detalle — dame un momento…",
+                          "Inspeccionando el documento — déjame leerlo entero primero…"],
 }
 
 
@@ -361,8 +405,10 @@ def _pick_file_switch_phrase(basename: str) -> str:
 # Estilos _sfmt para el ◈ pulsante en modo Multitarea (se ciclan con fi)
 _MULTI_ICON_STYLES = ["task-active", "status-phrase", "compact-bar", "status-bar-ok", "status-hint-near"]
 
-# Bloqueo global de compactación: evita saturar el LLM con múltiples resúmenes simultáneos
-_COMPACT_LOCK = threading.Lock()
+# H: Semáforo de compactación — permite hasta 2 compactaciones simultáneas.
+# Con Lock() todos los subagentes se serializaban; Semaphore(2) permite que dos
+# avancen en paralelo mientras los demás esperan, sin saturar el LLM con N llamadas.
+_COMPACT_LOCK = threading.Semaphore(2)
 
 _DONE_WORDS = [
     # Españolas reales
@@ -575,9 +621,10 @@ def _hint_styled(cpct: int, thresh_pct: int) -> str:
     return ""
 
 
-# Header mínimo: solo lo que no está en el mini-context del workspace
+# Header mínimo: SOLO datos factuales. La identidad y el rol del agente los
+# aporta el bloque "## Agente" del workspace (resumen de IDENTITY.md/SOUL.md).
+# No hardcodear aquí ningún rol ("asistente de programación", etc.).
 SYSTEM_HEADER = """\
-Eres {agent_name}, asistente de programación local con Ollama.
 Fecha: {today}
 Directorio del proyecto (CWD): {project_dir}
 IMPORTANTE: el código del proyecto está en el CWD. `~/.oocode/workspace/` contiene solo identidad/memoria del agente, NO código del proyecto.
@@ -665,16 +712,34 @@ _TOOL_GROUPS: dict[str, frozenset] = {
         "search_todos", "run_quick_check", "list_recent_files", "read_project_file",
     }),
     "office": frozenset({
+        # Email / calendario / notas / contactos
         "email_list", "email_read", "email_send", "email_search",
-        "doc_convert", "pdf_extract_text", "doc_word_count",
-        "xlsx_read", "xlsx_write", "csv_analyze",
         "cal_list", "cal_add", "cal_search",
         "notes_list", "notes_search", "notes_save",
-        "image_to_text", "contact_search", "markdown_to_html",
-        "doc_read_template_fields", "doc_fill_template", "doc_list_templates",
-        "doc_create_rfc", "xlsx_fill_range", "xlsx_append_row", "xlsx_create_report",
+        "image_to_text", "contact_search",
+        # Word — creación y edición nativa O365
+        "doc_create", "doc_create_from_template", "doc_create_rfc",
+        "doc_add_content_block", "doc_apply_style", "doc_set_table_style",
+        "doc_set_page_layout", "doc_add_header_footer", "doc_add_toc",
+        "set_paragraph_format", "apply_document_theme", "doc_embed_image",
+        "insert_chart", "doc_read", "doc_update_section", "doc_version_bump",
+        "doc_convert", "pdf_extract_text", "doc_word_count", "doc_compare",
+        "doc_extract_metadata",
+        # Plantillas corporativas
+        "doc_read_template_fields", "doc_fill_template",
+        "doc_fill_corporate_template", "doc_list_templates",
+        # Excel nativo
+        "xlsx_read", "xlsx_write", "xlsx_fill_range", "xlsx_append_row",
+        "xlsx_create_report", "xlsx_create_table", "xlsx_insert_chart",
+        "xlsx_apply_conditional_format", "apply_cell_formatting",
+        "xlsx_freeze_panes", "xlsx_set_column_width", "xlsx_merge_cells",
+        "xlsx_add_sheet", "xlsx_protect_sheet", "xlsx_add_data_validation",
+        "csv_analyze",
+        # PowerPoint nativo
+        "pptx_create", "pptx_create_from_template", "pptx_add_slide",
+        "pptx_insert_chart", "pptx_add_notes", "pptx_set_background", "pptx_read",
+        # Proyecto / CMDB / activos
         "project_context_read", "project_init_office", "doc_project_save",
-        "doc_read", "doc_update_section", "doc_version_bump",
         "cmdb_search", "cmdb_update", "asset_register_add",
     }),
     "security": frozenset({
@@ -775,168 +840,180 @@ SYSTEM_RULES = """\
 
 | Necesidad | ✅ USA | ❌ NO |
 |-----------|--------|-------|
-| Leer fichero | `read_file(path, offset=N, limit=M)` | `bash cat/head/tail/sed -n` |
+| Leer fichero | `read_file(path, offset=N, limit=M)` | `bash cat/head/tail` |
+| Fichero >__LARGE_FILE_LINES__ líneas | `code_outline(path)` luego `read_sections(path, ['fn'])` | `read_file` sin offset |
 | Comparar ficheros | `diff_files(a, b)` | `bash diff` |
-| Tests | `run_tests(path)` | `bash pytest / npm test` |
-| Estructura fichero | `code_outline(path)` **— OBLIGATORIO antes de editar ficheros >1000 líneas** | `read_file` con múltiples offsets |
-| Leer secciones | `read_sections(path, ['Clase.metodo', 'funcion'])` **— OBLIGATORIO para ficheros >1000 líneas** | `read_file(offset=N)` × N |
-| Buscar en código | `grep_code` / `multi_grep(patterns=[…])` | `bash grep -rn` |
-| Buscar símbolo | `lsp_workspace_symbols(q, path)` o `symbol_lookup` | `bash grep -rn` |
-| Impacto de cambio | `affected_files(symbol, directory)` | `grep_code` + leer cada fichero |
-| Callers/callees | `lsp_call_hierarchy(path, line)` | `bash grep -rn función` |
+| Tests | `run_tests(path)` | `bash pytest/npm test` |
+| Buscar código | `grep_code` / `multi_grep(patterns=[…])` | `bash grep -rn` |
+| Buscar símbolo | `lsp_workspace_symbols(q,path)` o `symbol_lookup` | `bash grep -rn` |
+| Impacto cambio | `affected_files(symbol, dir)` | grep+leer×N |
+| Callers/callees | `lsp_call_hierarchy(path, line)` | `bash grep -rn fn` |
 | Comparar código | `code_compare(a, b, symbol)` | grep+read×2 |
-| grep con filtros | `grep_code(exclude_pattern=, count_only=, files_with_matches=, files_without_matches=)` | `bash grep|grep -v` |
-| Buscar ficheros | `find_file` / `find_files` / `find_dir` | `bash find -name` |
-| Listar directorio | `ls_dir` | `bash ls -la` |
-| Info fichero | `file_stat` | `bash wc -l / stat` |
+| Buscar ficheros | `find_file` / `find_files` / `find_dir` | `bash find` |
+| Listar dir | `ls_dir` | `bash ls -la` |
 | Editar fichero | `edit_file` / `regex_replace` / `smart_replace` | `bash sed -i` |
-| Editar múltiples | `bulk_replace` / `edit_files` | `bash sed -i` en bucle |
+| Editar varios | `bulk_replace` / `edit_files` | sed en bucle |
 | Crear fichero | `write_file` | `bash cat > f <<'EOF'` |
-| Python puntual | `python_exec(code=…, workdir=…)` | `bash python3 -c/<<'EOF'` |
-| Índice símbolos | `find_symbol` / `list_symbols` / `extract_functions` | `bash ctags` |
+| Python puntual | `python_exec(code=…)` | `bash python3 -c` |
 | Git | `git_status/diff/add/commit/log/branch/stash` | `bash git …` |
-| Docker/compose | `docker_ps/logs/exec/inspect` / `compose_up/down/logs/exec/…` | `bash docker …` |
-| Copiar a container | `docker_cp(src=…, dst=…)` | `bash docker cp` |
-| Compilar | `make_run` | `bash make/gcc/cc` |
-| Linting | `lint_file` / `lint_project` | `bash ruff/mypy/…` |
-| Paquetes Python | `pip_tool(action='install', packages=[…])` | `bash pip install` |
-| Paquetes Node | `npm_tool(action='install', packages=[…])` | `bash npm install` |
+| Docker/compose | `docker_ps/logs/exec/inspect` · `compose_up/down/logs/exec/…` | `bash docker …` |
+| Compilar/linting | `make_run` · `lint_file` · `lint_project` | `bash make/ruff` |
+| Paquetes | `pip_tool(action='install',packages=[…])` · `npm_tool(…)` | `bash pip/npm` |
 | Debug | `strace_run` / `gdb_run` / `pdb_run` / `valgrind_run` | `bash strace/gdb` |
 
-`bash` = ÚLTIMO RECURSO — solo si ninguna tool de la tabla lo cubre.
+`bash` = ÚLTIMO RECURSO — solo si ninguna tool anterior lo cubre.
 
-## Planificación autónoma — OBLIGATORIA para tareas complejas
+## Planificación
 
-**Para cualquier consulta que implique ≥3 pasos distintos** (exploración + implementación + verificación, o múltiples ficheros, o varias fases): ANTES de ejecutar NINGUNA herramienta, emite un plan detallado en texto para que el usuario pueda revisarlo.
+Clasifica antes de actuar:
 
-**Formato del plan detallado (≥3 pasos o replanificación):**
-```
-Plan:
-1. [Acción]: [qué harás exactamente] — ficheros: [rutas exactas] — tools: [tools que usarás]
-2. [Acción]: [cambios concretos] — ficheros: [rutas] — riesgo: [si puede romper algo]
-...
-```
-Si hay bloqueadores o decisiones no claras, añade al final:
-`⚠ REQUIERE REVISIÓN: [descripción — decisión de diseño, dependencia faltante, riesgo alto]`
-El sistema pausa y espera al usuario. Sin ese marcador, continúa automáticamente.
-El usuario puede intervenir en cualquier momento con `/steer` o `/subagents steer`.
+| Nivel | Cuándo | Cómo |
+|-------|--------|------|
+| 1 — Directo | ≤2 ficheros, acción predecible | 1 frase + tools |
+| 2 — Pasos | 3-5 pasos secuenciales, mismo dominio | Lista en texto antes de la 1ª tool |
+| 3 — Panel | ≥3 módulos no relacionados · scope indefinido · refactor transversal · >1 auto-continue | Plan en texto → `plan_create` → `task_done()` por tarea |
+| 4 — Paralelo | ≥2 partes independientes (Nivel 3) | `spawn_fanout` (mismo dominio) · `spawn_subagent` (tareas separadas) · `create_team` (dominios distintos) |
 
-**Flujo de planificación con `plan_create`:**
-1. Emite el plan en texto (formato arriba) — SIN llamar tools aún.
-2. Llama `plan_create(tasks=["Tarea 1: …", "Tarea 2: …", ...], summary="Qué vas a hacer")`.
-   ⚠ REGLA CRÍTICA: `plan_create` debe ser la ÚNICA herramienta en ese turno.
-   NUNCA mezcles `plan_create` con herramientas de tarea (edit_file, read_file, etc.)
-   en el mismo bloque de tool_calls. El panel visual se muestra limpio entre el
-   resumen ⎿ del turno anterior y el siguiente ●.
-3. En el siguiente mensaje anuncia "Tarea 1: descripción breve" como primera frase
-   y llama las herramientas de esa tarea.
-4. Llama `task_done()` al completar cada tarea — avanza el marcador ✔/◼/◻.
-   ⚠ OBLIGATORIO: tras cada `spawn_subagent` o `explore` que complete una tarea,
-   llama `task_done()` EN EL MISMO turno o en el inmediatamente siguiente.
-5. Al terminar TODAS, di "He completado todas las tareas." como primera frase.
+**Nivel 3 — flujo `plan_create`:**
+1. Emite plan en texto (ANTES de tools): `Plan:\n1. [Acción] — ficheros: [rutas] — tools: [tools]\n2. …`
+2. Llama `plan_create(tasks=[…], summary="…")` — ÚNICA tool del turno.
+3. Por cada tarea: anuncia "Tarea N: descripción" → tools → `task_done()`.
+4. Al terminar TODAS: primera frase = `"__DONE_PHRASE__"`
+- Bloqueo: emite `⚠ REQUIERE REVISIÓN: [descripción]` → el sistema pausa.
+- Replanificación: anuncia `"Replanificación:"` → `plan_create([…])` → `workspace_remember(note="Aprendizaje: …")`. No cambies de estrategia silenciosamente.
 
-**Replanificación:** si durante la ejecución descubres que el plan original es incorrecto o incompleto:
-1. Anuncia `"Replanificación:"` seguido del nuevo plan antes de cambiar de estrategia.
-2. Llama `plan_create(tasks=[...])` para actualizar el panel visual con las nuevas tareas.
-3. Llama `workspace_remember(note="Aprendizaje: [descripción del problema] → [solución adoptada]")` para documentar el problema en OOCODE.md y evitar repetirlo en futuras sesiones.
-No cambies de estrategia silenciosamente.
-
-**Alternativa ligera (solo texto, sin panel):** si la tarea tiene exactamente 2 pasos o es puramente exploratoria, una frase de anuncio basta.
-
-**Evaluación de paralelismo — EVALÚA SIEMPRE antes de ejecutar:**
-Cuando el usuario proporciona ≥2 tareas en una sola solicitud, evalúa su independencia:
-
-| Situación | Estrategia |
-|-----------|------------|
-| Tareas sin dependencias entre sí | `spawn_subagent` × N en paralelo (cada una en su hilo) |
-| Mismo problema dividido en N partes (módulo A + B + C) | `spawn_fanout(agent_id, task_chunks=[…])` — mismo agente × N chunks |
-| Tareas en dominios distintos (código + docs + web) | `create_team` → `run_team`: agentes especializados (ver IDs disponibles en el schema de la tool) |
-| Tarea principal + exploración intensiva | Subagente para exploración, hilo principal para implementación |
-| Tareas con orden estricto (A→B→C) | Secuencial en el hilo principal, sin subagentes |
-| Análisis read-only de múltiples ficheros | `explore` para mapear arquitectura antes de modificar |
-
-**Cuándo usar subagente (`spawn_subagent`):**
-- Proyecto muy grande: exploración exhaustiva de codebase mientras el hilo principal prepara el plan.
-- Tareas completamente independientes que no comparten estado (ej. explorar fichero A y explorar fichero B simultáneamente).
-
-**Cuándo usar fanout (`spawn_fanout`):**
-- Mismo dominio, mismo agente, problema fragmentado: analizar módulo A + B + C en paralelo, buscar vulnerabilidades en src/auth/ + src/db/ + src/api/, revisar tests de varios paquetes.
-- Flujo: `spawn_fanout(agent_id="<agente>", task_chunks=["Analiza A", "Analiza B", "Analiza C"])` → combina hallazgos.
-
-**Cuándo usar equipo (`create_team` + `run_team`):**
-- ≥2 dominios distintos (código + documentación + web + ofimática) en paralelo con agentes especializados.
-- Flujo: `create_team(team_id="my-team", subtasks=[{"description": "...", "assign_to": "<agente>"}, ...])` → `run_team(team_id="my-team")` → sintetiza.
-
-**Cuándo NO usar subagente:** edición de ficheros, tests, implementación — hazlo directamente con las tools.
+**Nivel 4 — cuándo usar cada herramienta:**
+- `spawn_fanout`: mismo dominio, N chunks independientes del mismo agente (1 llamada → N en paralelo real).
+- `spawn_subagent`: UNA tarea aislada con estado separado. Llámalo SOLO en su propio turno — nunca en el mismo lote que `read_file`/`grep_code`/otras tools (rompe el render del subagente). Para N tareas en paralelo usa `spawn_fanout` o `create_team`, no N×`spawn_subagent`.
+- `create_team` + `run_team`: ≥2 dominios distintos con agentes especializados (paralelo real).
+- ANTES de `create_team`/`run_team`/`spawn_fanout`: anuncia al usuario en 1 frase la composición y el reparto ("Monto un equipo: [agente A] → [parte], [agente B] → [parte]"). El usuario debe saber quién hace qué y por qué.
+- DESPUÉS de `run_team`/`spawn_fanout`: SINTETIZA para el usuario qué aportó cada agente (combina hallazgos, destaca lo completado, menciona errores) ANTES de `task_done()`. Nunca cierres con `task_done()` silencioso saltándote la síntesis.
+- `task_done()` (con plan activo) va DESPUÉS de la síntesis, no en lugar de ella.
+- NO usar subagente para: editar ficheros, tests, implementación directa.
 
 ## Flujo de trabajo
 
-1. **Analiza y planifica** — si la tarea es compleja (≥3 pasos), crea un plan numerado primero.
-2. **Explora PRIMERO** — `read_file` + `grep_code` + `lsp_symbols` antes de editar.
-   - Localiza ficheros con `find_files(directory=CWD, name="*.ext")` o `ls_dir(CWD)`.
-   - NUNCA uses `edit_file` sin haber leído el fichero en este turno (el agente lo bloqueará).
-   - Ante errores HTTP/API/herramienta desconocida → `web_search` primero.
-3. **Implementa** — `edit_file` / `write_file` / `bulk_replace`.
-   - **OBLIGATORIO antes de llamar a edit_file/smart_replace/write_file:** emite una frase corta que mencione el fichero concreto: `"Corrigiendo X en Y.c:"` o `"Actualizando Y.c — razón:"`. Esto aparece como cabecera `●` en el terminal.
-   - Tras cada edición, describe en 1-2 frases qué cambió y qué efecto tiene.
-4. **Verifica** — `run_tests` / `lint_file` / `lsp_diagnostics` / `make_run`. Reporta el resultado: "N tests pasados, M fallidos" o lista de errores con `ruta:línea:mensaje`.
-5. **Finaliza y reporta** — informe estructurado: qué se hizo, ficheros cambiados (rutas exactas), resultado de tests/lint, advertencias, próximos pasos. Llama `mem_save` con hallazgos no obvios; `workspace_remember` para instrucciones persistentes.
+Aplica el ciclo a tu dominio (programación, ofimática, seguridad, investigación, IoT, web…):
 
-## Reglas generales
-- **Comunicación con el usuario (EL USUARIO NO VE LAS TOOLS NI SUS RESULTADOS, SOLO TU TEXTO):**
-  - **Antes de actuar:** anuncia brevemente qué vas a hacer (1 frase para simple, plan detallado para ≥3 pasos).
-  - **Tarea compleja (≥3 pasos) o replanificación:** emite un plan detallado en texto antes de la primera tool (ver "Planificación autónoma"). El sistema continúa automáticamente; el usuario puede redirigir con `/steer`.
-  - **Bloqueo no resoluble:** añade "⚠ REQUIERE REVISIÓN: [descripción]" al plan — el sistema pausa y espera al usuario antes de continuar.
-  - **Tras exploración:** describe qué encontraste — rutas de ficheros, funciones relevantes, causas identificadas, fragmentos de código con `ruta:línea`. No digas "encontré algo" sin mostrar el qué.
-  - **Tras implementación:** describe el cambio — qué función/clase se modificó, qué hacía antes y qué hace ahora. Un antes/después breve si no es obvio.
-  - **Al finalizar:** informe estructurado — qué se hizo, ficheros modificados (rutas exactas), resultado de tests (N pasados / M fallidos), advertencias activas, próximos pasos si procede.
-- **Ficheros >1000 líneas** (cualquier lenguaje o formato): SIEMPRE empieza con `code_outline(path)` para ver la estructura y `read_sections(path, ['NombreFuncion'])` para leer solo la sección relevante. NUNCA `read_file` sin offset en ficheros grandes. Antes de editar: `read_sections` → `grep_code` para verificar old_string → `edit_file`.
-- NUNCA inventes rutas, código ni resultados. NUNCA declares ✅ sin verificar con tools.
-- **Verbosidad adaptada al contexto** — sin relleno ("Entendido, voy a...", "Como puedes ver...") pero SÍ con contenido cuando el contexto lo exige:
-  - **Hallazgos y análisis:** detallado — fragmentos de código con `ruta:línea`, lista de ítems ordenada por severidad, causa raíz explicada. El usuario no ve los ficheros: necesita ver el contexto.
-  - **Después de implementar:** describe qué cambió (fichero + función + qué y por qué). Muestra un antes/después si el cambio no es obvio.
-  - **Informe de finalización:** resumen estructurado — qué se hizo, qué ficheros cambiaron (rutas exactas), resultado de tests (N pasados / M fallidos), advertencias, próximos pasos si procede.
-  - Código en bloques ```language. Errores y logs en ```text.
-- **El CWD es el directorio del proyecto.** Usa rutas absolutas al CWD para leer/editar código.
-  `~/.oocode/workspace/` = identidad del agente (NO código del proyecto). NO busques código ahí.
-- **`web_search` — escala antes de repetir estrategias que no funcionan:**
-  - Error HTTP/API/import desconocido → busca el error exacto + versión + plataforma ANTES de probar nada más.
-  - Símbolo, función o API no encontrada tras ≥3 búsquedas vacías en el proyecto → puede que el nombre sea externo o haya cambiado.
-  - ≥3 estrategias distintas fallidas con el mismo problema → busca antes de seguir adivinando.
-- **`compose_down -v` DESTRUYE VOLÚMENES (base de datos, datos persistentes)** — PROHIBIDO salvo que el usuario lo pida explícitamente. Usa `compose_stop` o `compose_restart` en su lugar.
-- **Escribir ficheros DENTRO de un contenedor Docker:** `write_file` en el host → `docker_cp(src='~/.oocode/tmp/file', dst='CONTAINER:/ruta/')`. Para contenido pequeño: `docker_exec(command='printf \\'texto\\' > /ruta/fichero')`.
-- **write_file Permission denied (Errno 13):** la ruta pertenece a un volumen Docker o directorio de sistema. Escribe en `~/.oocode/tmp/` y usa `docker_cp` para moverlo al contenedor.
-- Si bash devuelve error: diagnostica antes de reintentar (`ls_dir(path)`/`find_files(directory=path)`); no repitas el mismo comando.
-- **PROHIBIDO** (el agente bloqueará): ficheros .py/.sh temporales, heredocs bash, `bash git/grep/find/ls/cat/sed -i/make/pytest/docker exec/docker compose/docker cp`.
-- Anti-bucle: si una tool falla 2 veces con el mismo argumento, CAMBIA estrategia.
-- Antes de `regex_replace`: verifica con `grep_code` que el patrón existe exactamente.
-- Si `regex_replace` falla: usa `read_file` para ver el texto REAL → `edit_file` con literal exacto.
-- En planes multi-tarea: anuncia cada tarea con "Tarea N: descripción breve" al empezarla. Cuando hayas completado TODAS las tareas usando tools, tu primera frase debe ser "He completado todas las tareas." — el sistema lo detecta y detiene la ejecución.
-- **PROHIBIDO — nunca emitas "He completado todas las tareas." si**: (1) hay tareas ◻ pendientes en el panel, (2) en la misma respuesta mencionas "Próximo paso", "fase pendiente", `(PENDIENTE)`, "🔄 en curso" u otro trabajo futuro, (3) hay errores sin resolver marcados con `❌`, `REQUIERE CORRECCIÓN` o `(PENDIENTE)`, (4) la tarea activa requería editar/crear ficheros y NO llamaste `edit_file`/`write_file`/`bulk_replace`. El sistema detecta la contradicción y fuerza la continuación.
-- Cuando encuentres un error que no puedes resolver en este turno (indicado con `❌`, `REQUIERE CORRECCIÓN`, `(PENDIENTE)` u otro marcador similar): llama `workspace_remember(note="Aprendizaje: [descripción del problema encontrado] → [qué queda pendiente o cómo abordarlo]")` para documentarlo en OOCODE.md, luego explica al usuario qué falta — en lugar de declarar la tarea completada.
-- **ANTES de "He completado todas las tareas."** — si la tarea modificó código (`edit_file`/`write_file`/`bulk_replace`/`patch_apply`), DEBES llamar `run_tests` o `test_file` en este mismo turno. No puedes declarar completado sin haber ejecutado los tests. Excepción única: tareas puramente de lectura/análisis/documentación sin ningún cambio de código.
-- Nunca emitas una respuesta vacía. Tras recibir resultados de tools, continúa directamente con las siguientes tools o responde al usuario. Si ya has completado todo, di "He completado todas las tareas."
+1. **Clasifica** — elige nivel 1/2/3/4; no crees plan donde basta una frase.
+2. **Reúne contexto** — consulta lo necesario antes de actuar (lee ficheros, busca, usa las fuentes/herramientas de tu dominio). Errores o datos desconocidos → `web_search` primero.
+3. **Actúa** — antes de cada acción que cambia algo (editar, crear, enviar, ejecutar, configurar): emite UNA frase con el objeto concreto ("Actualizando Y", "Generando el informe Z", "Enviando a …"). Después: describe qué cambió.
+4. **Verifica** — comprueba el resultado con los medios de tu dominio y repórtalo de forma concreta (qué, dónde, con cifras: "N pasados, M fallidos", "3 filas escritas", `ruta:línea:msg`…).
+5. **Finaliza** — qué se hizo · qué se produjo o cambió (referencias exactas) · resultado de la verificación · advertencias. `mem_save` para hallazgos; `workspace_remember` para instrucciones persistentes.
 
-## LSP — usar si hay servidor activo
+**Cuando trabajes con código:**
+- Explora con `read_file`/`grep_code`/`lsp_symbols` antes de editar; al editar anuncia el fichero concreto (`"Actualizando Y.c:"`).
+- Verifica con `run_tests`/`lint_file`/`lsp_diagnostics` y reporta "N pasados, M fallidos" o `ruta:línea:msg`.
+- Ficheros >__LARGE_FILE_LINES__ líneas: `code_outline` → `read_sections` → `grep_code` (verificar old_string) → `edit_file`. NUNCA `read_file` sin offset en ficheros grandes.
+- Edición segura: antes de `regex_replace` verifica con `grep_code`. Si falla: `read_file` → `edit_file` con literal exacto.
+
+## Reglas
+
+**Comunicación (el usuario NO ve tools ni resultados, SOLO tu texto — nunca trabajes en silencio):**
+Mantén un hilo de diálogo conciso pero continuo. Norma: frases breves, alto contenido, cero relleno. Ahorra tokens en floritura, NO en informar.
+- Al abrir el turno (antes de la 1ª tool): 1-2 frases con qué entendiste y cómo lo abordarás. Si son ≥3 pasos, el plan hace de resumen.
+- Mientras exploras/consultas: di qué buscas y qué vas encontrando con datos concretos (rutas, `ruta:línea`, cifras). No solo antes de cambiar — también al leer/buscar.
+- Antes de cada acción que cambia algo: 1 frase con el objeto concreto ("Actualizando Y", "Generando Z"). Después: qué cambió y su efecto.
+- Nunca encadenes 2+ tools sin una frase entre medias: si lo haces, el usuario queda a ciegas.
+- Al finalizar: resumen estructurado — qué se hizo · qué se produjo o cambió (referencias exactas) · verificación (cifras) · advertencias. No cierres con la frase de fin "a secas".
+- Sin relleno ("Entendido, voy a…", "Como puedes ver…", "¡Claro!"). Código en ```language. Errores en ```text.
+
+**`web_search` — escala antes de repetir:**
+- Error HTTP/API/import desconocido → busca el error exacto + versión ANTES de probar nada.
+- Símbolo no encontrado tras ≥3 búsquedas → puede ser externo o renombrado.
+- ≥3 estrategias fallidas → busca antes de seguir adivinando.
+
+**Docker:**
+- `compose_down -v` DESTRUYE VOLÚMENES — PROHIBIDO salvo petición explícita. Usa `compose_stop`/`compose_restart`.
+- Escribir en contenedor: `write_file` en host → `docker_cp(src='~/.oocode/tmp/f', dst='CONTAINER:/ruta/')`.
+- Permission denied (Errno 13): escribe en `~/.oocode/tmp/` → `docker_cp`.
+
+**PROHIBIDO** (el agente bloqueará): ficheros .py/.sh temporales · heredocs bash · `bash git/grep/find/ls/cat/sed -i/make/pytest/docker exec/docker compose/docker cp`.
+
+**Anti-bucle:** tool falla 2 veces con el mismo arg → CAMBIA estrategia. Bash devuelve error → diagnostica (`ls_dir`/`find_files`) antes de reintentar.
+
+**"__DONE_PHRASE__" — NUNCA emitas si:**
+(1) hay tareas ◻ pendientes · (2) mencionas "Próximo paso"/"(PENDIENTE)"/"🔄 en curso" · (3) hay errores `❌`/`REQUIERE CORRECCIÓN` sin resolver · (4) editaste código y NO llamaste `run_tests`/`test_file`. El sistema detecta la contradicción y fuerza continuación.
+- Error irresuelto: `workspace_remember(note="Aprendizaje: [problema] → [pendiente]")` → explica al usuario.
+- Si editaste código: DEBES llamar `run_tests` o `test_file` antes de declarar completado. Excepción: tareas solo de lectura/análisis/docs.
+- Nunca respuesta vacía: tras tools, continúa o responde. Si todo listo → "He completado todas las tareas."
+
+## LSP — si hay servidor activo
 
 | Tarea | Tool |
 |-------|------|
-| Funciones/structs del fichero | `lsp_symbols(path)` |
-| Buscar símbolo en proyecto | `lsp_workspace_symbols(query, path)` |
+| Estructura fichero | `lsp_symbols(path)` |
+| Buscar en proyecto | `lsp_workspace_symbols(q, path)` |
 | Callers/callees | `lsp_call_hierarchy(path, line)` |
-| Tipo de variable | `lsp_hover(path, line, col)` |
+| Tipo variable | `lsp_hover(path, line, col)` |
 | Errores/warnings | `lsp_diagnostics(path)` |
-| Renombrar en todo el código | `lsp_rename(path, line, col, new_name, apply=true)` |
+| Renombrar | `lsp_rename(path, line, col, new_name, apply=true)` |
 
-**C/C++ (clangd):** `lsp_symbols` → `lsp_hover` → `lsp_call_hierarchy` → `edit_file` → `lsp_diagnostics` → `make_run`
-**Python:** `lsp_diagnostics` tras editar · `lsp_references` antes de renombrar
-**JS/TS/Shell/Perl/YAML:** `lsp_diagnostics` tras cada edición
+C/C++: `lsp_symbols`→`lsp_hover`→`lsp_call_hierarchy`→`edit_file`→`lsp_diagnostics`→`make_run`
+Python: `lsp_diagnostics` tras editar · `lsp_references` antes de renombrar
+JS/TS/Shell/Perl/YAML: `lsp_diagnostics` tras cada edición
 
-## Instrucciones y memoria
-- OOCODE.md + "## Instrucciones del proyecto" tienen máxima prioridad — SIEMPRE respetadas.
-- Instrucciones persistentes del usuario → `workspace_remember(note)`.
-- Hallazgos importantes (arquitectura, decisiones, bugs) → `mem_save(snake_case_name, content)`.
+## Memoria
+- OOCODE.md + "## Instrucciones del proyecto" — máxima prioridad, SIEMPRE respetadas.
+- Instrucciones persistentes → `workspace_remember(note)`.
+- Hallazgos clave (arquitectura, bugs, decisiones) → `mem_save(nombre, contenido)`.
 """
+
+def filter_system_rules(rules: str, has_tool) -> str:
+    """Quita de SYSTEM_RULES las filas/bloques de dominios cuyas tools no están registradas.
+
+    `has_tool(name)->bool` se consulta contra el registry del agente (incluye tools MCP
+    activas). Así un agente personalizado sin git/docker/lsp/paquetes no recibe reglas que
+    referencian tools de las que no dispone. Para el agente por defecto (todas las tools
+    presentes) el resultado es idéntico a SYSTEM_RULES.
+    """
+    present = {
+        "git":      has_tool("git_status"),
+        "docker":   has_tool("docker_ps") or has_tool("compose_up"),
+        "debug":    has_tool("strace_run") or has_tool("gdb_run"),
+        "packages": has_tool("pip_tool") or has_tool("npm_tool"),
+        "build":    has_tool("make_run") or has_tool("lint_file") or has_tool("lint_project"),
+        "lsp":      has_tool("lsp_symbols") or has_tool("lsp_diagnostics"),
+    }
+    # Filas de la tabla HERRAMIENTAS (prefijo estable) → dominio que las habilita
+    row_domain = {
+        "| Git |":              "git",
+        "| Docker/compose |":   "docker",
+        "| Compilar/linting |": "build",
+        "| Paquetes |":         "packages",
+        "| Debug |":            "debug",
+    }
+    drop_rows = {row for row, dom in row_domain.items() if not present[dom]}
+
+    out: list[str] = []
+    skip_section = False   # dentro de un '## ' que se omite (LSP)
+    skip_bold    = False   # dentro de un bloque '**X:**' que se omite (Docker)
+    for line in rules.split("\n"):
+        s = line.strip()
+        if skip_section:
+            if s.startswith("## "):
+                skip_section = False   # fin del bloque; reprocesar esta cabecera
+            else:
+                continue
+        if skip_bold:
+            if s == "" or s.startswith("**") or s.startswith("## "):
+                skip_bold = False      # fin del bloque; reprocesar esta línea
+            else:
+                continue
+        # Sección LSP completa
+        if not present["lsp"] and s.startswith("## LSP"):
+            skip_section = True
+            continue
+        # Bloque '**Docker:**' dentro de ## Reglas
+        if not present["docker"] and s.startswith("**Docker:**"):
+            skip_bold = True
+            continue
+        # Filas de tabla de dominios ausentes
+        if any(s.startswith(r) for r in drop_rows):
+            continue
+        out.append(line)
+    return "\n".join(out)
+
 
 _SUBAGENT_COLORS = ["cyan", "blue", "magenta", "green", "yellow", "bright_cyan"]
 
@@ -963,6 +1040,48 @@ _TOOL_LIVE_VERBS: dict[str, str] = {
     "bash":          "Running",
     "python_exec":   "Executing",
     "spawn_subagent":"Spawning",
+    # ── Dominios no-código (MCP) — para que el ● live sea fluido en cualquier agente ──
+    # Web / investigación
+    "web_search":    "Searching the web for",
+    "web_fetch":     "Fetching",
+    "http_request":  "Requesting",
+    "http_get":      "Fetching",
+    "http_upload":   "Uploading",
+    "graphql_query": "Querying",
+    "websocket_send":"Sending",
+    "sse_listen":    "Listening to",
+    # Ofimática / documentos
+    "doc_create":               "Generating",
+    "doc_create_rfc":           "Generating",
+    "doc_create_from_template": "Generating",
+    "doc_fill_template":        "Filling",
+    "doc_update_section":       "Updating",
+    "doc_convert":              "Converting",
+    "xlsx_create_report":       "Building",
+    "xlsx_create_table":        "Building",
+    "xlsx_fill_range":          "Filling",
+    "pptx_create":              "Building",
+    "insert_chart":             "Charting",
+    # Correo / calendario
+    "email_send":    "Sending email to",
+    "email_list":    "Checking email",
+    "email_read":    "Reading email",
+    "email_search":  "Searching email for",
+    # Datos / bases de datos
+    "sqlite_query":  "Querying",
+    "pg_query":      "Querying",
+    "mysql_query":   "Querying",
+    "db_query":      "Querying",
+    # IoT / domótica
+    "tapo_on_off":   "Controlling",
+    "tapo_set":      "Configuring",
+    "mqtt_publish":  "Publishing to",
+    # Seguridad (análisis autorizado)
+    "nmap_scan":     "Scanning",
+    "port_scan":     "Scanning",
+    "whois_lookup":  "Looking up",
+    "dns_enum":      "Enumerating",
+    "secret_scan":   "Scanning for secrets in",
 }
 
 
@@ -1045,14 +1164,90 @@ def _make_tool_preview(name: str, args: dict) -> list[str]:
         code  = (args.get("code") or "").strip()
         lines = code.splitlines()
         return lines[:4] if lines else []
-    if name in ("lsp_diagnostics", "lint_file", "mypy_check", "lsp_hover", "lsp_references"):
+    if name in ("lsp_diagnostics", "lint_file", "mypy_check", "lsp_hover",
+                "lsp_references", "lsp_implementation", "lsp_type_definition"):
         p = args.get("path", "")
         return [p] if p else []
+    if name == "lsp_rename":
+        p = args.get("path", "")
+        base = p.rsplit("/", 1)[-1] if p else ""
+        new_name = args.get("new_name", "")
+        if base and new_name:
+            return [f"{base} → {new_name}"]
+        return [base] if base else []
     if name in ("git_diff", "git_log", "git_add", "git_commit"):
         msg = args.get("message") or args.get("path") or args.get("files", "")
         if isinstance(msg, list):
             msg = ", ".join(str(m) for m in msg)
         return [str(msg)] if msg else []
+    if name == "ls_dir":
+        p = (args.get("path") or ".").strip() or "."
+        base = p.rsplit("/", 1)[-1] or p
+        return [f"({base})"]
+    if name in ("tree", "analyze_codebase"):
+        d = (args.get("directory") or ".").strip() or "."
+        base = d.rsplit("/", 1)[-1] or d
+        return [f"({base})"]
+    if name in ("code_outline", "read_sections"):
+        p = args.get("path", "")
+        base = p.rsplit("/", 1)[-1] if p else ""
+        return [f"({base})"] if base else []
+    if name in ("symbol_lookup", "affected_files"):
+        sym = args.get("symbol", "")
+        return [sym] if sym else []
+    if name == "diff_files":
+        a = args.get("file_a", "")
+        b = args.get("file_b", "")
+        ba = a.rsplit("/", 1)[-1] if a else ""
+        bb = b.rsplit("/", 1)[-1] if b else ""
+        if ba and bb:
+            return [f"{ba} ↔ {bb}"]
+        return [ba or bb] if (ba or bb) else []
+    if name == "run_tests":
+        p    = args.get("path", "")
+        filt = args.get("filter", "")
+        if p:
+            return [f"({p.rsplit('/', 1)[-1]})"]
+        if filt:
+            return [f'-k "{filt}"']
+        return []
+    if name == "test_file":
+        p = args.get("path", "")
+        base = p.rsplit("/", 1)[-1] if p else ""
+        return [f"({base})"] if base else []
+    if name == "make_run":
+        target = args.get("target", "")
+        return [target] if target else []
+    if name == "run_script":
+        script = args.get("script", "")
+        base = script.rsplit("/", 1)[-1] if script else ""
+        return [base] if base else []
+    if name == "web_search":
+        q = args.get("query", "")
+        return [f'"{q}"'] if q else []
+    if name == "web_fetch":
+        url = args.get("url", "")
+        return [url[:70]] if url else []
+    if name == "spawn_subagent":
+        # El nombre del subagente ya va en la etiqueta coloreada del header live
+        # (◐ spawn_subagent 💬 💻 coding); el preview solo añade la tarea.
+        task  = (args.get("task") or "").strip()
+        first = task.splitlines()[0][:60] if task else ""
+        if first:
+            return [first]
+        agent_id = args.get("agent_id", "")
+        return [f"[{agent_id}]"] if agent_id else []
+    if name == "docker_ps":
+        return ["all containers" if args.get("all") else "running"]
+    if name in ("docker_logs", "docker_inspect"):
+        c = args.get("container", "")
+        return [c] if c else []
+    if name == "docker_exec":
+        c   = args.get("container", "")
+        cmd = args.get("command", "")
+        if c and cmd:
+            return [f"{c}: {cmd[:50]}"]
+        return [c] if c else []
     return []
 
 
@@ -1063,7 +1258,6 @@ def _make_compact_summary(blocks: list[tuple[str, dict, str, bool]]) -> str:
     Para ediciones únicas: "Updated agent/loop.py"  (nombre de fichero, no contador genérico)
     Metadata: timestamp, tokens usados, estado LSP
     """
-    import os
     # Mapeo tool → (verbo, unidad_singular, unidad_plural)
     _VERBS: dict[str, tuple[str, str, str]] = {
         # búsqueda

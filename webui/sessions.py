@@ -3,7 +3,6 @@ import logging
 import queue
 import threading
 import time
-from pathlib import Path
 
 # ── Tiempos y estructura ──────────────────────────────────────────────────────
 
@@ -109,13 +108,13 @@ def _create_loop_for_webui(agent_id: str, out_queue: queue.Queue):
     if _PROJECT_ROOT not in _sys.path:
         _sys.path.insert(0, _PROJECT_ROOT)
 
-    from config import OOConfig, CONFIG_DIR, MEMORY_DIR
+    from config import OOConfig
     from agent.loop import AgentLoop
-    from agent.memory import MemorySystem
     from agent.session import SessionManager
-    from agent.embeddings import EmbeddingClient
+    from agent.services import (
+        build_workspace_manager, build_embedding_client, build_memory_system,
+    )
     from tools.permissions import PermissionManager
-    from workspace.manager import WorkspaceManager
     from oocode import build_registry
 
     cfg = OOConfig.load()
@@ -132,41 +131,15 @@ def _create_loop_for_webui(agent_id: str, out_queue: queue.Queue):
 
     project_dir = str(_Path.cwd())
 
-    ws_manager = WorkspaceManager(
-        cfg.workspace,
-        cfg.agent_name,
-        cfg.agent_emoji,
-        ollama_host=cfg.ollama_host,
-        permissions=cfg.permissions,
-        max_memory_lines=cfg.ws_max_memory_lines,
-        max_daily_chars=cfg.ws_max_daily_chars,
-    )
+    ws_manager = build_workspace_manager(cfg)
     if not ws_manager.exists():
         ws_manager.init()
 
     permissions = PermissionManager(cfg.permissions)
     permissions._non_interactive = True  # WebUI no tiene terminal interactiva
 
-    embed_client = EmbeddingClient(
-        host=cfg.effective_embed_host,
-        model=cfg.embed_model,
-        max_input_chars=cfg.embed_max_input_chars,
-        disk_cache_enabled=cfg.embed_disk_cache_enabled,
-        disk_cache_dir=cfg.embed_disk_cache_dir,
-        disk_cache_max=cfg.embed_disk_cache_max,
-        ram_cache_max=cfg.embed_ram_cache_max,
-    )
-
-    agent_memory_dir = MEMORY_DIR / cfg.agent_id
-    agent_memory_dir.mkdir(parents=True, exist_ok=True)
-
-    memory = MemorySystem(
-        embed_client=embed_client if cfg.memory_embed_enabled else None,
-        similarity_threshold=cfg.embed_similarity_threshold,
-        snippet_chars=cfg.embed_snippet_chars,
-        top_k=cfg.embed_top_k,
-        memory_dir=agent_memory_dir,
-    )
+    embed_client = build_embedding_client(cfg)
+    memory = build_memory_system(cfg, embed_client)
 
     registry = build_registry(project_dir, cfg)
 
@@ -195,7 +168,7 @@ def _create_loop_for_webui(agent_id: str, out_queue: queue.Queue):
     session_mgr.start(cfg.model or "", project_dir)
 
     from agent.runtime import RuntimeSettings
-    runtime = RuntimeSettings()
+    runtime = RuntimeSettings(ctx_mode=getattr(cfg, "ctx_mode", "mini"))
 
     loop = AgentLoop(
         config=cfg,
@@ -226,22 +199,10 @@ def _create_loop_for_webui(agent_id: str, out_queue: queue.Queue):
     try:
         _active_mcp_servers = [s for s in cfg.mcp_servers if s.get("enabled", True)]
         _active_names = {s.get("name") for s in _active_mcp_servers}
-        _mcp_dir = _Path(__file__).parent.parent / "mcp_servers"
-
-        def _add_bundled(flag: bool, name: str, fname: str) -> None:
-            if flag and name not in _active_names:
-                p = _mcp_dir / fname
-                if p.exists():
-                    _active_mcp_servers.append(
-                        {"name": name, "cmd": [_sys.executable, str(p)]}
-                    )
-                    _active_names.add(name)
-
-        _add_bundled(cfg.mcp_oocode_assistant_enabled,    "oocode-assistant",        "oocode_assistant.py")
-        _add_bundled(cfg.mcp_system_assistant_enabled,    "system-assistant",        "system_assistant.py")
-        _add_bundled(cfg.mcp_home_office_assistant_enabled, "home-office-assistant", "home_office_assistant.py")
-        _add_bundled(cfg.mcp_security_assistant_enabled,  "security-assistant",     "security_assistant.py")
-        _add_bundled(cfg.mcp_iot_assistant_enabled,       "iot-assistant",           "iot_assistant.py")
+        # Bundled (8 servidores) vía helper compartido con el TUI (agent/services.py):
+        # única fuente de verdad para que ambas rutas arranquen el mismo conjunto.
+        from agent.services import bundled_mcp_servers
+        _active_mcp_servers.extend(bundled_mcp_servers(cfg, _active_names))
 
         if _active_mcp_servers:
             from agent.mcp_client import McpPool

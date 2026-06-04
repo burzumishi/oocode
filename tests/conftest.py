@@ -12,6 +12,36 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 _TEST_TMP = Path.home() / ".oocode" / "_test_tmp"
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _isolate_real_config():
+    """Red de seguridad: redirige CONFIG_DIR/CONFIG_FILE/MEMORY_DIR a un sandbox.
+
+    Garantiza que NINGÚN test escriba sobre ~/.oocode/oocode.json real, aunque olvide
+    parchear (OOConfig.save()/load() resuelven la ruta vía config en runtime). Los tests
+    que parchean CONFIG_FILE a su propio tmp siguen funcionando (override local durante
+    el `with patch(...)`). Se copia la config real al sandbox para que load() devuelva
+    valores realistas sin tocar el original.
+    """
+    import config
+    real_dir, real_file, real_mem = config.CONFIG_DIR, config.CONFIG_FILE, config.MEMORY_DIR
+    sandbox = Path.home() / ".oocode" / "_test_config_sandbox"
+    sandbox.mkdir(parents=True, exist_ok=True)
+    try:
+        if real_file.exists():
+            shutil.copy2(real_file, sandbox / "oocode.json")
+    except Exception:
+        pass
+    config.CONFIG_DIR  = sandbox
+    config.CONFIG_FILE = sandbox / "oocode.json"
+    config.MEMORY_DIR  = sandbox / "memory"
+    config.MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        yield
+    finally:
+        config.CONFIG_DIR, config.CONFIG_FILE, config.MEMORY_DIR = real_dir, real_file, real_mem
+        shutil.rmtree(sandbox, ignore_errors=True)
+
+
 @pytest.fixture(autouse=True)
 def _cleanup_test_tmp():
     """Limpia el directorio de test al finalizar cada test."""

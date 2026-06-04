@@ -6,7 +6,7 @@ Las funciones TUI (Rich/Live) se mantienen en ui/loop_tui.py.
 from __future__ import annotations
 import queue as _queue
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 import agent.logger as log
 
@@ -91,7 +91,9 @@ class WebUIMixin:
         try:
             self.run(user_message, images)
             response = getattr(self, '_last_response', '') or ''
+            # Emitir evento 'done' y 'inference_done' para indicar finalización de inferencia
             self._webui_emit({**self._webui_status(), "type": "done", "response": response})
+            self._webui_emit({**self._webui_status(), "type": "inference_done"})
         except Exception as exc:
             self._webui_emit({"type": "error", "error": str(exc)})
 

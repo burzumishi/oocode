@@ -57,7 +57,7 @@ oocode/
 ├── mcp_servers/           # Servidores MCP bundled (proceso stdio independiente)
 │   ├── oocode_assistant.py    # ~35 tools: git, docker, fs, grep, symbols, utils
 │   ├── system_assistant.py    # systemctl, journalctl, red, disco, procesos
-│   ├── home_office_assistant.py # 77+ tools: Office, email, calendario
+│   ├── home_office_assistant.py # 66 tools: Office nativo, email, calendario
 │   ├── security_assistant.py  # 24 tools: nmap, web, crypto, CTF
 │   └── iot_assistant.py       # 25 tools: TAPO, Alexa, HA, MQTT, ESPHome
 │

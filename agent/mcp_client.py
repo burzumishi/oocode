@@ -364,7 +364,7 @@ class McpClient:
 
     def list_resources(self) -> list[dict]:
         """Solicita resources/list al servidor MCP (solo si el servidor lo soporta)."""
-        if not self._capabilities.get("resources"):
+        if "resources" not in self._capabilities:
             return []
         result = self._request("resources/list", {})
         return (result or {}).get("resources", [])
@@ -388,7 +388,7 @@ class McpClient:
 
     def list_prompts(self) -> list[dict]:
         """Solicita prompts/list al servidor MCP (solo si el servidor lo soporta)."""
-        if not self._capabilities.get("prompts"):
+        if "prompts" not in self._capabilities:
             return []
         result = self._request("prompts/list", {})
         return (result or {}).get("prompts", [])
@@ -418,7 +418,9 @@ def mcp_tool_to_oocode(client: McpClient, tool: dict,
 
     # Servidores bundled → sin prefijo para máxima usabilidad
     if client.name in ("oocode_assistant", "oocode-assistant",
-                       "system_assistant", "system-assistant"):
+                       "system_assistant", "system-assistant",
+                       "devops_assistant", "devops-assistant",
+                       "database_assistant", "database-assistant"):
         oo_name = clean
     else:
         # Servidor externo: añadir prefijo solo si colisiona

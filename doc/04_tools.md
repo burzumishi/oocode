@@ -72,6 +72,19 @@ Reemplaza una cadena exacta dentro de un fichero. Más seguro que `write_file` p
 
 Falla si `old_string` no se encuentra o no es único.
 
+#### Verificación previa y anti-bucle de ediciones (v0.4.2)
+
+Para evitar que el modelo malgaste turnos editando con texto alucinado, OOCode aplica varias salvaguardas en torno a `edit_file`/`regex_replace`/`smart_replace`/`write_file`:
+
+- **Read-before-edit** — `edit_file` exige que el fichero se haya leído en el turno (garantiza que existe y que el `old_string` es real).
+- **PRE-EDIT** — antes de aplicar el cambio, OOCode comprueba que `old_string` existe literalmente; si no, devuelve el error sin tocar el fichero y muestra líneas similares.
+- **Escalada unificada por fichero** — todos los fallos de modificación del **mismo** fichero en un turno (PRE-EDIT fallido, regex sin coincidencias, llamada duplicada) cuentan juntos y escalan:
+  1. **1.º:** indica leer el fichero y copiar el texto literal.
+  2. **2.º:** **inyecta el contenido real del fichero** (con números de línea) para que el agente copie el texto exacto en lugar de adivinarlo — y avisa de que el cambio puede estar **ya aplicado**.
+  3. **3.º:** parada en seco — deja de reintentar sobre ese fichero; lo más probable es que el cambio ya esté hecho (debe verificarlo e informar al usuario) o que falte el texto exacto (debe pedir ayuda).
+
+  El contador se reinicia cuando una modificación a ese fichero tiene éxito. Así se corta el bucle típico `edit → regex → write` que no avanza tras una compactación.
+
 ---
 
 ### `list_dir`
@@ -225,6 +238,8 @@ Descarga una URL y extrae el texto visible (elimina scripts, estilos, nav, foote
 
 **Configuración:** `tools.webFetchMaxChars`
 
+> El resultado de `web_fetch` (y de `pdf_extract_text`/`doc_read`/`doc_extract_metadata`) se etiqueta internamente como salida de herramienta antes de inyectarlo en el contexto, para que el modelo no confunda el documento descargado con un mensaje nuevo del usuario y siga la tarea en curso (v0.4.3).
+
 ---
 
 ### `searxng_search`
@@ -325,9 +340,9 @@ O mejor, crear un skill o plugin (ver `doc/07_plugins.md`, `doc/08_skills.md`).
 
 ---
 
-## Herramientas de Documentos (python-docx, openpyxl, matplotlib)
+## Herramientas de Documentos (python-docx, openpyxl, python-pptx)
 
-OOCode incluye soporte nativo para manipulación de documentos O365 (.docx, .xlsx) usando las librerías **python-docx** y **openpyxl**, junto con **matplotlib** para gráficos dinámicos.
+OOCode incluye soporte nativo para manipulación de documentos O365 (.docx, .xlsx, .pptx) usando las librerías **python-docx**, **openpyxl** y **python-pptx**. Las gráficas se generan como **objetos OOXML nativos** (DrawingML), editables en Office — sin imágenes PNG ni matplotlib.
 
 ### 📄 python-docx — Documentos .docx
 
@@ -409,25 +424,21 @@ wb.save("hoja.xlsx")
 
 ---
 
-### 📈 matplotlib — Gráficos Dinámicos
+### 📈 Gráficas OOXML nativas (DrawingML)
 
-**Descripción:** Biblioteca para generar gráficos y exportarlos a documentos.
+**Descripción:** Las gráficas se insertan como objetos `chartSpace` OOXML nativos — editables en Word/Excel/PowerPoint, vectoriales y sin pérdida de calidad. **No** se usan imágenes PNG ni matplotlib.
 
-**Formatos de exportación:**
-- `.png` — Imagen de alta calidad (recomendado: DPI 300)
-- `.pdf` — Vectorial con fuentes embebidas
-- `.svg` — Escalable vectorial
-- `.eps` — PostScript
+**Tools por formato:**
+- `insert_chart` — gráfica nativa en Word (.docx): bar, column, line, line_markers, area, pie, doughnut, scatter, stacked_bar, stacked_column, radar
+- `xlsx_insert_chart` — gráfica nativa de openpyxl anclada a un rango en Excel (.xlsx)
+- `pptx_insert_chart` — gráfica nativa en una diapositiva (.pptx)
+- En `doc_create`, el bloque `{"type": "chart", ...}` incrusta la gráfica nativa directamente
 
-**Configuración recomendada:**
-```python
-import matplotlib
-matplotlib.use('Agg')  # Modo no-GUI
-matplotlib.rcParams['figure.dpi'] = 300
-matplotlib.rcParams['savefig.dpi'] = 300
+**Formato de datos:**
+```json
+{"categories": ["Ene", "Feb", "Mar"],
+ "series": [{"label": "Ventas", "values": [100, 200, 150]}]}
 ```
-
-**Ver documentación completa:** `doc/STYLES_O365.md`
 
 ---
 
@@ -435,18 +446,10 @@ matplotlib.rcParams['savefig.dpi'] = 300
 
 ```bash
 # Instalar todas las dependencias necesarias
-pip install python-docx openpyxl matplotlib pillow
+pip install python-docx python-pptx openpyxl pillow docxtpl
 
 # Verificar instalación
-python -c "import docx; import openpyxl; import matplotlib; print('✅ Todas las librerías instaladas')"
-```
-
-**Configuración de matplotlib:**
-```python
-matplotlib.rcParams['figure.dpi'] = 300  # Alta resolución
-matplotlib.rcParams['savefig.dpi'] = 300
-matplotlib.rcParams['pdf.fonttype'] = 42  # PDF con fuentes embebidas
-matplotlib.rcParams['ps.fonttype'] = 3
+python -c "import docx, openpyxl, pptx, docxtpl; print('✅ Todas las librerías instaladas')"
 ```
 
 **Paleta de colores O365:**

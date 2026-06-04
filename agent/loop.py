@@ -8,7 +8,6 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Optional
 from datetime import date
-import ollama
 from rich.markdown import Markdown
 from rich.padding import Padding
 from rich.text import Text
@@ -27,6 +26,8 @@ from tools.permissions import PermissionManager
 from tools.hooks import _is_modify_tool
 from workspace.manager import WorkspaceManager
 from config import DEFAULT_CONFIG as _DEFAULT_CONFIG
+from api import build_client
+from api.base import BackendClient
 
 
 # ── Helpers y constantes (re-exportadas para compatibilidad hacia atrás) ───────
@@ -39,12 +40,14 @@ from agent.loop_helpers import (  # noqa: F401
     _TOOL_ALIASES, _IMG_EXTENSIONS,
     _SUBAGENT_COLORS, _TOOL_LIVE_VERBS,
     SYSTEM_HEADER, _TOOL_GROUPS, _TASK_KEYWORDS, SYSTEM_RULES,
+    filter_system_rules,
     _pick_preflight_phrase, _fmt_elapsed, _fmt_tokens, _rag_display,
     _is_complex_query, _load_images_b64, _ctx_bar, _compact_hint,
     _pbar_thin_ratio, _sfmt, _bar_style, _hint_styled,
     _make_compact_summary,
     _make_tool_preview, _pick_file_switch_phrase,
     _SUBAGENT_SPINNER_POLL, _MAX_PLAN_TASKS, _BASH_OVERUSE_RATIO,
+    _ORCHESTRATION_TOOLS, _COLD_START_RE,
 )
 from webui.loop_webui import WebUIMixin
 from ui.loop_tui import TUIDisplayMixin
@@ -62,6 +65,10 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         subagent_runner=None,
         capture_output: bool = False,
         is_subagent: bool = False,
+        backend_client: "BackendClient | None" = None,
+        # Alias deprecado de `backend_client` (nombre previo a multi-backend). Solo lo
+        # usan los tests; el código de producción pasa siempre `backend_client=`.
+        # Se mantiene como red de compatibilidad para tests/código externo.
         ollama_client=None,
     ):
         self.config = config
@@ -74,6 +81,18 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         self.subagent_runner = subagent_runner
         self.capture_output = capture_output
         self.is_subagent = is_subagent          # activa prefijo visual │ en output
+        # Frase canónica de completado (configurable por idioma del agente). Se inyecta
+        # en el system prompt y se compila en un regex que complementa la detección
+        # ES/EN hardcodeada, para que agentes en otros idiomas disparen el fin de turno.
+        self._done_phrase: str = (
+            getattr(config, "completion_phrase", "") or "He completado todas las tareas."
+        )
+        _done_variants = [self._done_phrase] + list(
+            getattr(config, "completion_extra_phrases", []) or []
+        )
+        self._cfg_done_re = re.compile(
+            "|".join(re.escape(p) for p in _done_variants if p), re.IGNORECASE
+        )
         # Managers opcionales — se asignan desde oocode.py
         self.branches = None
         self.tasks = None
@@ -84,6 +103,11 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         self._extra_rules: str = ""
         # Última respuesta del asistente (para /copy y Ctrl+O)
         self._last_response: str = ""
+        # Último bloque de texto emitido por el agente en el turno EN CURSO.
+        # Se actualiza por iteración (a diferencia de _last_response, que solo se
+        # fija en _turn_finish), por lo que refleja el estado real cuando hay una
+        # compactación a mitad de turno (auto-continue dentro del mismo run()).
+        self._last_agent_msg: str = ""
         # Tool calls del último turno: lista de (nombre, args_str, resultado_completo)
         self._last_tool_calls: list[tuple[str, str, str]] = []
         # Tiempo de la última llamada LLM (segundos)
@@ -101,12 +125,21 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             tool_max_chars=config.context_tool_max_chars,
         )
         # Reutilizar cliente externo si se proporciona (subagentes comparten el del padre
-        # para que Ollama no descargue/recargue el modelo entre llamadas).
-        if ollama_client is not None:
-            self.client = ollama_client
+        # para que el modelo no se descargue/recargue entre llamadas).
+        # ollama_client es el alias deprecado (solo-tests); backend_client tiene precedencia.
+        _ext = backend_client or ollama_client
+        if _ext is not None:
+            # Envolver ollama.Client legado en OllamaBackend si es necesario
+            if not isinstance(_ext, BackendClient):
+                from api.ollama import OllamaBackend
+                _wrap = OllamaBackend.__new__(OllamaBackend)
+                _wrap._host   = getattr(config, "ollama_host", "http://localhost:11434")
+                _wrap._client = _ext
+                _ext = _wrap
+            self.client: BackendClient = _ext
             self._owns_client = False
         else:
-            self.client = ollama.Client(host=config.ollama_host)
+            self.client = build_client(config)
             self._owns_client = True
         # Último mensaje del usuario — para búsqueda semántica de memoria
         self._last_user_msg: str = ""
@@ -124,6 +157,10 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         # Tokens acumulados del turno actual (para mostrar en stats line)
         self._turn_inp: int = 0
         self._turn_out: int = 0
+        # E: longitud del system prompt en el último call (para calibración CPT)
+        self._last_system_chars: int = 0
+        # I: hilo de pre-compactación idle (evita lanzar varios en paralelo)
+        self._precompact_thread: Optional[threading.Thread] = None
         # Contador de auto-continuaciones del turno actual (se resetea en run())
         self._auto_continue_count: int = 0
         # Etiqueta del separador superior: "" → muestra proyecto, "⚙ tool…" durante tool
@@ -154,6 +191,11 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         # Detector de bucles de edición fallida: regex_replace/bulk_replace sin coincidencias.
         self._failed_edit_streak: int = 0
         self._failed_edit_patterns: list[str] = []
+        # Contador unificado de fallos de modificación POR FICHERO en el turno.
+        # Lo alimentan TODOS los caminos de fallo (edit_file PRE-EDIT, regex/bulk
+        # sin coincidencias, write/edit duplicado) para escalar de forma coherente:
+        # 1.º leer · 2.º inyectar contenido real · 3.º parar en seco.
+        self._failed_modify_by_path: dict[str, int] = {}
         # Caché intra-turno: evita ejecutar reads idénticos más de una vez
         # y bloquea writes duplicados que pueden corromper ficheros.
         self._turn_read_cache: dict[str, str] = {}
@@ -178,6 +220,9 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         # Plan de tareas con tracking visual — alimenta el task progress panel del TUI
         # Cada entrada: {text: str, status: "pending"|"active"|"done", start_ts: float, end_ts: float}
         self._plan_tasks: list[dict] = []
+        # Número de mensajes en context cuando la tarea activa actual empezó.
+        # min_keep adaptativo en compactación: preserva el turno de la tarea activa.
+        self._plan_active_msg_idx: int = -1
         # True mientras _do_compact_impl está activo — suprime el task panel en el TUI
         self._compacting_ctx: bool = False
         # Event que se activa durante _do_compact_impl — permite que run() espere
@@ -216,9 +261,9 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         self._task_last_test: str = ""
 
     def close(self) -> None:
-        """Libera recursos de forma determinista: cierra el httpx.Client de Ollama
-        si este AgentLoop es su propietario.  Llamar explícitamente antes de salir;
-        __del__ actúa solo como red de seguridad."""
+        """Libera recursos de forma determinista: cierra el backend si este AgentLoop
+        es su propietario. Llamar explícitamente antes de salir; __del__ actúa
+        solo como red de seguridad."""
         if not getattr(self, "_owns_client", True):
             return
         client = getattr(self, "client", None)
@@ -255,7 +300,6 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             or _os.getcwd()
         )
         header = SYSTEM_HEADER.format(
-            agent_name=self.config.agent_name,
             today=date.today().isoformat(),
             project_dir=_project_dir,
         )
@@ -308,6 +352,35 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             if oocode_md else ""
         )
 
+        # Agentes disponibles para delegar (solo si hay >1 y no es subagente).
+        # Lista id + emoji + Rol (de cada IDENTITY.md) para que el LLM sepa de forma
+        # genérica qué agente encaja mejor en cada tarea y pueda delegar (vía
+        # spawn_subagent/create_team) — ahorra contexto y herramientas. Sin esto, el
+        # modelo solo veía IDs sueltos en el schema y no sabía, p.ej., que existe un
+        # 'webcrawler' idóneo para búsquedas web.
+        agents_section = ""
+        _agents_cfg = getattr(self.config, "agents", []) or []
+        if len(_agents_cfg) > 1 and not self.is_subagent:
+            from workspace.manager import agent_role as _agent_role
+            _alines: list[str] = []
+            for _a in _agents_cfg:
+                _rol = _agent_role(getattr(_a, "workspace", "")) or ""
+                _em  = getattr(_a, "emoji", "") or ""
+                _aid = getattr(_a, "id", "")
+                if not _aid:
+                    continue
+                _alines.append(f"- {_em} {_aid}: {_rol}".rstrip() if _rol
+                               else f"- {_em} {_aid}".rstrip())
+            if _alines:
+                agents_section = (
+                    "\n## Agentes disponibles para delegar\n"
+                    "Puedes delegar partes de la tarea en estos agentes especializados "
+                    "(con spawn_subagent / create_team / spawn_fanout) cuando otro encaje "
+                    "mejor que tú — ahorra contexto y herramientas. Evalúa antes de actuar "
+                    "si la tarea es más afín a otro agente:\n"
+                    + "\n".join(_alines) + "\n"
+                )
+
         # Directorios adicionales de trabajo
         extra_dirs_section = ""
         if self.rt.extra_dirs:
@@ -321,20 +394,39 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
 
         think_section = self.rt.think_injection()
         extra_rules = f"\n{self._extra_rules}" if self._extra_rules else ""
-        _agent_instr = getattr(self.config, "agent_instructions", "") or ""
-        agent_instr_section = (
-            f"\n## Instrucciones del agente {self.config.agent_name}\n{_agent_instr}\n"
-            if _agent_instr else ""
+        # Orden del system prompt:
+        #  1. Identidad/comportamiento del agente — sus ficheros .md del workspace
+        #     (mini = resumen de IDENTITY.md/SOUL.md; full = ficheros completos). LIDERA.
+        #  2. Datos factuales de la sesión (fecha, CWD, nota CWD-vs-workspace).
+        #  3. Reglas del sistema (disciplina de herramientas) — juntas tras el header.
+        #  4. Instrucciones del proyecto (OOCODE.md) — pueden afinar las reglas generales.
+        #  5. Entorno: directorios adicionales + plugins activos.
+        #  6. Contexto dinámico del turno: memoria semántica + RAG de código (recencia).
+        #  7. Ajustes de runtime (thinking, reglas extra).
+        # Los schemas de tools y los hooks NO van aquí (param `tools` y runtime).
+        _large_lines = getattr(self.config, "read_file_lines_warn_large", 500)
+        _rules = (
+            SYSTEM_RULES
+            .replace("__DONE_PHRASE__", self._done_phrase_text())
+            .replace("__LARGE_FILE_LINES__", str(_large_lines))
         )
+        # Filtra reglas de dominios cuyas tools no están registradas en este agente
+        # (p.ej. un agente sin git/docker/lsp no recibe esas filas/secciones).
+        try:
+            _rules = filter_system_rules(_rules, self.registry.has)
+        except Exception as e:
+            log.debug("filter_system_rules_error", error=str(e))
         result = (
-            f"{header}\n{workspace_ctx}\n"
-            f"{mem_snippet}\n"
-            f"{rag_snippet}"
+            f"{workspace_ctx}\n"
+            f"{header}\n"
+            f"{_rules}\n"
             f"{oocode_section}"
-            f"{agent_instr_section}"
+            f"{agents_section}"
             f"{extra_dirs_section}"
             f"{plugin_injection}\n"
-            f"{SYSTEM_RULES}{think_section}{extra_rules}"
+            f"{mem_snippet}\n"
+            f"{rag_snippet}"
+            f"{think_section}{extra_rules}"
         )
         self._sys_prompt_cache = result
         # _turn_guidance() se añade AQUÍ, fuera del caché: se recalcula en cada
@@ -367,6 +459,17 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             plain = self._strip_rich(text).strip()
             if plain:
                 self._webui_emit({"type": "text", "text": plain})
+
+    def _notice(self, body: str) -> None:
+        """Aviso de sistema de una línea, alineado según contexto.
+
+        Agente principal → indentado 2 con líneas en blanco alrededor.
+        Subagente → vía _print (prefijo │), para no romper la alineación del bloque.
+        """
+        if self.is_subagent:
+            self._print(body)
+        elif not self.capture_output:
+            console.print(f"\n  {body}\n")
 
     # Nombres de display al estilo Claude Code: verb capitalizado en lugar del snake_case interno
     _TOOL_DISPLAY_NAMES: dict[str, str] = {
@@ -432,6 +535,8 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         "gdb_run":          "GDB",
         "valgrind_run":     "Valgrind",
         "explore":          "Explore",
+        "web_search":       "WebSearch",
+        "web_fetch":        "WebFetch",
         # Memoria
         "mem_save":           "Memory",
         "workspace_remember": "OOCODE",
@@ -502,6 +607,9 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         if name in ("lsp_diagnostics", "lint_file", "mypy_check"):
             p = args.get("path", "")
             return _esc(f"({_short_path(p)})") if p else ""
+        if name == "spawn_subagent":
+            sid = args.get("agent_id", "")
+            return _esc(f"(\U0001f4ac {sid})") if sid else ""
         return ""
 
 
@@ -567,52 +675,66 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                 "n_lines": len(_result_str.splitlines()),
                 "preview": _prev,
             }
-            # Detectar fichero creado/editado para mostrar tarjeta de descarga
+            # Tarjeta de descarga: SOLO para entregables que el usuario pide producir
+            # (documentos ofimáticos, PDF, exports). NUNCA para ediciones de código
+            # (edit_file, *_replace, patch_apply) ni ficheros temporales: esos no son
+            # entregables descargables.
             if _is_ok:
-                import os as _ose, re as _re_fp
-                _FC = frozenset((
-                    "write_file", "create_file", "save_file",
+                import os as _ose, re as _re_fp, tempfile as _tf
+                # Tools ofimáticas/documento: siempre producen un entregable
+                _DOC_TOOLS = frozenset((
                     "doc_create", "doc_create_rfc", "doc_project_save",
                     "doc_create_from_template", "doc_fill_template",
                     "doc_fill_corporate_template", "doc_convert",
                     "xlsx_create_report", "xlsx_create_table",
                     "pptx_create", "pptx_create_from_template",
-                ))
-                _FE = frozenset((
-                    "edit_file", "edit_files", "regex_replace",
-                    "smart_replace", "bulk_replace", "patch_apply",
                     "doc_update_section", "xlsx_fill_range",
                 ))
-                _FSC = ("_write_file", "_create_file", "_save_file",
-                        "_doc_create", "_spreadsheet_create",
-                        "_presentation_create", "_export_pdf",
-                        "_create_report", "_create_table",
-                        "_fill_template", "_corporate_template")
-                _FSE = ("_edit_file", "_edit_files", "_regex_replace",
-                        "_smart_replace", "_bulk_replace", "_patch_apply",
-                        "_update_section", "_fill_range")
-                _is_fc = name in _FC or any(name.endswith(s) for s in _FSC)
-                _is_fe = name in _FE or any(name.endswith(s) for s in _FSE)
-                if _is_fc or _is_fe:
+                _DOC_SFX = ("_doc_create", "_spreadsheet_create",
+                            "_presentation_create", "_export_pdf",
+                            "_create_report", "_create_table",
+                            "_fill_template", "_corporate_template",
+                            "_doc_convert", "_update_section", "_fill_range")
+                # write_file/create_file/save_file genéricos: solo si el destino tiene
+                # extensión de entregable (no código). Excluye .py/.c/.js/.md/etc.
+                _GEN_WRITE     = frozenset(("write_file", "create_file", "save_file"))
+                _GEN_WRITE_SFX = ("_write_file", "_create_file", "_save_file")
+                _DELIVERABLE_EXTS = frozenset((
+                    ".docx", ".xlsx", ".pptx", ".pdf",
+                    ".odt", ".ods", ".odp", ".csv",
+                ))
+                _is_doc = name in _DOC_TOOLS or any(name.endswith(s) for s in _DOC_SFX)
+                _is_gen = name in _GEN_WRITE or any(name.endswith(s) for s in _GEN_WRITE_SFX)
+                if _is_doc or _is_gen:
                     _p = (args.get("path") or args.get("file_path") or
                           args.get("output_path") or args.get("filepath") or
                           args.get("dest") or "")
-                    if not _p and "edits" in args and isinstance(args["edits"], list):
-                        _paths = [e.get("path", "") for e in args["edits"] if e.get("path")]
-                        _p = _paths[0] if _paths else ""
                     # Fallback: extraer ruta del texto de resultado (ej. "✅ Guardado: /ruta/f.docx")
                     if not _p and _result_str:
-                        _ext_p = r'\.(?:docx|xlsx|pptx|pdf|odt|csv|md|txt|json|yaml|yml)'
+                        _ext_p = r'\.(?:docx|xlsx|pptx|pdf|odt|ods|odp|csv)'
                         _fm = _re_fp.search(r'(/\S+' + _ext_p + r')', _result_str)
                         if _fm:
                             _p = _fm.group(1).rstrip('.,;)')
                     if isinstance(_p, str) and _p:
-                        _abs = _ose.path.abspath(_ose.path.expanduser(str(_p)))
-                        if _ose.path.isfile(_abs):
+                        _abs  = _ose.path.abspath(_ose.path.expanduser(str(_p)))
+                        _ext  = _ose.path.splitext(_abs)[1].lower()
+                        # Excluir temporales: /tmp, $TMPDIR, .cache, sufijos .tmp/.bak
+                        _tmpdir = _ose.path.realpath(_tf.gettempdir())
+                        _rabs   = _ose.path.realpath(_abs)
+                        _is_temp = (_rabs.startswith(_tmpdir + _ose.sep)
+                                    or _ose.sep + ".cache" + _ose.sep in _abs
+                                    or _ext in (".tmp", ".bak", ".swp"))
+                        # Entregable: tool de documento, o write genérico con ext entregable
+                        _is_deliverable = _is_doc or (_is_gen and _ext in _DELIVERABLE_EXTS)
+                        if (_is_deliverable and not _is_temp
+                                and _ose.path.isfile(_abs)):
+                            _is_edit = (name in ("doc_update_section", "xlsx_fill_range")
+                                        or name.endswith("_update_section")
+                                        or name.endswith("_fill_range"))
                             _ev["file_path"]   = _abs
                             _ev["file_name"]   = _ose.path.basename(_abs)
                             _ev["file_size"]   = _ose.path.getsize(_abs)
-                            _ev["file_action"] = "created" if _is_fc else "edited"
+                            _ev["file_action"] = "edited" if _is_edit else "created"
             self._webui_emit(_ev)
             self._webui_emit(self._webui_status())
             return
@@ -633,6 +755,22 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             _is_ok = not _result_str.startswith("⛔") and not _result_str.startswith("⚠️ DUPLICADO")
 
             if pre_shown:
+                # Orquestación (explore/create_team/run_team/spawn_fanout): el live block del
+                # mensaje anterior ya se cerró en _show_tool_running_header y la tool imprimió
+                # su propio bloque (header + streaming │). Su footer ⎿ va como print ESTÁTICO
+                # aquí — NO a _turn_block: ese buffer se renderiza al cerrar el live block, que
+                # ya no existe, así que el resumen se perdería (quedaría sin footer visible).
+                # (spawn_subagent retornó antes: imprime su propio ⎿ Done dentro del closure.)
+                if name in _ORCHESTRATION_TOOLS:
+                    if _is_ok:
+                        _osum = _make_compact_summary(
+                            [(name, args if isinstance(args, dict) else {}, _result_str, allowed)]
+                        )
+                        self._print(f"  [dim]⎿ {_osum}[/dim]")
+                    else:
+                        _ofirst = _result_str.splitlines()[0] if _result_str else "Error"
+                        self._print(f"  [dim red]⎿ {_esc(_ofirst)}[/dim red]")
+                    return
                 # Ejecución secuencial: el header ◐ solo se mostró para write/replace/mem.
                 # Write/replace: mostrar diff visual; solo mostrar errores si falla.
                 if _is_modify:
@@ -671,6 +809,12 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             if getattr(self, "_update_live_current_tool_cb", None):
                 self._update_live_current_tool_cb("")
             return
+
+        # Subagente con live callbacks del padre inyectados: actualizar sliding window.
+        # Se llama independientemente del rendering (que continúa debajo para el histórico).
+        if self.is_subagent and getattr(self, "_update_live_tools_cb", None):
+            self._live_tool_count += 1
+            self._update_live_tools_cb(self._live_tool_count)
 
         # ── Header ────────────────────────────────────────────────────────────
         is_blocked  = isinstance(result, str) and result.startswith("⛔ AGENTE BLOQUEÓ")
@@ -854,14 +998,31 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         if _in_webui and name == "plan_create":
             return
 
-        # WebUI: emitir evento estructurado tool_start
-        if _in_webui:
+        # WebUI: emitir evento estructurado tool_start.
+        # spawn_subagent NO emite tool_start de agente principal: se representa con
+        # 'subagent_start' (team-bar) + su propio bloque en la conversación. Emitirlo
+        # aquí creaba un bloque huérfano "◐ Ejecutando… / Subagent" que nunca recibía
+        # tool_done (se convierte en 'subagent_done'), por eso quedaba colgado y los
+        # textos del subagente acababan fuera de su bloque.
+        if _in_webui and name != "spawn_subagent":
             ctx_plain = self._strip_rich(ctx).strip()
             self._webui_emit({"type": "tool_start", "tool": display, "raw": name,
                               "context": ctx_plain})
 
+        # Tools de orquestación (spawn_subagent/explore/create_team/run_team/spawn_fanout)
+        # en TUI son la excepción: NO deben alimentar el live block del ● anterior. Estas
+        # tools renderizan su PROPIO bloque en la conversación (header ●/🔍, streaming │,
+        # footer ⎿ Done) vía console.print durante su ejecución. Si el live block del mensaje
+        # previo sigue activo, todo ese output cae en _live_block_body y queda enterrado:
+        # no se ve hasta que el bloque de tools anterior hace flush. Cerramos ese live block
+        # AQUÍ para que la orquestación arranque como un MENSAJE NUEVO, visible en tiempo real.
+        _orch_tui = (name in _ORCHESTRATION_TOOLS and not self.is_subagent and not _in_webui)
+        if _orch_tui and self._flush_live_block_cb:
+            self._flush_turn_block()
+
         # Live block TUI: actualizar la línea |◐ con nombre de tool y preview de args
-        if getattr(self, "_update_live_tool_start_cb", None) and self._status_cb:
+        if (getattr(self, "_update_live_tool_start_cb", None) and self._status_cb
+                and not _orch_tui):
             # Actualización atómica label+preview en una sola operación (evita double-flash)
             self._update_live_tool_start_cb(f"{display}:", _make_tool_preview(name, args))
             # ●: actualizar con verbo en gerundio + contexto breve
@@ -872,7 +1033,7 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                 self._update_live_bullet_cb(
                     f"{_verb} {_ctx_brief}…  (ctrl+o to expand)"
                 )
-        # spawn_subagent: header especial ● [emoji nombre]: tarea
+        # spawn_subagent: header especial ● [emoji nombre]: tarea (live block ya cerrado arriba)
         if name == "spawn_subagent" and not self.is_subagent:
             _sid   = args.get("agent_id", "")
             _stask = args.get("task", "")
@@ -880,13 +1041,24 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             _semoji = _tgt.emoji if _tgt else "🤖"
             _sname  = _tgt.name  if _tgt else _sid
             if not _in_webui:
-                # TUI/REPL: mostrar cabecera inline; WebUI lo gestiona con subagent_start
+                # El task puede ser un bloque markdown multilínea (contexto, listas…).
+                # La primera línea va inline en el header; el resto se renderiza como
+                # Markdown indentado para que **negritas**, listas, etc. no salgan en
+                # crudo (antes todo el task iba por _esc → markdown literal en pantalla).
+                _task_lines = _stask.split('\n', 1)
+                _task_head  = _task_lines[0].rstrip()
+                _task_rest  = _task_lines[1] if len(_task_lines) > 1 else ""
                 self._print(
                     f"\n  [bold green]●[/bold green] "
-                    f"[bold][{_esc(_semoji)} {_esc(_sname)}]:[/bold] [dim]{_esc(_stask)}[/dim]"
+                    f"[bold magenta]spawn_subagent[/bold magenta] "
+                    f"[bold cyan]\U0001f4ac {_esc(_semoji)} {_esc(_sname)}[/bold cyan]"
+                    f"[dim]:[/dim] [dim]{_esc(_task_head)}[/dim]"
                 )
+                if _task_rest.strip():
+                    console.print(Padding(Markdown(_task_rest.strip()), (0, 0, 0, 4)))
             self._webui_emit({"type": "subagent_start",
-                              "agent_id": _sid, "agent_emoji": _semoji, "agent_name": _sname})
+                              "agent_id": _sid, "agent_emoji": _semoji, "agent_name": _sname,
+                              "task": _stask})
             self._sub_lines_shown = 0   # resetear buffer para este subagente
             return
 
@@ -977,76 +1149,48 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         opts.pop("keep_alive", None)
         return opts
 
-    def _chat_kwargs(self, opts: dict) -> dict:
-        """Construye kwargs para client.chat() a partir del dict ya filtrado de _build_options."""
-        if not opts:
-            return {}
-        return {"options": opts}
-
     # ── LLM call ─────────────────────────────────────────────────────────────
 
     def _close_stream_connection(self) -> None:
-        """Cierra el httpx.Client interno de ollama para interrumpir cualquier
-        streaming en curso.  Marca el cliente para reconstrucción antes del
-        próximo request."""
+        """Interrumpe el streaming en curso y marca el cliente para reconstrucción."""
         try:
-            if hasattr(self.client, "_client"):
-                self.client._client.close()
+            self.client.kill_stream()
         except Exception as e:
             log.debug("stream_close_error", error=str(e))
         self._client_needs_rebuild = True
 
     def _rebuild_client_if_needed(self) -> None:
-        """Reconstruye el ollama.Client si el anterior fue cerrado por kill."""
+        """Reconstruye el backend si fue cerrado por kill."""
         if not self._client_needs_rebuild:
             return
         try:
-            self.client = ollama.Client(host=self.config.ollama_host)
-            self._client_needs_rebuild = False  # solo en éxito: un fallo preserva el flag para reintentar
+            self.client.rebuild(self.config)
+            self._client_needs_rebuild = False
         except Exception as e:
-            log.warning("client_rebuild_failed", host=self.config.ollama_host, error=str(e))
+            log.warning("client_rebuild_failed", error=str(e))
 
     def _stream_response(self, messages: list, tools: list) -> tuple[str, list, int, int]:
         self._rebuild_client_if_needed()
         opts = self._build_options()
 
-        # Subagentes y modo captura: stream=False, sin spinner (evita Live en TUI)
+        # Subagentes y modo captura: sync, sin spinner (evita Live en TUI)
         if self.capture_output or self.is_subagent:
             fb_timeout = self.config.model_timeout(self._active_model())
             try:
-                if fb_timeout > 0:
-                    from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeout
-                    _model = self._active_model()
-                    _kwargs = self._chat_kwargs(opts)
-                    with ThreadPoolExecutor(max_workers=1) as _ex:
-                        _fut = _ex.submit(
-                            self.client.chat,
-                            model=_model, messages=messages, tools=tools,
-                            stream=False, **_kwargs,
-                        )
-                        try:
-                            resp = _fut.result(timeout=fb_timeout)
-                        except _FutureTimeout:
-                            self._last_elapsed = fb_timeout * 1.0
-                            self._close_stream_connection()  # aborta el thread del executor y marca rebuild
-                            return _TIMEOUT_SENTINEL, [], 0, 0
-                else:
-                    resp = self.client.chat(
-                        model=self._active_model(),
-                        messages=messages,
-                        tools=tools,
-                        stream=False,
-                        **self._chat_kwargs(opts),
-                    )
-                msg = resp.message
-                return (
-                    msg.content or "",
-                    msg.tool_calls or [],
-                    getattr(resp, "prompt_eval_count", 0) or 0,
-                    getattr(resp, "eval_count", 0) or 0,
+                resp = self.client.chat_sync(
+                    model=self._active_model(),
+                    messages=messages,
+                    tools=tools,
+                    model_params=opts,
+                    timeout=fb_timeout,
                 )
+                return resp.text, resp.tool_calls, resp.input_tokens, resp.output_tokens
+            except TimeoutError:
+                self._last_elapsed = float(fb_timeout) if fb_timeout else 0.0
+                self._close_stream_connection()
+                return _TIMEOUT_SENTINEL, [], 0, 0
             except Exception as e:
-                self._close_stream_connection()  # marca rebuild: la conexión puede haber quedado rota
+                self._close_stream_connection()
                 return f"Error: {e}", [], 0, 0
 
         # Modo display (agente principal): streaming para tokens en tiempo real
@@ -1069,12 +1213,11 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         error      = None
 
         try:
-            stream = self.client.chat(
+            stream = self.client.chat_stream(
                 model=self._active_model(),
                 messages=messages,
                 tools=tools,
-                stream=True,
-                **self._chat_kwargs(opts),
+                model_params=opts,
             )
 
             if self._status_cb:
@@ -1099,34 +1242,28 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                         for chunk in stream:
                             if _kill_ev.is_set():
                                 break   # kill solicitado: dejar de emitir chunks
-                            msg = chunk.message
-                            if msg.thinking:
-                                _think_chars_sh[0] += len(msg.thinking)
+                            if chunk.thinking:
+                                _think_chars_sh[0] += len(chunk.thinking)
                                 if _max_think_chars > 0 and _think_chars_sh[0] > _max_think_chars:
                                     _kill_ev.set()
                                     break  # thinking excesivo: abortar y reintentar sin thinking
-                            if msg.content:
-                                text_parts.append(msg.content)
-                                _out_chars_sh[0] += len(msg.content)
+                            if chunk.text:
+                                text_parts.append(chunk.text)
+                                _out_chars_sh[0] += len(chunk.text)
                                 # Streaming en tiempo real al WebUI (SSE stream_chunk)
-                                self._webui_emit({"type": "stream_chunk", "text": msg.content})
-                            if msg.tool_calls:
-                                _tc_result[0] = list(msg.tool_calls)
-                                # Contar JSON de tool_calls para que ↓ no muestre siempre "…"
+                                self._webui_emit({"type": "stream_chunk", "text": chunk.text})
+                            if chunk.tool_calls:
+                                _tc_result[0] = list(chunk.tool_calls)
                                 try:
                                     _out_chars_sh[0] += sum(
-                                        len(json.dumps(
-                                            getattr(tc.function, "arguments", {})
-                                            if hasattr(tc, "function") else {}
-                                        ))
-                                        for tc in msg.tool_calls
+                                        len(json.dumps(tc.function.arguments))
+                                        for tc in chunk.tool_calls
                                     )
                                 except Exception as e:
                                     log.debug("tool_call_token_count_error", error=str(e))
                             if chunk.done:
-                                _inp_sh[0] = getattr(chunk, "prompt_eval_count", 0) or 0
-                                _out_sh[0] = getattr(chunk, "eval_count", 0) or 0
-                                # Usar eval_count como fallback si no se generó texto
+                                _inp_sh[0] = chunk.input_tokens
+                                _out_sh[0] = chunk.output_tokens
                                 if _out_chars_sh[0] == 0 and _out_sh[0] > 0:
                                     _out_chars_sh[0] = _out_sh[0] * 4
                                 break
@@ -1268,27 +1405,23 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                             for chunk in stream:
                                 if _kill_r.is_set():
                                     break
-                                msg = chunk.message
-                                if msg.thinking:
-                                    _out_chars_r[0] += len(msg.thinking)
-                                if msg.content:
-                                    text_parts.append(msg.content)
-                                    _out_chars_r[0] += len(msg.content)
-                                if msg.tool_calls:
-                                    _tc_r[0] = list(msg.tool_calls)
+                                if chunk.thinking:
+                                    _out_chars_r[0] += len(chunk.thinking)
+                                if chunk.text:
+                                    text_parts.append(chunk.text)
+                                    _out_chars_r[0] += len(chunk.text)
+                                if chunk.tool_calls:
+                                    _tc_r[0] = list(chunk.tool_calls)
                                     try:
                                         _out_chars_r[0] += sum(
-                                            len(json.dumps(
-                                                getattr(tc.function, "arguments", {})
-                                                if hasattr(tc, "function") else {}
-                                            ))
-                                            for tc in msg.tool_calls
+                                            len(json.dumps(tc.function.arguments))
+                                            for tc in chunk.tool_calls
                                         )
                                     except Exception as e:
                                         log.debug("tool_call_token_count_error", error=str(e))
                                 if chunk.done:
-                                    _inp_r[0] = getattr(chunk, "prompt_eval_count", 0) or 0
-                                    _out_r[0] = getattr(chunk, "eval_count", 0) or 0
+                                    _inp_r[0] = chunk.input_tokens
+                                    _out_r[0] = chunk.output_tokens
                                     if _out_chars_r[0] == 0 and _out_r[0] > 0:
                                         _out_chars_r[0] = _out_r[0] * 4
                                     break
@@ -1343,14 +1476,13 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                             if self._kill_requested:
                                 self._close_stream_connection()
                                 break
-                            msg = chunk.message
-                            if msg.content:
-                                text_parts.append(msg.content)
-                            if msg.tool_calls:
-                                tool_calls_result = msg.tool_calls
+                            if chunk.text:
+                                text_parts.append(chunk.text)
+                            if chunk.tool_calls:
+                                tool_calls_result = chunk.tool_calls
                             if chunk.done:
-                                inp_tokens = getattr(chunk, "prompt_eval_count", 0) or 0
-                                out_tokens = getattr(chunk, "eval_count", 0) or 0
+                                inp_tokens = chunk.input_tokens
+                                out_tokens = chunk.output_tokens
                                 break
                             elapsed = time.time() - t_start
                             frame   = _SPINNER_FRAMES[fi % len(_SPINNER_FRAMES)]
@@ -1398,11 +1530,10 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             if _is_eof_truncation:
                 log.warn("xml_eof_truncation_retry", model=self._active_model(),
                          think_level=getattr(self.rt, "think_level", "off"))
-                if not self.capture_output:
-                    console.print(
-                        "\n  [yellow]⚡[/yellow]  Thinking agotó el presupuesto de tokens "
-                        "— XML de tool call truncado. Reintentando sin thinking…\n"
-                    )
+                self._notice(
+                    "[yellow]⚡[/yellow]  Thinking agotó el presupuesto de tokens "
+                    "— XML de tool call truncado. Reintentando sin thinking…"
+                )
                 # Añadir /no_think al último mensaje de usuario para que qwen3 desactive
                 # su bloque <think> solo en esta llamada (no cambia rt.think_level)
                 retry_messages = list(messages)
@@ -1418,20 +1549,13 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                             )
                         break
                 try:
-                    resp = self.client.chat(
+                    _r = self.client.chat_sync(
                         model=self._active_model(),
                         messages=retry_messages,
                         tools=tools,
-                        stream=False,
-                        **self._chat_kwargs(opts),
+                        model_params=opts,
                     )
-                    _rm = resp.message
-                    return (
-                        _rm.content or "",
-                        _rm.tool_calls or [],
-                        getattr(resp, "prompt_eval_count", 0) or 0,
-                        getattr(resp, "eval_count", 0) or 0,
-                    )
+                    return _r.text, _r.tool_calls, _r.input_tokens, _r.output_tokens
                 except Exception as _retry_exc:
                     log.warn("xml_eof_retry_failed", error=str(_retry_exc))
                     # Caer al mensaje de error original
@@ -1443,26 +1567,18 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             if _is_xml and not _is_eof_truncation:
                 log.warn("xml_malformed_retry", model=self._active_model(),
                          error=error_str[:120])
-                if not self.capture_output:
-                    console.print(
-                        "\n  [yellow]⚡[/yellow]  XML de tool call malformado "
-                        "(tag incorrecto) — reintentando…\n"
-                    )
+                self._notice(
+                    "[yellow]⚡[/yellow]  XML de tool call malformado "
+                    "(tag incorrecto) — reintentando…"
+                )
                 try:
-                    resp2 = self.client.chat(
+                    _r2 = self.client.chat_sync(
                         model=self._active_model(),
                         messages=messages,
                         tools=tools,
-                        stream=False,
-                        **self._chat_kwargs(opts),
+                        model_params=opts,
                     )
-                    _rm2 = resp2.message
-                    return (
-                        _rm2.content or "",
-                        _rm2.tool_calls or [],
-                        getattr(resp2, "prompt_eval_count", 0) or 0,
-                        getattr(resp2, "eval_count", 0) or 0,
-                    )
+                    return _r2.text, _r2.tool_calls, _r2.input_tokens, _r2.output_tokens
                 except Exception as _rx2:
                     log.warn("xml_malformed_retry_failed", error=str(_rx2)[:80])
                     # Si el retry también falló pero tenemos texto parcial, devolverlo
@@ -1473,11 +1589,10 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             if partial and _is_xml:
                 log.warn("xml_tool_call_recovered", chars=len(partial),
                          model=self._active_model())
-                if not self.capture_output:
-                    console.print(
-                        "\n  [yellow]⚠[/yellow]  El modelo generó tool calls en XML no válido "
-                        "y el retry falló. Respuesta parcial recuperada.\n"
-                    )
+                self._notice(
+                    "[yellow]⚠[/yellow]  El modelo generó tool calls en XML no válido "
+                    "y el retry falló. Respuesta parcial recuperada."
+                )
                 return partial, [], inp_tokens, out_tokens
 
             # Error de red/conexión real o XML malformado sin texto previo
@@ -1494,7 +1609,7 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                         "usa /think off para reducir la complejidad de la respuesta."
                     )
             else:
-                msg = f"Error conectando con Ollama: {error_str}"
+                msg = f"Error conectando con el backend LLM: {error_str}"
                 self._close_stream_connection()  # error de red: marca rebuild para el siguiente intento
             return msg, [], 0, 0
 
@@ -1519,25 +1634,62 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
 
     # ── Compactación inteligente ──────────────────────────────────────────────
 
+    @staticmethod
+    def _serialize_turns(messages: list[dict]) -> str:
+        """F: serializa msgs agrupando user→(assistant+tools) en turnos numerados.
+
+        Preserva la estructura causa-efecto (qué tool generó qué output) en lugar
+        de aplanar todo a una lista plana. Mejora la calidad del resumen LLM.
+        """
+        lines: list[str] = []
+        turn = 0
+        i = 0
+        n = len(messages)
+        while i < n:
+            role = messages[i].get("role", "")
+            if role == "user":
+                turn += 1
+                raw = messages[i].get("content") or ""
+                if isinstance(raw, list):
+                    content = " ".join(
+                        str(c.get("text", c) if isinstance(c, dict) else c) for c in raw
+                    )
+                else:
+                    content = str(raw)
+                lines.append(f"\n[Turno {turn}]")
+                lines.append(f"Usuario: {content[:400]}")
+                i += 1
+            elif role == "assistant":
+                content = str(messages[i].get("content") or "")[:200]
+                tool_calls = messages[i].get("tool_calls") or []
+                if tool_calls:
+                    names = [tc.get("function", {}).get("name", "?") for tc in tool_calls]
+                    lines.append(f"Asistente: {content} → [{', '.join(names)}]".strip())
+                else:
+                    lines.append(f"Asistente: {content}")
+                i += 1
+                # Tool results asociados a este assistant turn
+                while i < n and messages[i].get("role") == "tool":
+                    tr    = messages[i]
+                    name  = tr.get("name", "?")
+                    body  = str(tr.get("content") or "")
+                    preview = (body[:120].replace("\n", " ") + "…") if len(body) > 120 else body.replace("\n", " ")
+                    lines.append(f"  ↳ {name}: {preview}")
+                    i += 1
+            else:
+                i += 1
+        return "\n".join(lines)
+
     def _summarize_messages(self, messages: list[dict]) -> str:
         """
         Llama al LLM para resumir mensajes eliminados.
-        El resumen se inyecta en el system prompt para no perder contexto.
+        El resumen se inyecta como mensaje system separado (ver get_messages).
         """
         if not messages:
             return ""
-        # Serializa solo user/assistant/tool (sin system) para el prompt de resumen
-        lines = []
-        for m in messages:
-            role = m.get("role", "")
-            content = str(m.get("content") or "")
-            if role == "user":
-                lines.append(f"Usuario: {content}")
-            elif role == "assistant":
-                lines.append(f"Asistente: {content}")
-            elif role == "tool":
-                lines.append(f"Tool({m.get('name', '')}): {content}")
-        if not lines:
+        # F: serialización por turnos preservando estructura causa-efecto
+        serialized = self._serialize_turns(messages)
+        if not serialized.strip():
             return ""
 
         # Incluir estado del plan activo en el prompt para que el resumen lo preserve
@@ -1579,8 +1731,8 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             "IMPORTANTE: Si el usuario ha dado instrucciones especiales (estilo de código, preferencias, "
             "restricciones, 'recuerda que...', 'siempre haz X'), inclúyelas EXPLÍCITAMENTE en el resumen "
             "bajo el encabezado '**Instrucciones del usuario:**'.\n"
-            "Solo hechos relevantes para continuar la tarea. Máximo 6 bullets:\n\n"
-            + "\n".join(lines)
+            f"Solo hechos relevantes para continuar la tarea. Máximo {max(6, min(12, len(messages) // 5))} bullets:\n\n"
+            + serialized
             + _plan_section
             + _state_section
         )
@@ -1624,17 +1776,27 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             + "\n"
         ) if _structured_lines else ""
 
+        # G: meta-header para identificar cada ronda de compactación
+        from datetime import datetime as _dt
+        _ctx_g     = getattr(self, "context", None)
+        _n         = getattr(_ctx_g, "_compact_count", 1) if _ctx_g else 1
+        _conserved = len(_ctx_g.messages) if _ctx_g else 0
+        _total     = len(messages) + _conserved
+        _ts        = _dt.now().strftime("%Y-%m-%d %H:%M")
+        _meta      = f"[Compactación #{_n} — conservados {_conserved}/{_total} msgs — {_ts}]"
+
         try:
             opts = self._build_options()
-            resp = self.client.chat(
+            _cr = self.client.chat_sync(
                 model=self._active_model(),
                 messages=[{"role": "user", "content": prompt_text}],
-                stream=False,
-                **self._chat_kwargs(opts),
+                tools=[],
+                model_params=opts,
             )
-            llm_summary = resp.message.content or ""
+            llm_summary = _cr.text
             # Combinar: bloque estructurado (siempre fiable) + resumen LLM (narrativo)
-            summary = (_structured_block + "\n" + llm_summary).strip() if llm_summary else _structured_block.strip()
+            body = (_structured_block + "\n" + llm_summary).strip() if llm_summary else _structured_block.strip()
+            summary = f"{_meta}\n\n{body}" if body else _meta
             if summary:
                 # Escribe en memoria diaria como checkpoint
                 self.ws.write_daily_memory(
@@ -1642,9 +1804,63 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                 )
             return summary
         except Exception:
-            # Sin LLM: al menos preservar el bloque estructurado
-            return _structured_block.strip()
+            # Sin LLM: al menos preservar meta-header + bloque estructurado
+            body = _structured_block.strip()
+            return f"{_meta}\n\n{body}" if body else _meta
 
+
+    def _condense_summary(self, summary: str) -> str:
+        """Condensa un summary acumulado demasiado largo con una llamada LLM adicional.
+
+        Solo se invoca cuando el summary supera max_summary_chars tras varias compactaciones.
+        """
+        prompt = (
+            "El siguiente es un resumen acumulado de varias compactaciones de contexto que ha crecido demasiado.\n"
+            "Condénsalo en un máximo de 10 bullets concisos conservando:\n"
+            "  - La tarea original del usuario\n"
+            "  - Ficheros modificados (rutas absolutas)\n"
+            "  - Instrucciones especiales del usuario ('recuerda que…', 'siempre haz X')\n"
+            "  - Estado del plan de tareas si lo hay\n"
+            "  - El progreso y decisiones más recientes\n\n"
+            + summary
+        )
+        try:
+            opts = self._build_options()
+            _cr = self.client.chat_sync(
+                model=self._active_model(),
+                messages=[{"role": "user", "content": prompt}],
+                tools=[],
+                model_params=opts,
+            )
+            return _cr.text
+        except Exception:
+            return ""
+
+    def _maybe_precompact_idle(self) -> None:
+        """I: lanza compactación en background si el contexto está entre high_water y compact_threshold.
+
+        Se invoca al finalizar cada turno (vuelta a idle). Si el contexto está
+        en la zona de advertencia (high_water ≤ pct < compact_threshold), se compacta
+        ahora en background para que el próximo turno empiece con contexto limpio.
+        El event _compact_running garantiza que si el usuario envía un mensaje antes
+        de que termine, run() espera a que la pre-compactación acabe.
+        """
+        if self.capture_output or self.is_subagent:
+            return
+        if self._compact_running.is_set():
+            return
+        if self._precompact_thread and self._precompact_thread.is_alive():
+            return
+        ctx = self.context
+        pct = ctx.token_estimate() / max(ctx.max_tokens, 1)
+        if ctx.high_water <= pct < ctx.compact_threshold:
+            self._precompact_thread = threading.Thread(
+                target=self._do_compact,
+                kwargs={"with_summary": True},
+                daemon=True,
+                name="oocode-precompact",
+            )
+            self._precompact_thread.start()
 
     def _do_compact(self, with_summary: bool = True) -> int:
         """Compacta el contexto con barra de progreso. Devuelve msgs eliminados."""
@@ -1771,7 +1987,7 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         Reduce el overhead de ~11K tokens enviando solo los schemas pertinentes.
         Devuelve todos si el filtrado resulta en <20 schemas (seguridad).
         """
-        all_schemas = self.registry.ollama_schemas()
+        all_schemas = self.registry.tool_schemas()
         groups = self._classify_task_groups(hint)
         if groups == frozenset(_TOOL_GROUPS.keys()):
             return all_schemas
@@ -1810,6 +2026,79 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                 + base_msg
             )
         return base_msg
+
+    def _recovery_snippet(self, path: str, max_lines: int = 50,
+                          max_chars: int = 2500) -> str:
+        """Lee el fichero y devuelve su contenido real con números de línea (acotado).
+
+        Se inyecta cuando el agente falla repetidamente al modificar un fichero: darle
+        el texto literal (ground truth) corta el bucle de old_string alucinado mejor que
+        pedirle que lo lea (que el modelo suele ignorar tras compactar)."""
+        try:
+            with open(os.path.expanduser(str(path)), encoding="utf-8", errors="replace") as _f:
+                lines = _f.read().split("\n")
+        except OSError:
+            return ""
+        shown = lines[:max_lines]
+        out, total = [], 0
+        for i, ln in enumerate(shown, 1):
+            row = f"  L{i}: {ln}"
+            total += len(row) + 1
+            if total > max_chars:
+                out.append("  …")
+                break
+            out.append(row)
+        if len(lines) > len(shown) and (not out or out[-1] != "  …"):
+            out.append(f"  … (+{len(lines) - len(shown)} líneas más; usa read_file con offset)")
+        return "\n".join(out)
+
+    def _modify_failure_guidance(self, path: str, extra: str = "") -> str:
+        """Cuenta fallos de modificación por fichero en el turno y devuelve guía escalada.
+
+        Unifica edit_file (PRE-EDIT), regex/bulk sin coincidencias y writes duplicados:
+        el agente que cicla edit→regex→write sobre el MISMO fichero escala igual.
+        - 1.º: lee el fichero y copia el texto literal.
+        - 2.º: inyecta el contenido REAL (puede que el cambio ya esté aplicado).
+        - 3.º+: parada en seco — no más ediciones a ese fichero este turno."""
+        p = str(path or "")
+        counts = getattr(self, "_failed_modify_by_path", None)
+        if counts is None:
+            counts = {}
+            self._failed_modify_by_path = counts
+        cnt = counts.get(p, 0) + 1
+        counts[p] = cnt
+        base = os.path.basename(p) or p or "el fichero"
+        if cnt >= 3:
+            return (
+                f"\n\n⛔ STOP — {cnt} intentos fallidos de modificar {base} en este turno. "
+                "NO vuelvas a editar este fichero ahora.\n"
+                "Lo más probable: el cambio YA está aplicado (de un turno anterior) o el texto que buscas no existe.\n"
+                "1. read_file(path) UNA sola vez y compáralo con lo que querías lograr.\n"
+                "2. Si el cambio ya está presente → DÍSELO al usuario y continúa con lo siguiente. NO edites.\n"
+                "3. Si de verdad falta y no consigues el texto exacto → explica el bloqueo al usuario y pide ayuda."
+            )
+        if cnt == 2:
+            snippet = self._recovery_snippet(p)
+            body = (
+                f"\n\n⚡ AGENTE [2.º fallo al modificar {base}]: el texto que buscas NO coincide con el fichero real.\n"
+                "Causa habitual: el cambio YA se aplicó antes, o difieren espacios/indentación.\n"
+            )
+            if snippet:
+                body += (
+                    "CONTENIDO REAL ACTUAL del fichero (cópialo literal si todavía hay que editar):\n"
+                    f"{snippet}\n"
+                    "→ Si arriba ves que el cambio YA está hecho: NO edites, informa al usuario.\n"
+                    "→ Si falta: usa edit_file con old_string copiado EXACTO de arriba (no de memoria)."
+                )
+            else:
+                body += "→ Lee el fichero con read_file(path) y copia el texto literal."
+            return body + (f"\n{extra}" if extra else "")
+        return (
+            f"\n\n⚡ AGENTE [fallo al modificar {base}]: el texto buscado no coincide. "
+            "Lee el fichero real antes de reintentar — read_file(path) o read_sections(path, ['Funcion']) — "
+            "y copia el texto literal (espacios e indentación incluidos)."
+            + (f"\n{extra}" if extra else "")
+        )
 
     def _precheck_tool_call(self, name: str, args: dict) -> "str | None":
         """Pre-flight: bloquea tool calls que indican creación/ejecución de scripts
@@ -1870,9 +2159,8 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                             f"⛔ PRE-EDIT FALLIDO: old_string no encontrado en '{_edit_path}'.\n"
                             f"Primera línea buscada: {_first_line!r}\n"
                             f"El texto debe coincidir exactamente (espacios, indentación, "
-                            f"saltos de línea).{_close_str}\n"
-                            f"Usa read_sections(path='{_edit_path}', "
-                            f"sections=['NombreFuncion']) para ver el texto REAL antes de editar."
+                            f"saltos de línea).{_close_str}"
+                            + self._modify_failure_guidance(_edit_path)
                         )
                 except OSError:
                     pass  # El fichero no se puede leer → dejar que edit_file lo maneje
@@ -2234,18 +2522,48 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         re.IGNORECASE | re.MULTILINE,
     )
 
-    @classmethod
-    def _is_completion_report(cls, text: str) -> bool:
+    def _done_phrase_text(self) -> str:
+        """Frase de completado configurada (lazy: tolera __init__ bypaseado en tests)."""
+        dp = getattr(self, "_done_phrase", None)
+        if not dp:
+            _cfg = getattr(self, "config", None)
+            dp = getattr(_cfg, "completion_phrase", "") or "He completado todas las tareas."
+            self._done_phrase = dp
+        return dp
+
+    def _done_phrase_re(self):
+        """Regex de la frase de completado configurada (lazy: tolera __init__ bypaseado).
+
+        Construye desde `config.completion_phrase` + `completion_extra_phrases`; si no hay
+        config disponible (p.ej. instancia de test vía __new__) usa el default castellano.
+        """
+        re_ = getattr(self, "_cfg_done_re", None)
+        if re_ is None:
+            _cfg = getattr(self, "config", None)
+            phrase = getattr(_cfg, "completion_phrase", "") or "He completado todas las tareas."
+            extra  = getattr(_cfg, "completion_extra_phrases", []) or []
+            variants = [phrase] + list(extra)
+            re_ = re.compile("|".join(re.escape(p) for p in variants if p), re.IGNORECASE)
+            self._cfg_done_re = re_
+        return re_
+
+    def _is_completion_report(self, text: str) -> bool:
         """True si el texto parece un informe de tarea completada (no un plan futuro).
 
-        Detecta señales en pasado/informe: "he completado", "## Resumen", etc.
+        Detecta señales en pasado/informe: "he completado", "## Resumen", etc.,
+        más la frase de completado configurada (`completion.phrase`, idioma del agente).
         Se usa para evitar que auto-continue dispare después de un informe final.
         """
-        if not text or len(text) < 40:
+        if not text:
+            return False
+        # La frase canónica configurada se reconoce sin mínimo de longitud (puede ser breve)
+        if self._done_phrase_re().search(text):
+            return True
+        if len(text) < 40:
             return False
         return bool(
-            cls._COMPLETION_REPORT_RE.search(text)
-            or cls._COMPLETION_HEADER_RE.search(text)
+            self._COMPLETION_REPORT_RE.search(text)
+            or self._COMPLETION_HEADER_RE.search(text)
         )
 
     # ── Task plan tracker ────────────────────────────────────────────────────
@@ -2304,7 +2622,7 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         )
         # Capa 1: señal de completado global — SOLO si menciona "todas" / "all tasks"
         # NO usar _is_completion_report aquí: "he completado [un fichero]" no es completado global
-        if self._DONE_SIGNAL_RE.search(text):
+        if self._DONE_SIGNAL_RE.search(text) or self._done_phrase_re().search(text):
             _pending = sum(1 for t in self._plan_tasks if t["status"] == "pending")
             # La señal es prematura si:
             #   (a) todavía hay tareas ◻ que no han empezado, O
@@ -2433,13 +2751,13 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                     if not _is_last
                     else " Ésta es la última tarea. Al terminarla: "
                          "(1) llama run_tests/test_file si modificaste código; "
-                         "(2) escribe \"He completado todas las tareas.\" como primera frase."
+                         f"(2) escribe \"{self._done_phrase_text()}\" como primera frase."
                 )
                 hints.append(
                     f"\n📋 PLAN EN CURSO [{_done_t + 1}/{_total_t}]:\n{_task_lines}\n"
                     f"→ Completando ahora: \"{_plan_tasks_g[_ai]['text']}\".{_next_hint}\n"
                     f"→ NO respondas vacío. Usa tools o describe el avance.\n"
-                    f"→ PROHIBIDO: no emitas \"He completado todas las tareas\" mientras haya ◻ tareas pendientes "
+                    f"→ PROHIBIDO: no emitas \"{self._done_phrase_text()}\" mientras haya ◻ tareas pendientes "
                     f"o si mencionas \"Próximo paso\" / trabajo futuro en la misma respuesta.\n"
                 )
 
@@ -2530,10 +2848,10 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                                  "regex_replace", "edit_files", "patch_apply"))
         if total >= 10 and _reads_n >= 8 and _writes_n == 0:
             hints.append(
-                f"\n⚡ EVALUACIÓN AGENTE [{_reads_n}/{total} exploración sin escrituras]: "
-                "Has explorado extensamente pero no has modificado nada. "
-                "Si la tarea requiere cambios: usa edit_file, write_file o bulk_replace. "
-                "Si es solo análisis: responde con lo que has encontrado."
+                f"\n⚡ EVALUACIÓN AGENTE [{_reads_n}/{total} exploración sin acción]: "
+                "Has explorado/consultado extensamente pero aún no has producido ningún resultado. "
+                "Si la tarea requiere cambios o acciones: ejecútalas ya (editar, crear, enviar, ejecutar… según tu dominio). "
+                "Si es solo análisis/consulta: responde al usuario con lo que has encontrado."
             )
 
         # ── 7. Atasco total — últimas 4 acciones todas con error ─────────────
@@ -2579,10 +2897,10 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         _search_n = sum(1 for n, _, _ in self._last_tool_calls if n in _search_names)
         if total >= 6 and _search_n >= 4 and _writes_n == 0 and _has_edits == 0:
             hints.append(
-                f"\n⚡ EVALUACIÓN AGENTE [{_search_n} búsquedas sin implementación]: "
-                "Llevas mucho tiempo explorando sin aplicar cambios. "
-                "Si ya tienes el cuadro claro: enumera los problemas y di 'Implemento:' antes de editar. "
-                "Si no: usa explore(task) para una exploración profunda en una sola llamada."
+                f"\n⚡ EVALUACIÓN AGENTE [{_search_n} búsquedas sin avance]: "
+                "Llevas mucho tiempo explorando/buscando sin pasar a la acción ni responder. "
+                "Si ya tienes el cuadro claro: anúncialo y pasa a la acción (o responde al usuario con tus conclusiones). "
+                "Si necesitas profundizar: usa explore(task) para una exploración profunda en una sola llamada."
             )
 
         # ── 10. Misma tool con mismos args llamada N veces (bucle exacto) ────────
@@ -2672,28 +2990,53 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                     "Si la búsqueda devuelve resultados, lee el más relevante antes de continuar."
                 )
 
-        # ── 13. Exploración intensa sin plan — sugerir crear plan ahora ─────────
-        # Cuando el agente lleva muchas tool calls exploratorias (lecturas/búsquedas)
-        # sin ninguna escritura y SIN plan activo, es señal de una tarea compleja
-        # que se beneficiaría de un plan estructurado antes de implementar.
+        # ── 13. Exploración intensa sin plan — evaluar estrategia antes de implementar ──
+        # Distingue exploración de un solo módulo (→ ejecución directa o anuncio breve)
+        # de exploración multi-módulo (→ evaluar paralelismo o plan con tareas).
         _no_plan = not getattr(self, "_plan_tasks", [])
         _no_writes = _writes_n == 0
+        _EXPLORE_TOOLS_13 = frozenset({
+            "read_file", "read_files", "grep_code", "find_file", "find_files",
+            "find_dir", "ls_dir", "symbol_lookup", "lsp_symbols",
+            "lsp_workspace_symbols", "lsp_references", "multi_grep",
+            "code_compare", "explore", "analyze_codebase",
+        })
         _has_reads_count = sum(
-            1 for n, _, _ in self._last_tool_calls
-            if n in ("read_file", "read_files", "grep_code", "find_file", "find_files",
-                     "find_dir", "ls_dir", "symbol_lookup", "lsp_symbols",
-                     "lsp_workspace_symbols", "lsp_references", "multi_grep",
-                     "code_compare", "explore", "analyze_codebase")
+            1 for n, _, _ in self._last_tool_calls if n in _EXPLORE_TOOLS_13
         )
         if _no_plan and _no_writes and _has_reads_count >= 5 and total >= 5:
-            hints.append(
-                f"\n⚡ EVALUACIÓN AGENTE [{_has_reads_count} exploraciones, sin plan activo]: "
-                "Has realizado exploración extensiva. ANTES de implementar, crea un plan con:\n"
-                "  plan_create(tasks=[\"Tarea 1: …\", \"Tarea 2: …\"], summary=\"Qué vas a hacer\")\n"
-                "  • Para cada tarea: fichero exacto, qué cambiarás, por qué.\n"
-                "  • Llama task_done() al completar cada tarea para avanzar el panel visual.\n"
-                "Esto evita ediciones desorganizadas y hace el trabajo verificable."
-            )
+            # Calcular cuántos directorios distintos toca la exploración
+            _explored_dirs: set[str] = set()
+            for _en, _ea, _ in self._last_tool_calls:
+                if _en not in _EXPLORE_TOOLS_13:
+                    continue
+                _ep = (_ea.get("path") or _ea.get("directory") or
+                       _ea.get("file", "")) if isinstance(_ea, dict) else ""
+                if _ep and isinstance(_ep, str):
+                    _explored_dirs.add(os.path.dirname(str(_ep)))
+            _n_dirs = len(_explored_dirs)
+            _multi_module = _n_dirs >= 3  # ≥3 directorios distintos → multi-módulo
+
+            if _multi_module:
+                hints.append(
+                    f"\n⚡ EVALUACIÓN AGENTE [{_has_reads_count} exploraciones en {_n_dirs} módulos, sin plan activo]: "
+                    "Exploración multi-módulo. Evalúa la estrategia ANTES de implementar:\n"
+                    "  • Partes independientes, mismo dominio → spawn_fanout (1 llamada, N chunks en paralelo)\n"
+                    "  • Dominios distintos (código + docs + web) → create_team + run_team\n"
+                    "  • Tareas separadas con estado aislado → spawn_subagent (1 por turno; NO lo batchees con exploración u otras tools)\n"
+                    "  • Dependencias estrictas entre módulos → plan_create con tareas secuenciales\n"
+                    "  • Cambio transversal único → plan_create agrupando ficheros por área\n"
+                    "Elige la estrategia primero, implementa después."
+                )
+            else:
+                hints.append(
+                    f"\n⚡ EVALUACIÓN AGENTE [{_has_reads_count} exploraciones en módulo único, sin plan activo]: "
+                    "Exploración concentrada. ANTES de implementar, elige el nivel correcto:\n"
+                    "  • Cambio acotado (1-2 ficheros, acción clara) → anuncia en 1 frase y ejecuta directamente\n"
+                    "  • Varios ficheros del mismo módulo → lista los pasos en texto (sin plan_create)\n"
+                    "  • Tarea mayor de lo esperado → plan_create con tareas concretas\n"
+                    "No uses plan_create donde basta un anuncio breve."
+                )
 
         # ── 14. Escrituras sin tests — recordatorio antes de declarar completado ─
         # Si el turno tiene ediciones/escrituras pero ninguna llamada a run_tests
@@ -2703,15 +3046,49 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         _modify_names = frozenset({"edit_file", "write_file", "bulk_replace",
                                    "regex_replace", "edit_files", "patch_apply",
                                    "smart_replace"})
+        # Solo exige tests si se tocó CÓDIGO real. Las extensiones de documento/datos
+        # (.docx/.xlsx/.md/.json…) no se verifican con run_tests, así que un agente de
+        # ofimática/investigación que genera entregables no debe recibir este aviso.
+        # Señal por extensión (fiable, independiente del tipo de agente). Si no se
+        # puede determinar la ruta, se asume código (conservador → avisa).
+        _DOC_NONCODE_EXTS = frozenset({
+            ".docx", ".xlsx", ".pptx", ".pdf", ".odt", ".ods", ".odp", ".csv",
+            ".md", ".markdown", ".rst", ".txt", ".log", ".html", ".htm",
+        })
+
+        def _modify_touches_code() -> bool:
+            for _mn, _ma_str, _ in self._last_tool_calls:
+                if _mn not in _modify_names:
+                    continue
+                _paths: list[str] = []
+                try:
+                    _ma = json.loads(_ma_str) if _ma_str else {}
+                except Exception:
+                    return True  # args ilegibles → conservador
+                _p = (_ma.get("path") or _ma.get("file_path") or
+                      _ma.get("output_path") or _ma.get("filepath") or "")
+                if _p:
+                    _paths.append(_p)
+                if isinstance(_ma.get("edits"), list):
+                    _paths += [e.get("path", "") for e in _ma["edits"] if isinstance(e, dict) and e.get("path")]
+                if not _paths:
+                    return True  # sin ruta detectable → conservador
+                for _pp in _paths:
+                    _ext = os.path.splitext(str(_pp))[1].lower()
+                    if _ext not in _DOC_NONCODE_EXTS:
+                        return True  # al menos un fichero parece código
+            # Hubo modificaciones pero todas a ficheros de documento/datos → no avisar
+            return False
+
         _has_modifications = any(n in _modify_names for n, _, _ in self._last_tool_calls)
-        if _has_modifications and not _has_tests and total >= 2:
+        if _has_modifications and not _has_tests and total >= 2 and _modify_touches_code():
             hints.append(
                 f"\n⚡ EVALUACIÓN AGENTE [código modificado, tests no ejecutados]: "
                 "Has editado ficheros en este turno pero aún no has ejecutado tests. "
                 "OBLIGATORIO antes de declarar completado:\n"
                 "  run_tests(path='tests/')  — suite completa\n"
                 "  test_file(path='tests/test_X.py')  — fichero específico\n"
-                "No puedes escribir \"He completado todas las tareas.\" sin haber verificado con tests."
+                f"No puedes escribir \"{self._done_phrase_text()}\" sin haber verificado con tests."
             )
 
         # ── 15. Turno silencioso — el modelo ejecuta tools sin comunicar nada ──
@@ -2728,6 +3105,22 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                 "  • 'Revisando [fichero] para localizar la función de [nombre]...'\n"
                 "  • 'He encontrado el problema en [fichero], aplico el fix:'\n"
                 "  • 'Explorando la estructura del módulo [nombre]...'"
+            )
+
+        # ── 15b. Arranque en frío a mitad de tarea ────────────────────────────
+        # El agente ya usó tools este turno pero su último texto es un saludo o una
+        # petición de instrucciones de cero (típico tras descargar un PDF/URL: el
+        # modelo confunde la salida de la tool con un mensaje nuevo del usuario).
+        # Reorienta hacia la tarea en curso.
+        _cold = (getattr(self, "_last_agent_msg", "") or "").strip()
+        if self._last_tool_calls and _cold and _COLD_START_RE.search(_cold):
+            hints.append(
+                f"\n⚠ EVALUACIÓN AGENTE [arranque en frío a mitad de tarea]: "
+                f"Ya estás trabajando en una tarea en curso (has usado "
+                f"{len(self._last_tool_calls)} tool{'s' if len(self._last_tool_calls) != 1 else ''} este turno). "
+                "El contenido reciente es SALIDA DE TUS HERRAMIENTAS (p.ej. un PDF/URL que descargaste), "
+                "NO un mensaje nuevo del usuario. NO saludes ni pidas instrucciones de cero: "
+                "continúa la tarea — procesa el contenido obtenido y avanza hacia el objetivo original."
             )
 
         # ── 16. Checkpoint de tarea — inyecta estado en auto-continúas ─────────
@@ -2817,6 +3210,8 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         ]
         self._plan_tasks[0]["status"] = "active"
         self._plan_tasks[0]["start_ts"] = time.time()
+        _ctx = getattr(self, "context", None)
+        self._plan_active_msg_idx = len(_ctx.messages) if _ctx is not None else 0
 
         # Persistir en TaskManager para /task list y supervivencia a reinicios
         if not self.is_subagent and getattr(self, "tasks", None) is not None:
@@ -2913,6 +3308,8 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         if next_idx >= 0:
             self._plan_tasks[next_idx]["status"] = "active"
             self._plan_tasks[next_idx]["start_ts"] = now_ts
+            _ctx = getattr(self, "context", None)
+            self._plan_active_msg_idx = len(_ctx.messages) if _ctx is not None else 0
             # Sync TaskManager: siguiente tarea activa
             if not self.is_subagent and getattr(self, "tasks", None) is not None:
                 next_tid = self._plan_tasks[next_idx].get("task_id")
@@ -2967,7 +3364,7 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         return (
             f"✔ Todas las {total} tareas completadas.\n"
             f"⚠️ Responde al usuario con un resumen conciso y di "
-            f"'He completado todas las tareas.' como primera frase."
+            f"'{self._done_phrase_text()}' como primera frase."
         )
 
     def _restore_plan_from_tasks(self) -> None:
@@ -3062,6 +3459,11 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         if rejection is not None:
             return rejection
 
+        # Heartbeat: ejecutar una tool es progreso → resetea el watchdog del subagente
+        # (timeout por inactividad/paso). Una tool legítimamente lenta (build, tests)
+        # no debe contar como "sin progreso" del paso anterior.
+        self._subagent_heartbeat()
+
         # mem_save: ejecución especial con fases visuales en el spinner
         if name == "mem_save":
             return self._execute_mem_save(args)
@@ -3100,10 +3502,11 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         if name in self._WRITE_TOOLS:
             prev = self._turn_write_seen.get(key_hash)
             if prev is not None:
+                _dp = str(args.get("path", "") or args.get("file_path", ""))
                 return (
                     f"⚠️ DUPLICADO BLOQUEADO: {name} con los mismos argumentos ya se ejecutó "
-                    f"en este turno.\nResultado anterior: {prev[:300]}\n"
-                    "Usa read_file para verificar el estado actual antes de repetir."
+                    f"en este turno.\nResultado anterior: {prev[:300]}"
+                    + self._modify_failure_guidance(_dp)
                 )
             result = self.registry.call(name, args)
             result_str = str(result)
@@ -3126,6 +3529,8 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             path = args.get("path", "")
             if path and not result_str.startswith(("Error", "⚠️", "⛔")):
                 self._session_reads.append((str(path), None, True))
+                # Modificación exitosa → resetea el contador de fallos de ese fichero
+                getattr(self, "_failed_modify_by_path", {}).pop(str(path), None)
                 # Invalidar el fichero en el RAG para que se re-indexe en el próximo turno
                 _rag = getattr(self, "_workspace_rag", None)
                 if _rag is not None:
@@ -3172,6 +3577,14 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         "symbol_lookup", "code_search",
     })
 
+    # Tools que inyectan contenido de un documento/URL externo en el contexto.
+    # Su resultado se etiqueta para que el modelo no lo confunda con un mensaje
+    # nuevo del usuario (un modelo débil, tras descargar p.ej. un PDF, tiende a
+    # saludar de cero "¡Hola! Veo que has compartido un PDF…" y abandonar la tarea).
+    _EXTERNAL_DOC_TOOLS = frozenset({
+        "web_fetch", "pdf_extract_text", "doc_read", "doc_extract_metadata",
+    })
+
     # Patrones de error en output bash que requieren orientación específica
     _BASH_ERR_PATTERNS: list[tuple[str, str]] = [
         ("no such file or directory",
@@ -3195,9 +3608,28 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
 
     def _postprocess_tool_result(self, name: str, args: dict, result: str) -> str:
         """Post-procesado de resultados:
-        1. Detecta bucles de búsqueda vacíos → hint para cambiar estrategia.
-        2. Detecta errores bash comunes → orientación específica.
+        1. Etiqueta contenido de documentos/URLs externos (anti-confusión usuario).
+        2. Detecta bucles de búsqueda vacíos → hint para cambiar estrategia.
+        3. Detecta errores bash comunes → orientación específica.
         """
+        # ── Etiquetado de contenido externo (web/PDF/doc) ─────────────────────
+        # Antepone una cabecera clara para que el modelo entienda que es SALIDA de
+        # una tool (no un mensaje del usuario) y siga con la tarea en curso. Va al
+        # principio para sobrevivir a _truncate_tool_result (que recorta por el final).
+        if name in self._EXTERNAL_DOC_TOOLS:
+            _r = result.strip()
+            _is_err = _r.startswith("Error") or _r.startswith("⛔") or not _r
+            if not _is_err:
+                _origen = (args.get("url") or args.get("path")
+                           or args.get("input_path") or args.get("file_path") or "")
+                _org_txt = f" de «{_origen}»" if _origen else ""
+                return (
+                    f"[Resultado de la tool {name}: contenido obtenido{_org_txt}. "
+                    "Es SALIDA DE HERRAMIENTA, NO un mensaje nuevo del usuario — "
+                    "continúa la tarea en curso; no saludes ni reinicies la conversación.]\n\n"
+                    + result
+                )
+
         # ── Detección de errores bash con orientación específica ──────────────
         if name == "bash":
             result_lower = result.lower()
@@ -3214,33 +3646,18 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             self._failed_edit_streak += 1
             pat = str(args.get("pattern", args.get("old", str(args)[:60])))[:80]
             self._failed_edit_patterns.append(pat)
-            if self._failed_edit_streak == 1:
-                hint = (
-                    f"\n\n⚡ AGENTE [regex sin coincidencias]: El patrón '{pat}' no existe tal como está.\n"
-                    "SIGUIENTE PASO OBLIGATORIO antes de reintentar:\n"
-                    "• read_file(path) → ve el contenido REAL del fichero\n"
-                    "• Copia el texto exacto → usa edit_file(old_string='...literal...')\n"
-                    "• O usa smart_replace(file, pattern, replacement) — muestra contexto si falla\n"
-                    "• Regex tip: puede que haya espacios/tabs diferentes, o el texto cambia de línea."
-                )
-            else:
-                tried = self._failed_edit_patterns[-5:]
-                hint = (
-                    f"\n\n⚡ AGENTE [BUCLE DETECTADO — {self._failed_edit_streak} regex fallidas seguidas]: "
-                    f"Patrones probados: {tried}.\n"
-                    "⛔ PARA ahora. Proceso obligatorio:\n"
-                    "1. read_file(path) — lee el fichero completo para ver el texto real\n"
-                    "2. Identifica las líneas exactas a cambiar (con sus números de línea)\n"
-                    "3. Usa edit_file(old_string='copia literal', new_string='...') — sin regex\n"
-                    "   Si necesitas regex: verifica primero con grep_code(pattern, path)\n"
-                    "   smart_replace(file, pattern, replacement) — busca + muestra contexto + aplica"
-                )
-            return result + hint
+            _ep = str(args.get("path", "") or args.get("file_path", ""))
+            return result + self._modify_failure_guidance(
+                _ep, extra=f"Patrón que no coincide: {pat!r}."
+            )
 
         # Reset si la edición tuvo éxito
         if name in _EDIT_TOOLS and _NO_MATCH_KW not in result.lower():
             self._failed_edit_streak = 0
             self._failed_edit_patterns = []
+            _ep = str(args.get("path", "") or args.get("file_path", ""))
+            if _ep:
+                getattr(self, "_failed_modify_by_path", {}).pop(_ep, None)
 
         # ── Detector de bucles de búsqueda vacíos ────────────────────────────
         is_empty = ("Sin resultados" in result or "No se encontró" in result
@@ -3359,6 +3776,7 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         # Resetear estado interno residual (evita que _system_prompt use msg stale)
         self._last_user_msg      = ""
         self._last_response      = ""
+        self._last_agent_msg     = ""
         self._last_tool_calls    = []
         self._pending_usage_line = ""
         self._turn_mem_snippet   = None
@@ -3453,6 +3871,7 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         self._empty_search_patterns = []
         self._failed_edit_streak = 0
         self._failed_edit_patterns = []
+        self._failed_modify_by_path = {}
         self._turn_read_cache = {}
         self._turn_write_seen = {}
         self._turn_read_paths = set()
@@ -3526,7 +3945,14 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             return True
 
         if self._ext_kill is not None and self._ext_kill.is_set():
-            self._print("\n  [yellow]↯[/yellow]  Subagente detenido por el usuario.")
+            # Distinguir kill del usuario vs. timeout automático del watchdog:
+            # el watchdog marca el ActiveSubAgent con status="killed" + error="Timeout: …".
+            _ref = getattr(self, "_sub_stats_ref", None)
+            _err = getattr(_ref, "error", None) if _ref is not None else None
+            if _err and str(_err).startswith("Timeout"):
+                self._print(f"\n  [yellow]↯[/yellow]  Subagente detenido — {_err}.")
+            else:
+                self._print("\n  [yellow]↯[/yellow]  Subagente detenido por el usuario.")
             return True
 
         if self._steer_queue is not None:
@@ -3541,6 +3967,21 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                 pass
 
         return False
+
+    def _subagent_heartbeat(self) -> None:
+        """Señala progreso al watchdog del subagente (timeout por inactividad/paso).
+
+        El watchdog de `spawn_background` mide tiempo SIN progreso, no tiempo total,
+        de modo que el timeout configurado (`subagents.defaultTimeout`) es efectivo
+        "por petición al LLM / paso". Se llama al iniciar cada iteración del bucle,
+        al recibir respuesta del LLM y tras cada tool. No-op si no es subagente.
+        """
+        _ref = getattr(self, "_sub_stats_ref", None)
+        if _ref is not None:
+            try:
+                _ref.heartbeat()
+            except Exception:
+                pass
 
     def _turn_iter_prepare(self) -> tuple[list, list]:
         """Compacta contexto, emite avisos de contexto, refresca schemas y mensajes. Devuelve (messages, tools_cache)."""
@@ -3565,7 +4006,9 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
 
         self._sep_label = ""
         _tools_cache = self._filtered_schemas(self._last_user_msg)
-        messages = self.context.get_messages(system=self._system_prompt())
+        _sys = self._system_prompt()
+        self._last_system_chars = len(_sys)
+        messages = self.context.get_messages(system=_sys)
         self._trace_header(messages)
         return messages, _tools_cache
 
@@ -3621,7 +4064,7 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                     text = (
                         f"Error: el modelo de fallback '{_fb_model}' también excedió "
                         f"el tiempo de espera ({_to_secs}s). Comprueba la conexión con "
-                        "Ollama o aumenta `timeoutSeconds` en `models.configs` de oocode.json."
+                        "el backend LLM o aumenta `timeoutSeconds` en `models.configs` de oocode.json."
                     )
                     tool_calls = []
                     inp = out = 0
@@ -3635,6 +4078,66 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                 inp = out = 0
 
         return text, tool_calls, inp, out
+
+    def request_kill(self) -> dict:
+        """Solicita el kill del turno actual y de todo lo que haya lanzado.
+
+        Hace tres cosas de inmediato (no espera a que el bucle las detecte):
+        1. Marca `_kill_requested` para que el bucle principal pare en el próximo check.
+        2. Aborta la llamada LLM en curso cerrando a la fuerza el socket del cliente
+           (`_close_stream_connection` → `kill_stream` → `force_close_httpx_sockets`).
+           Como los subagentes comparten el pool del cliente del padre, esto también
+           aborta sus `chat_sync` en vuelo.
+        3. Mata todos los subagentes/equipos activos (`subagent_runner.kill_all()`),
+           que pone su `kill_event`; sus bucles paran en el próximo check de `_ext_kill`.
+
+        Devuelve un resumen: {"subagents": n_matados}. No deshabilita scheduler ni
+        tareas wip — de eso se encarga el caller de `/kill all`.
+        """
+        self._kill_requested = True
+        summary = {"subagents": 0}
+        try:
+            self._close_stream_connection()
+        except Exception as e:
+            log.debug("request_kill_close_stream_error", error=str(e))
+        runner = getattr(self, "subagent_runner", None)
+        if runner is not None:
+            try:
+                summary["subagents"] = runner.kill_all()
+            except Exception as e:
+                log.debug("request_kill_kill_all_error", error=str(e))
+        return summary
+
+    def kill_all_extras(self) -> dict:
+        """Parte adicional de `/kill all` (sobre lo de `request_kill`): deshabilita los
+        jobs activos del scheduler y resetea las tareas `wip → todo`.
+
+        Compartido por el comando `/kill all` del TUI y el botón Kill de la WebUI para
+        que ambos tengan la misma semántica. Tolerante a fallos: si el scheduler o el
+        tracker de tareas no están disponibles, devuelve 0 en ese campo.
+
+        Devuelve {"jobs": n_deshabilitados, "wip": n_reseteadas}.
+        """
+        out = {"jobs": 0, "wip": 0}
+        sched = getattr(self, "scheduler", None)
+        if sched is not None:
+            try:
+                jobs = [j for j in sched.all_jobs() if j.get("enabled")]
+                for job in jobs:
+                    sched.toggle(job["id"])
+                out["jobs"] = len(jobs)
+            except Exception as e:
+                log.debug("kill_all_jobs_error", error=str(e))
+        tasks = getattr(self, "tasks", None)
+        if tasks is not None:
+            try:
+                wip = tasks.all_tasks(status="wip")
+                for t in wip:
+                    tasks.update(t["id"], status="todo")
+                out["wip"] = len(wip)
+            except Exception as e:
+                log.debug("kill_all_wip_error", error=str(e))
+        return out
 
     def _turn_print_kill_stopped(self) -> None:
         """Imprime el mensaje de stop tras kill post-LLM."""
@@ -3730,11 +4233,34 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         self._flush_turn_block()
         return "break"
 
+    def _render_subagent_bullet(self, text: str, accent: str) -> None:
+        """Imprime el ● de texto de un subagente con prefijo │ alineado (vía _print).
+
+        Los subagentes no tienen live block (sus callbacks son None), así que su ●
+        caía en la rama `console.print` directa de _turn_display_bullet → columna 0,
+        desalineado respecto a sus propias líneas de tool ("  │  …"). Aquí el primer
+        renglón lleva el ● y los siguientes se indentan bajo el texto; todo pasa por
+        self._print, que añade el prefijo │ y respeta el presupuesto _MAX_SUB_LINES.
+        """
+        from rich.markup import escape as _mesc
+        import re as _re_sb
+        _lines = [ln.rstrip() for ln in text.strip().split('\n')]
+        if not any(l.strip() for l in _lines):
+            return
+        first = _re_sb.sub(r'\*{1,3}([^*\n]+)\*{1,3}', r'\1', _lines[0]).strip()
+        self._print(f"[bold {accent}]●[/bold {accent}] {_mesc(first)}")
+        for _ln in _lines[1:]:
+            self._print(f"  {_mesc(_ln)}" if _ln.strip() else "")
+
     def _turn_display_bullet(self, text: str, tool_calls: list) -> None:
         """Renderiza el ● con el texto del LLM y arranca el live block si hay tools."""
         from rich.markup import escape as _mesc
         import re as _re_bullet
         _ac = COLOR_PRESETS.get(self.rt.accent_color, COLOR_PRESETS["cyan"])[1]
+        # Subagentes: sin live block; renderizar el ● alineado bajo el prefijo │.
+        if self.is_subagent:
+            self._render_subagent_bullet(text, _ac)
+            return
         text_clean = text.lstrip()
         lines   = text_clean.split('\n', 1)
         first   = lines[0].rstrip()
@@ -3991,7 +4517,7 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                     f"La tarea {_rn}/{len(self._plan_tasks)} "
                     f"\"{_rt['text'][:80]}\" aún no está completada. "
                     f"Continúa ejecutando con las tools necesarias. "
-                    f"NO digas \"He completado todas las tareas\" hasta haber "
+                    f"NO digas \"{self._done_phrase_text()}\" hasta haber "
                     f"ejecutado todas las acciones requeridas con tools."
                 )
                 if not getattr(self, "_webui_queue", None):
@@ -4032,9 +4558,20 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             description = f"{name}({json.dumps(args, ensure_ascii=False)[:80]})"
             allowed_map[idx] = self.permissions.check(name, description)
 
+        # Tools de orquestación: tienen concurrencia interna (spawn_background +
+        # join) y rendering especial que SOLO funciona en la rama secuencial
+        # (header ● [emoji nombre]: tarea, streaming │, spinner de color del
+        # subagente). Si se batchean con otras tools en el ThreadPoolExecutor su
+        # output queda "encerrado" en el bloque anterior y colisiona en el live
+        # block del padre. Nunca deben paralelizarse: fuerzan modo secuencial.
+        _has_orchestration = any(
+            n in _ORCHESTRATION_TOOLS for _, n, _ in parsed_calls
+        )
+
         _safe_parallel = (
             len(parsed_calls) > 1
             and not any(n == "bash" for _, n, _ in parsed_calls)
+            and not _has_orchestration
             and not self.capture_output
         )
 
@@ -4065,7 +4602,9 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
 
             if getattr(self, "_webui_queue", None) is not None:
                 for _pidx, (_, _pn, _pa) in enumerate(parsed_calls):
-                    if allowed_map[_pidx]:
+                    # spawn_subagent/plan_create se representan con sus propios eventos
+                    # (subagent_start / plan), no con un tool_start de agente principal.
+                    if allowed_map[_pidx] and _pn not in ("spawn_subagent", "plan_create"):
                         _pd = self._TOOL_DISPLAY_NAMES.get(_pn, _pn)
                         _pc = self._strip_rich(self._call_context(_pn, _pa)).strip()
                         self._webui_emit({"type": "tool_start", "tool": _pd,
@@ -4088,9 +4627,13 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                         _t2p = _fmt_elapsed(elapsed2)
                         if elapsed2 > 25:
                             _ph2p = _NEAR_FINISH_PHRASES[(fi2 // 5) % len(_NEAR_FINISH_PHRASES)]
-                            _tp2p = f"({_t2p} · {_ph2p})"
+                            _tp2p = (
+                                _sfmt("time-dim", f"({_t2p} · ")
+                                + _sfmt("status-phrase", _ph2p)
+                                + _sfmt("time-dim", ")")
+                            )
                         else:
-                            _tp2p = f"({_t2p})"
+                            _tp2p = _sfmt("time-dim", f"({_t2p})")
                         mem_p2 = f"  ·  ⬡ {self.memory.last_hits} mem" if self.memory.last_hits > 0 else ""
                         rag_p2 = _rag_display(self._workspace_rag)
                         _act2  = next(
@@ -4115,6 +4658,19 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             )
             _spin_t.start()
 
+            # tools.hooks usa threading.local para el canal de impresión (hook_print_fn),
+            # que se setea en _turn_reset_state SOLO en el hilo del loop. Los hilos worker
+            # del pool no lo heredan, así que lint/lsp/interface_change_detector caerían al
+            # fallback console y su salida no llegaría al WebUI ni al bloque del subagente.
+            # Reinyectamos el canal (y el dprint global por consistencia) en cada worker.
+            import tools.hooks as _hooks_par
+            import tools.diff_renderer as _diff_par
+
+            def _exec_tool_in_worker(_n: str, _a: dict) -> str:
+                _hooks_par.set_hook_print_fn(self._print)
+                _diff_par.set_dprint_fn(self._print)
+                return self._execute_tool(_n, _a)
+
             submitted: list[tuple] = []
             with ThreadPoolExecutor(
                 max_workers=min(len(parsed_calls), 4),
@@ -4122,7 +4678,7 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             ) as pool:
                 for idx, (_tc, name, args) in enumerate(parsed_calls):
                     if allowed_map[idx]:
-                        submitted.append((pool.submit(self._execute_tool, name, args), idx))
+                        submitted.append((pool.submit(_exec_tool_in_worker, name, args), idx))
                     else:
                         submitted.append((None, idx))
 
@@ -4181,9 +4737,13 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                             _t2 = _fmt_elapsed(elapsed2)
                             if elapsed2 > 25:
                                 _ph2 = _NEAR_FINISH_PHRASES[(_fi // 5) % len(_NEAR_FINISH_PHRASES)]
-                                _tp2 = f"({_t2} · {_ph2})"
+                                _tp2 = (
+                                    _sfmt("time-dim", f"({_t2} · ")
+                                    + _sfmt("status-phrase", _ph2)
+                                    + _sfmt("time-dim", ")")
+                                )
                             else:
-                                _tp2 = f"({_t2})"
+                                _tp2 = _sfmt("time-dim", f"({_t2})")
                             mem_s2 = f"  ·  ⬡ {self.memory.last_hits} mem" if self.memory.last_hits > 0 else ""
                             rag_s2 = _rag_display(self._workspace_rag)
                             _phase = self._tool_phase
@@ -4397,6 +4957,7 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
 
         self._last_response = "\n".join(full_output_parts)
         log.debug("assistant_reply", chars=len(self._last_response))
+        self._maybe_precompact_idle()   # I: pre-compactación en idle si pct ≥ high_water
         if self.capture_output:
             return self._last_response
         return None
@@ -4427,19 +4988,41 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             if self._turn_loop_guard():
                 break
 
+            # Heartbeat: inicio de un paso → resetea el presupuesto del watchdog del
+            # subagente (timeout por inactividad/paso, no por tiempo total).
+            self._subagent_heartbeat()
+
             _new_count = len(self._last_tool_calls)
             _had_tools_prev       = _new_count > _last_tool_call_count
             _last_tool_call_count = _new_count
             self._subagent_color_idx += 1
+            # Presupuesto │ del subagente: refrescar por turno (no por run completo).
+            # El cap _MAX_SUB_LINES es "por turno" (ver _print): sin este reset un
+            # subagente multi-turno congelaba tras 12 líneas y ocultaba toda la
+            # actividad posterior. Reseteando aquí, cada turno muestra líneas nuevas
+            # y las antiguas hacen scroll hacia arriba en el buffer de salida.
+            if self.is_subagent:
+                self._sub_lines_shown = 0
 
             messages, _tools_cache = self._turn_iter_prepare()
 
             text, tool_calls, inp, out = self._turn_llm_call(
                 messages, _tools_cache, total_inp, total_out)
 
+            # Heartbeat: la petición al LLM completó → progreso (la fase de tools
+            # que sigue arranca con presupuesto fresco del watchdog).
+            self._subagent_heartbeat()
+
             if self._kill_requested:
                 self._kill_requested = False
                 self._turn_print_kill_stopped()
+                break
+
+            # Subagente: si nos mataron (kill_all del padre) durante la llamada al LLM
+            # —su chat_sync se abortó al cerrar el socket compartido— parar AQUÍ mismo
+            # en vez de procesar el texto de error y esperar al próximo turno.
+            if self._ext_kill is not None and self._ext_kill.is_set():
+                self._print("\n  [yellow]↯[/yellow]  Subagente detenido por el usuario.")
                 break
 
             total_inp += inp
@@ -4448,6 +5031,9 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             self._turn_out = total_out
             if inp or out:
                 self.session.log_usage(inp, out)
+            # E: calibrar estimación CPT con prompt_eval_count real (solo 1er call del turno)
+            if inp > 0 and total_inp == inp:
+                self.context.calibrate(inp, self._last_system_chars)
 
             ctrl = self._turn_handle_empty(text, tool_calls, _had_tools_prev)
             if ctrl == "break":
@@ -4468,6 +5054,11 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                 self._advance_plan_task(text)
                 self._turn_text_emitted = True
                 full_output_parts.append(text)
+                # Último bloque de texto del agente, siempre actualizado (a diferencia
+                # de _last_response, que solo se fija en _turn_finish). Lo usa el
+                # display de compactación para mostrar el mensaje real más reciente
+                # cuando se compacta a mitad de turno (auto-continue).
+                self._last_agent_msg = text
                 self.session.log_message("assistant", text)
                 self.chatlog.log_assistant(text)
                 self._flush_turn_block()
