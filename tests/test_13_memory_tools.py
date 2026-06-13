@@ -213,6 +213,38 @@ class TestMemToolAttributes:
         assert "workspace_remember" in AgentLoop._MEM_TOOLS
 
 
+# ── workspace_remember respeta el límite de OOCODE.md ────────────────────────
+
+class TestWorkspaceRememberSizeLimit:
+    def _registry(self, tmp_path, max_kb=24, warn_kb=8):
+        from oocode import build_registry
+        from config import OOConfig
+        cfg = OOConfig()
+        cfg.ws_oocode_md_max_kb = max_kb
+        cfg.ws_oocode_md_warn_kb = warn_kb
+        return build_registry(str(tmp_path), cfg), tmp_path / "OOCODE.md"
+
+    def test_writes_when_under_limit(self, tmp_path):
+        reg, md = self._registry(tmp_path)
+        out = reg.call("workspace_remember", {"note": "usa python3"})
+        assert "guardada" in out.lower()
+        assert md.exists() and "usa python3" in md.read_text()
+
+    def test_refuses_over_hard_ceiling(self, tmp_path):
+        reg, md = self._registry(tmp_path, max_kb=1)   # techo 1 KB
+        md.write_text("# OOCODE.md\n\n## Notas del usuario\n" + "x" * 1100)  # ya >1 KB
+        out = reg.call("workspace_remember", {"note": "otra nota"})
+        assert "⛔" in out or "No guardado" in out
+        assert "otra nota" not in md.read_text()   # NO se escribió
+
+    def test_warns_over_soft_threshold(self, tmp_path):
+        reg, md = self._registry(tmp_path, max_kb=100, warn_kb=1)
+        md.write_text("# OOCODE.md\n\n## Notas del usuario\n" + "x" * 1100)  # >1 KB warn
+        out = reg.call("workspace_remember", {"note": "nota nueva"})
+        assert "guardada" in out.lower() and "⚠" in out
+        assert "nota nueva" in md.read_text()
+
+
 # ── _show_compact_reset ──────────────────────────────────────────────────────
 
 class TestShowCompactReset:
@@ -382,6 +414,60 @@ class TestShowCompactReset:
                    for c in captured)
         # El obsoleto NO debe aparecer como texto renderizado directamente
         assert "MENSAJE OBSOLETO" not in full
+
+    def test_mid_turn_compaction_reanchors_live_block(self, loop):
+        """Compactación MID-TURN: re-ancla el live block en el último mensaje en vez de
+        pintarlo como retrospectiva estática.
+
+        El agente sigue en el bucle y emitirá más tools (a menudo SIN texto). Re-anclar
+        el live block (_bullet_block_open=True + _start_live_block_cb) hace que esas tools
+        post-compactación se asignen visiblemente al ● del mensaje guardado antes de
+        compactar (su texto vacío cuenta como continuación en _is_duplicate_bullet).
+        """
+        loop._session_reads   = []
+        loop._session_mems    = []
+        loop._clear_output_cb = lambda: None
+        loop._last_agent_msg  = "Voy a aplicar el siguiente cambio.\nDetalle adicional."
+        loop._compacting_mid_turn = True
+        started = []
+        loop._start_live_block_cb = lambda b: started.append(b)
+        captured = []
+
+        with patch("ui.renderer.print_compact_banner"), \
+             patch("ui.console.console") as mock_con:
+            mock_con.print = lambda *a, **kw: captured.append(" ".join(str(x) for x in a))
+            loop._show_compact_reset(5, 1000, True)
+
+        # Re-anclado: live block arrancado, bloque abierto, bullet registrado
+        assert started, "debió arrancar el live block (re-anclaje)"
+        assert loop._bullet_block_open is True
+        assert loop._last_displayed_bullet == "Voy a aplicar el siguiente cambio. Detalle adicional."
+        # NO es retrospectiva estática
+        full = " ".join(captured)
+        assert "último mensaje del agente" not in full
+        # _is_duplicate_bullet trata el siguiente turno sin texto como continuación
+        assert loop._is_duplicate_bullet("", [{"function": {"name": "x"}}]) is True
+
+    def test_idle_compaction_does_not_reanchor(self, loop):
+        """Compactación idle/manual (sin _compacting_mid_turn): retrospectiva estática,
+        bloque cerrado (no hay continuación que anclar)."""
+        loop._session_reads   = []
+        loop._session_mems    = []
+        loop._clear_output_cb = lambda: None
+        loop._last_agent_msg  = "Resumen final.\n¿Continúo?"
+        loop._compacting_mid_turn = False
+        started = []
+        loop._start_live_block_cb = lambda b: started.append(b)
+        captured = []
+
+        with patch("ui.renderer.print_compact_banner"), \
+             patch("ui.console.console") as mock_con:
+            mock_con.print = lambda *a, **kw: captured.append(" ".join(str(x) for x in a))
+            loop._show_compact_reset(5, 1000, True)
+
+        assert not started, "idle NO debe arrancar live block"
+        assert loop._bullet_block_open is False
+        assert "último mensaje del agente" in " ".join(captured)
 
     def test_execute_mem_save_registers_in_session_mems(self, loop, tmp_mem_dir):
         """_execute_mem_save añade el nombre a _session_mems."""

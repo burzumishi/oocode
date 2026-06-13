@@ -1,4 +1,4 @@
-"""Handlers de /slash commands — compatible con OpenClaw y Claude Code."""
+"""Handlers de /slash commands."""
 import importlib.metadata
 import json
 import os
@@ -79,7 +79,9 @@ SLASH_HELP: dict[str, dict[str, str]] = {
         "/sessions":            "Historial de sesiones del agente",
         "/context":             "Estado detallado del contexto (tokens, resumen, modo)",
         "/ctx [mini|full]":     "Modo de contexto del workspace (mini: compacto, full: todos los ficheros sin límite)",
+        "/plan [on|off]":       "Plan-mode: el agente pide tu aprobación antes de ejecutar cada plan (Aprobar/Editar/Cancelar)",
         "/compact [fast]":      "Compacta contexto con resumen LLM (fast: sin resumen)",
+        "/suggest [on|off]":    "Sugerencia contextual del siguiente mensaje en el prompt (franja idle)",
         "/resume":              "Resume contexto actual y lo limpia (mantiene resumen)",
         "/checkpoint":          "Guarda checkpoint manual del contexto en memoria diaria",
         "/branch [subcmd]":     "Ramas de conversación: save|load|list|rm <nombre>",
@@ -241,8 +243,12 @@ def handle_slash(command: str, agent_loop, config) -> bool:
         print_ctx_status(agent_loop.context, config, rt)
     elif cmd == "/ctx":
         _cmd_ctx(args, rt)
+    elif cmd == "/plan":
+        _cmd_plan(args, rt)
     elif cmd == "/compact":
         _cmd_compact(args, agent_loop)
+    elif cmd == "/suggest":
+        _cmd_suggest(args, agent_loop, config)
     elif cmd == "/resume":
         _cmd_resume(agent_loop)
     elif cmd == "/checkpoint":
@@ -536,6 +542,35 @@ def _cmd_ctx(args: str, rt: RuntimeSettings) -> None:
     )
 
 
+def _cmd_plan(args: str, rt: RuntimeSettings) -> None:
+    """Plan-mode: si está ON, plan_create presenta el plan y espera tu aprobación.
+
+    /plan          — muestra el estado
+    /plan on|off   — activa/desactiva la aprobación previa de planes
+    """
+    arg = args.strip().lower()
+    if arg in ("on", "off"):
+        rt.plan_approval = (arg == "on")
+        if rt.plan_approval:
+            console.print(
+                "  [green]✓[/green]  plan-mode [bold green]ON[/bold green]  "
+                "[dim]— el agente pedirá tu aprobación antes de ejecutar cada plan "
+                "(Aprobar / Editar / Cancelar)[/dim]"
+            )
+        else:
+            console.print(
+                "  [green]✓[/green]  plan-mode [bold]OFF[/bold]  "
+                "[dim]— los planes se ejecutan directamente[/dim]"
+            )
+        return
+    state = "ON" if rt.plan_approval else "OFF"
+    color = "green" if rt.plan_approval else "dim"
+    console.print(
+        f"  plan-mode: [{color}]{state}[/{color}]  [dim]opciones: on | off[/dim]\n"
+        f"  [dim]ON: plan_create presenta el plan y espera tu aprobación antes de ejecutarlo.[/dim]"
+    )
+
+
 def _cmd_compact(args: str, agent_loop) -> None:
     """
     /compact        — compactación inteligente con resumen LLM
@@ -545,6 +580,31 @@ def _cmd_compact(args: str, agent_loop) -> None:
     agent_loop._do_compact(with_summary=with_summary)
     if not with_summary:
         console.print("  [dim](sin resumen LLM — usa /compact para resumen completo)[/dim]")
+
+
+def _cmd_suggest(args: str, agent_loop, config) -> None:
+    """
+    /suggest         — muestra el estado de la sugerencia contextual del prompt
+    /suggest on|off  — activa/desactiva la sugerencia del siguiente mensaje (persiste)
+    """
+    arg = args.strip().lower()
+    if arg in ("on", "off"):
+        val = (arg == "on")
+        config.suggestions_enabled = val
+        try:
+            config.save()
+        except Exception:
+            pass
+        estado = "activada" if val else "desactivada"
+        console.print(f"  [dim]Sugerencia contextual {estado}.[/dim]")
+    else:
+        estado = "on" if getattr(config, "suggestions_enabled", True) else "off"
+        console.print(
+            f"  Sugerencia contextual del prompt: [bold]{estado}[/bold]\n"
+            f"  [dim]Tras cada turno propone, en la franja idle, el siguiente "
+            f"mensaje probable (llamada LLM corta).[/dim]\n"
+            f"  [dim]/suggest on  ·  /suggest off[/dim]"
+        )
 
 
 def _cmd_checkpoint(agent_loop) -> None:
@@ -1151,8 +1211,6 @@ def _cmd_agent_reset(args: str, config, agent_loop=None) -> None:  # noqa: C901
 
     Uso: /agent reset <id> [nueva_descripción]
     """
-    from workspace.manager import WorkspaceManager
-
     parts = args.strip().split(maxsplit=1) if args.strip() else []
     if not parts:
         ids = ", ".join(a.id for a in config.agents)
@@ -1182,45 +1240,34 @@ def _cmd_agent_reset(args: str, config, agent_loop=None) -> None:  # noqa: C901
         console.print("  Cancelado.")
         return
 
+    # Regenerar ficheros de identidad por el MISMO camino que la creación
+    # (WorkspaceManager.init → workspace/templates/ con fallback a generadores).
+    # Antes el reset usaba SIEMPRE los generadores Python → escribía contenido
+    # divergente del de un agente recién creado y perdía las mejoras de las
+    # plantillas (patrón de conversación, Core…). MEMORY.md se preserva.
+    from workspace.manager import WORKSPACE_FILES, WorkspaceManager
+    ws_path = Path(target.workspace).expanduser()
+    old_contents = {
+        fn: ((ws_path / fn).read_text() if (ws_path / fn).exists() else "")
+        for fn in WORKSPACE_FILES
+    }
     ws = WorkspaceManager(
-        target.workspace,
+        workspace_path=target.workspace,
         agent_name=target.name,
         agent_emoji=target.emoji,
         ollama_host=config.ollama_host,
         permissions=config.permissions,
-        max_memory_lines=config.ws_max_memory_lines,
-        max_daily_chars=config.ws_max_daily_chars,
     )
-    desc = new_desc or f"agente {target.id}"
-    # Regenerar ficheros de identidad (overwrite=True, excepto MEMORY.md)
-    from workspace.manager import WORKSPACE_FILES, _identity, _soul, _user, _agents, _heartbeat, _tools
-    ws_path = Path(target.workspace).expanduser()
-    ws_path.mkdir(parents=True, exist_ok=True)
-    (ws_path / "memory").mkdir(exist_ok=True)
+    ws.init(overwrite=True, preserve=("MEMORY.md",))
 
     regenerated = []
     for filename in WORKSPACE_FILES:
         if filename == "MEMORY.md":
-            continue  # Preservar memoria
+            continue  # Preservada
         fpath = ws_path / filename
-        old_content = fpath.read_text() if fpath.exists() else ""
-        if filename == "IDENTITY.md":
-            content = _identity(target.name, target.emoji)
-        elif filename == "SOUL.md":
-            content = _soul(target.name)
-        elif filename == "USER.md":
-            content = _user()
-        elif filename == "AGENTS.md":
-            content = _agents(target.name, target.workspace)
-        elif filename == "HEARTBEAT.md":
-            content = _heartbeat()
-        elif filename == "TOOLS.md":
-            content = _tools(target.name, config.ollama_host, config.permissions)
-        else:
-            continue
-        fpath.write_text(content)
-        if content != old_content:
-            regenerated.append((filename, old_content, content))
+        content = fpath.read_text() if fpath.exists() else ""
+        if content != old_contents[filename]:
+            regenerated.append((filename, old_contents[filename], content))
 
     # Mostrar diffs de los ficheros cambiados
     if regenerated:
@@ -1358,11 +1405,11 @@ _Eres {agent_name}, un agente especializado en {prof['label']}. Un compañero de
 
 ## Core
 
-1. **Ayuda genuinamente, no performativamente.** Sin "¡Claro!", "¡Por supuesto!" — solo ayuda.
+1. **Ayuda genuinamente, no performativamente.** Cálido y cercano, como un compañero que va contando lo que hace; la amabilidad va en explicar y acompañar, no en acuses huecos ("¡Claro!", "¡Por supuesto!").
 2. **Sé proactivo.** Reúne el contexto antes de preguntar.
-3. **Resultados > proceso.** No expliques lo que vas a hacer, hazlo — pero anuncia cada acción en una frase.
+3. **Comunica y justifica lo que decides.** Narra de forma continua qué haces y qué encuentras, y al decidir di el veredicto, el motivo y la acción. Nunca trabajes en silencio ni cierres una tarea solo con su título.
 4. **Honesto > cortés.** Si algo es mala idea, dilo directamente con alternativas.
-5. **Respeta su tiempo.** Cada palabra innecesaria es robo.
+5. **Deja al usuario sus decisiones.** Cuando hay varias opciones válidas o la elección es del usuario, pregunta con `ask_user` (no en texto plano).
 6. **El contexto lo es todo.** Entiende antes de actuar.
 
 ## Tu función
@@ -3236,22 +3283,22 @@ def run_doctor_standalone(config) -> bool:  # noqa: C901
         except ImportError:
             return False, ""
 
-    if getattr(config, "mcp_home_office_assistant_enabled", False):
+    if any(getattr(config, f"mcp_{_s}_assistant_enabled", False) for _s in ("word", "excel", "pptx")):
         for _disp, _meta, _imp, _desc in _HO_PY_PKGS_ALL:
             _found, _ver = _pkg_ok(_meta, _imp)
             if _found:
-                ok("Home Office Python", f"{_disp} {_ver}")
+                ok("Office Python", f"{_disp} {_ver}")
             else:
-                warn("Home Office Python", f"{_disp} no instalado  [dim]{_desc}[/dim]")
+                warn("Office Python", f"{_disp} no instalado  [dim]{_desc}[/dim]")
         for _cmd, _cdesc, _cinst in [
             ("pandoc",    "conversión de documentos", "apt install pandoc"),
             ("tesseract", "OCR imagen→texto",         "apt install tesseract-ocr"),
             ("pdftotext", "texto desde PDF",           "apt install poppler-utils"),
         ]:
             if _which(_cmd):
-                ok("Home Office Tools", f"{_cmd}  [dim]{_cdesc}[/dim]")
+                ok("Office Tools", f"{_cmd}  [dim]{_cdesc}[/dim]")
             else:
-                warn("Home Office Tools", f"{_cmd} no encontrado  [dim]{_cdesc}  →  {_cinst}[/dim]")
+                warn("Office Tools", f"{_cmd} no encontrado  [dim]{_cdesc}  →  {_cinst}[/dim]")
 
     if getattr(config, "webui_enabled", False):
         for _wpkg in _WEBUI_PACKAGES:
@@ -3351,7 +3398,11 @@ def run_doctor_standalone(config) -> bool:  # noqa: C901
     for _srv_name, _enabled_attr in [
         ("oocode_assistant",      "mcp_oocode_assistant_enabled"),
         ("system_assistant",      "mcp_system_assistant_enabled"),
-        ("home_office_assistant", "mcp_home_office_assistant_enabled"),
+        ("word_assistant",        "mcp_word_assistant_enabled"),
+        ("excel_assistant",       "mcp_excel_assistant_enabled"),
+        ("pptx_assistant",        "mcp_pptx_assistant_enabled"),
+        ("mail_assistant",        "mcp_mail_assistant_enabled"),
+        ("cmdb_assistant",        "mcp_cmdb_assistant_enabled"),
         ("security_assistant",    "mcp_security_assistant_enabled"),
         ("iot_assistant",         "mcp_iot_assistant_enabled"),
     ]:
@@ -3380,6 +3431,10 @@ def run_doctor_standalone(config) -> bool:  # noqa: C901
         _pd = _P(config.project_dir)
         ok("Config", f"Proyecto  [dim]{_pd}[/dim]  "
                      + ("[green]OOCODE.md[/green]" if (_pd / "OOCODE.md").exists() else "[dim]sin OOCODE.md[/dim]"))
+
+    _oocode_warn = config.oocode_md_warning()
+    if _oocode_warn:
+        warn("Config", _oocode_warn)
 
     # ── IoT MCP Python + CLI ───────────────────────────────────────────────────
     if getattr(config, "mcp_iot_assistant_enabled", False):
@@ -3420,14 +3475,14 @@ def run_doctor_standalone(config) -> bool:  # noqa: C901
             else:
                 warn("Security MCP Tools", f"{_cmd} no encontrado  [dim]{_desc}  →  {_inst}[/dim]")
 
-    # ── Home Office packages — siempre verificar (no solo si está habilitado) ──
-    if not getattr(config, "mcp_home_office_assistant_enabled", False):
+    # ── Office packages — siempre verificar (no solo si está habilitado) ──
+    if not any(getattr(config, f"mcp_{_s}_assistant_enabled", False) for _s in ("word", "excel", "pptx")):
         for _disp, _meta, _imp, _desc in _HO_PY_PKGS_ALL:
             _found, _ver = _pkg_ok(_meta, _imp)
             if _found:
-                ok("Home Office Python (opcional)", f"{_disp} {_ver}")
+                ok("Office Python (opcional)", f"{_disp} {_ver}")
             else:
-                warn("Home Office Python (opcional)", f"{_disp} no instalado  [dim]{_desc}[/dim]")
+                warn("Office Python (opcional)", f"{_disp} no instalado  [dim]{_desc}[/dim]")
 
     # ── LSP servers ────────────────────────────────────────────────────────────
     _LSP_SA = {
@@ -3611,12 +3666,20 @@ def _cmd_doctor(config, agent_loop) -> None:  # noqa: C901
     else:
         warn("MCP", "oocode_assistant desactivado  [dim](mcp.oocodeAssistant.enabled=false)[/dim]")
 
-    # Bundled MCP: system-assistant, home-office-assistant, security-assistant, iot-assistant
+    # Bundled MCP: system, office, mail, cmdb, security, iot
     _BUNDLED_MCP_EXTRA = [
         ("systemAssistant",     "system-assistant",
          getattr(config, "mcp_system_assistant_enabled", False)),
-        ("homeOfficeAssistant", "home-office-assistant",
-         getattr(config, "mcp_home_office_assistant_enabled", False)),
+        ("wordAssistant",       "word-assistant",
+         getattr(config, "mcp_word_assistant_enabled", False)),
+        ("excelAssistant",      "excel-assistant",
+         getattr(config, "mcp_excel_assistant_enabled", False)),
+        ("pptxAssistant",       "pptx-assistant",
+         getattr(config, "mcp_pptx_assistant_enabled", False)),
+        ("mailAssistant",       "mail-assistant",
+         getattr(config, "mcp_mail_assistant_enabled", False)),
+        ("cmdbAssistant",       "cmdb-assistant",
+         getattr(config, "mcp_cmdb_assistant_enabled", False)),
         ("securityAssistant",   "security-assistant",
          getattr(config, "mcp_security_assistant_enabled", False)),
         ("iotAssistant",        "iot-assistant",
@@ -3926,6 +3989,10 @@ def _cmd_doctor(config, agent_loop) -> None:  # noqa: C901
         ok("Config", f"Proyecto  [dim]{_pd}[/dim]  "
                      + ("[green]OOCODE.md[/green]" if (_pd / "OOCODE.md").exists() else "[dim]sin OOCODE.md[/dim]"))
 
+    _oocode_warn = config.oocode_md_warning()
+    if _oocode_warn:
+        warn("Config", _oocode_warn)
+
     if log.is_enabled():
         ok("Config", f"Log activo  [dim]{log.log_file_path()}[/dim]")
     else:
@@ -4064,7 +4131,9 @@ def _cmd_doctor(config, agent_loop) -> None:  # noqa: C901
     _any_extra_mcp = any([
         getattr(config, "mcp_iot_assistant_enabled", False),
         getattr(config, "mcp_security_assistant_enabled", False),
-        getattr(config, "mcp_home_office_assistant_enabled", False),
+        getattr(config, "mcp_word_assistant_enabled", False),
+        getattr(config, "mcp_excel_assistant_enabled", False),
+        getattr(config, "mcp_pptx_assistant_enabled", False),
     ])
     if _any_extra_mcp:
         # (display_name, [metadata_names_to_try], import_fallback, description)
@@ -4137,18 +4206,18 @@ def _cmd_doctor(config, agent_loop) -> None:  # noqa: C901
                 else:
                     warn("Security MCP Tools", f"{_cmd} no encontrado  [dim]{_desc}  →  {_inst}[/dim]")
 
-        if getattr(config, "mcp_home_office_assistant_enabled", False):
+        if any(getattr(config, f"mcp_{_s}_assistant_enabled", False) for _s in ("word", "excel", "pptx")):
             for _pkg, _meta, _imp, _desc in _HO_PY_PKGS:
                 _found, _ver = _pkg_ok(_meta, _imp)
                 if _found:
-                    ok("Home Office MCP Python", f"{_pkg} {_ver}")
+                    ok("Office MCP Python", f"{_pkg} {_ver}")
                 else:
-                    warn("Home Office MCP Python", f"{_pkg} no instalado  [dim]{_desc}[/dim]")
+                    warn("Office MCP Python", f"{_pkg} no instalado  [dim]{_desc}[/dim]")
             for _cmd, _desc, _inst in _HO_CLI:
                 if _which(_cmd):
-                    ok("Home Office MCP Tools", f"{_cmd}  [dim]{_desc}[/dim]")
+                    ok("Office MCP Tools", f"{_cmd}  [dim]{_desc}[/dim]")
                 else:
-                    warn("Home Office MCP Tools", f"{_cmd} no encontrado  [dim]{_desc}  →  {_inst}[/dim]")
+                    warn("Office MCP Tools", f"{_cmd} no encontrado  [dim]{_desc}  →  {_inst}[/dim]")
 
     # ── 16. WebUI ────────────────────────────────────────────────────────────────
     if getattr(config, "webui_enabled", False):
@@ -4528,11 +4597,31 @@ def _cmd_config_panel(args: str, config, rt: RuntimeSettings) -> None:
         "true" if config.mcp_system_assistant_enabled else "false",
     )
     config.mcp_system_assistant_enabled = _sa_en.lower() in ("true", "s", "si", "sí", "yes", "1")
-    _ho_en = _ask(
-        "homeOfficeAssistant.enabled — servidor MCP ofimática/email/docs (true/false)",
-        "true" if getattr(config, "mcp_home_office_assistant_enabled", False) else "false",
+    _word_en = _ask(
+        "wordAssistant.enabled — servidor MCP documentos Word/PDF + núcleo O365 (true/false)",
+        "true" if getattr(config, "mcp_word_assistant_enabled", False) else "false",
     )
-    config.mcp_home_office_assistant_enabled = _ho_en.lower() in ("true", "s", "si", "sí", "yes", "1")
+    config.mcp_word_assistant_enabled = _word_en.lower() in ("true", "s", "si", "sí", "yes", "1")
+    _excel_en = _ask(
+        "excelAssistant.enabled — servidor MCP hojas de cálculo .xlsx/CSV (true/false)",
+        "true" if getattr(config, "mcp_excel_assistant_enabled", False) else "false",
+    )
+    config.mcp_excel_assistant_enabled = _excel_en.lower() in ("true", "s", "si", "sí", "yes", "1")
+    _pptx_en = _ask(
+        "pptxAssistant.enabled — servidor MCP presentaciones .pptx (true/false)",
+        "true" if getattr(config, "mcp_pptx_assistant_enabled", False) else "false",
+    )
+    config.mcp_pptx_assistant_enabled = _pptx_en.lower() in ("true", "s", "si", "sí", "yes", "1")
+    _mail_en = _ask(
+        "mailAssistant.enabled — servidor MCP email/calendario/notas/contactos (true/false)",
+        "true" if getattr(config, "mcp_mail_assistant_enabled", False) else "false",
+    )
+    config.mcp_mail_assistant_enabled = _mail_en.lower() in ("true", "s", "si", "sí", "yes", "1")
+    _cmdb_en = _ask(
+        "cmdbAssistant.enabled — servidor MCP inventario IT/CMDB (true/false)",
+        "true" if getattr(config, "mcp_cmdb_assistant_enabled", False) else "false",
+    )
+    config.mcp_cmdb_assistant_enabled = _cmdb_en.lower() in ("true", "s", "si", "sí", "yes", "1")
     _sec_en = _ask(
         "securityAssistant.enabled — servidor MCP seguridad/recon/CTF (true/false)",
         "true" if getattr(config, "mcp_security_assistant_enabled", False) else "false",
@@ -4875,6 +4964,11 @@ def _cmd_init(args: str, config, agent_loop) -> None:
 {struct_lines}
 ```
 <!-- Describe aquí los módulos o carpetas más importantes -->
+
+## Ficheros clave
+<!-- Ficheros/módulos principales y su funcionalidad, una línea por entrada:
+     - ruta/fichero — qué hace y por qué importa
+     Mantén esta lista concisa: solo lo esencial para entender el proyecto. -->
 
 ## Comandos
 
@@ -5502,7 +5596,11 @@ def _cmd_mcp(args: str, agent_loop) -> None:
         ("system-assistant",       "mcp_system_assistant_enabled",        "system_assistant.py"),
         ("devops-assistant",       "mcp_devops_assistant_enabled",        "devops_assistant.py"),
         ("database-assistant",     "mcp_database_assistant_enabled",      "database_assistant.py"),
-        ("home-office-assistant",  "mcp_home_office_assistant_enabled",   "home_office_assistant.py"),
+        ("word-assistant",         "mcp_word_assistant_enabled",          "word_assistant.py"),
+        ("excel-assistant",        "mcp_excel_assistant_enabled",         "excel_assistant.py"),
+        ("pptx-assistant",         "mcp_pptx_assistant_enabled",          "pptx_assistant.py"),
+        ("mail-assistant",         "mcp_mail_assistant_enabled",          "mail_assistant.py"),
+        ("cmdb-assistant",         "mcp_cmdb_assistant_enabled",          "cmdb_assistant.py"),
         ("security-assistant",     "mcp_security_assistant_enabled",      "security_assistant.py"),
         ("iot-assistant",          "mcp_iot_assistant_enabled",           "iot_assistant.py"),
         ("http-client-assistant",  "mcp_http_client_assistant_enabled",   "http_client_assistant.py"),
@@ -5742,7 +5840,11 @@ _BUNDLED_CONFIG_ATTR: dict[str, str] = {
     "system-assistant":      "mcp_system_assistant_enabled",
     "devops-assistant":      "mcp_devops_assistant_enabled",
     "database-assistant":    "mcp_database_assistant_enabled",
-    "home-office-assistant": "mcp_home_office_assistant_enabled",
+    "word-assistant":        "mcp_word_assistant_enabled",
+    "excel-assistant":       "mcp_excel_assistant_enabled",
+    "pptx-assistant":        "mcp_pptx_assistant_enabled",
+    "mail-assistant":        "mcp_mail_assistant_enabled",
+    "cmdb-assistant":        "mcp_cmdb_assistant_enabled",
     "security-assistant":    "mcp_security_assistant_enabled",
     "iot-assistant":         "mcp_iot_assistant_enabled",
     "http-client-assistant": "mcp_http_client_assistant_enabled",

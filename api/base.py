@@ -1,7 +1,23 @@
 """Tipos normalizados y protocolo común para todos los backends LLM."""
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Iterator
+from typing import Iterator, Optional, Union
+
+# Valor normalizado de "think" que el AgentLoop pasa a los backends:
+#   None  → omitir el parámetro (usa el default del modelo; NO error en modelos
+#           sin soporte de thinking — preserva el comportamiento histórico).
+#   False → desactivar pensamiento explícitamente.
+#   True  → activar pensamiento (nivel por defecto del modelo).
+#   "low"/"medium"/"high" → nivel graduado (gpt-oss, Anthropic budget, etc.).
+ThinkValue = Optional[Union[bool, str]]
+
+# Mapa think_level (runtime) → valor de nivel para los backends que lo gradúan.
+THINK_LEVEL_MAP = {
+    "minimal": "low",
+    "low":     "low",
+    "medium":  "medium",
+    "high":    "high",
+}
 
 
 def force_close_httpx_sockets(httpx_client) -> int:
@@ -83,6 +99,7 @@ class Response:
     """Respuesta síncrona normalizada (stream=False)."""
     text:          str  = ""
     tool_calls:    list = field(default_factory=list)   # list[ToolCall]
+    thinking:      str  = ""
     input_tokens:  int  = 0
     output_tokens: int  = 0
 
@@ -97,8 +114,12 @@ class BackendClient(ABC):
         messages: list,
         tools: list,
         model_params: dict,
+        think: ThinkValue = None,
     ) -> Iterator[Chunk]:
-        """Streaming: yield Chunk objects hasta Chunk(done=True)."""
+        """Streaming: yield Chunk objects hasta Chunk(done=True).
+
+        `think` controla el canal de razonamiento (ver ThinkValue). `None` omite el
+        parámetro para no romper modelos sin soporte de thinking."""
         ...
 
     @abstractmethod
@@ -109,8 +130,9 @@ class BackendClient(ABC):
         tools: list,
         model_params: dict,
         timeout: float = 0,
+        think: ThinkValue = None,
     ) -> Response:
-        """Síncrono: devuelve un Response completo."""
+        """Síncrono: devuelve un Response completo. Ver `think` en chat_stream."""
         ...
 
     @abstractmethod

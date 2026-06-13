@@ -39,6 +39,11 @@ PostHookFn = Callable[[str, dict, str], Optional[str]]  # (name, args, result) �
 # Usar threading.local() evita que subagentes concurrentes se interfieran.
 _tl = threading.local()
 
+# Post-hooks que dependen de estado thread-local capturado por su PRE en el MISMO hilo
+# (_tl.backup_pending / _tl.icd_snapshots): run_post los ejecuta en el hilo llamante, no
+# en un worker del pool, o no verían el snapshot de su pre. El resto se paraleliza.
+_THREAD_LOCAL_POST_HOOKS = frozenset({"_builtin_backup_post", "_builtin_icd_post"})
+
 
 def set_hook_print_fn(fn) -> None:
     """Configura la función de impresión para hooks (TUI-aware). None = REPL mode."""
@@ -720,6 +725,29 @@ def _rotate_log(log_path) -> None:  # type: ignore[no-untyped-def]
         pass
 
 
+def result_indicates_failure(result: str) -> bool:
+    """True si el resultado de una tool indica fallo (clasificación robusta).
+
+    El heurístico antiguo (`"Error" not in result and "fallida" not in result`) era
+    poco fiable: '⛔ PRE-EDIT FALLIDO' (mayúsculas, sin 'fallida') contaba como éxito
+    y la salida de lint con 'error' daba falsos negativos. Cubre los marcadores reales
+    de los caminos de fallo de las write tools (alineado con `_is_fail` en agent/loop.py)."""
+    if not result:
+        return True
+    r  = result.lstrip()
+    rl = r.lower()
+    if r.startswith(("Error", "⛔", "⚠️", "⚠")):
+        return True
+    return (
+        "pre-edit fallido" in rl
+        or "validación fallida" in rl
+        or "no encontrado" in rl
+        or "no se encontraron coincidencias" in rl
+        or "cadena no encontrada" in rl
+        or "duplicado bloqueado" in rl
+    )
+
+
 def _builtin_log_tool_calls(tool_name: str, args: dict, result: str) -> Optional[str]:
     """Post-hook: registra tool calls de escritura en ~/.oocode/logs/tool_calls.jsonl.
 
@@ -740,7 +768,7 @@ def _builtin_log_tool_calls(tool_name: str, args: dict, result: str) -> Optional
     entry = {
         "ts":   _time.time(),
         "tool": tool_name,
-        "ok":   "Error" not in result and "fallida" not in result,
+        "ok":   not result_indicates_failure(result),
     }
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1823,7 +1851,7 @@ def _builtin_security_audit_log(tool_name: str, args: dict, result: str) -> Opti
 
 def _builtin_doc_validate_template_filled(tool_name: str, args: dict, result: str) -> Optional[str]:
     """Post-hook para doc_fill_template: avisa si el fichero de salida tiene campos sin rellenar."""
-    if tool_name not in {"doc_fill_template", "mcp_home_office_assistant_doc_fill_template"}:
+    if tool_name not in {"doc_fill_template", "mcp_word_assistant_doc_fill_template"}:
         return None
     import re as _re
     from pathlib import Path as _P
@@ -2663,17 +2691,68 @@ class HookManager:
         return True, current_args
 
     def run_post(self, tool_name: str, args: dict, result: str) -> str:
-        """Ejecuta los post-hooks. Devuelve el resultado (posiblemente modificado)."""
+        """Ejecuta los post-hooks. Devuelve el resultado (posiblemente modificado).
+
+        Con ≥2 hooks que casan, los INDEPENDIENTES se ejecutan en paralelo (cada uno
+        recibe el mismo `result` base y devuelve `result + su_anotación`); los que
+        dependen de estado thread-local capturado por su PRE en este hilo
+        (`_THREAD_LOCAL_POST_HOOKS`: backup, interface_change) se ejecutan en el hilo
+        llamante para no perder el snapshot. Las anotaciones se recombinan en orden de
+        registro. Esto evita serializar los subprocesos pesados (ctags/lint/lsp/tests)
+        — antes cada escritura los encadenaba uno tras otro.
+        """
         args = dict(args)  # copia defensiva: consistente con run_pre; hooks no deben mutar args del caller
-        current = result
-        for pattern, fn in self._post:
-            if fnmatch.fnmatch(tool_name, pattern):
+        matched = [fn for pattern, fn in self._post if fnmatch.fnmatch(tool_name, pattern)]
+        if not matched:
+            return result
+        if len(matched) == 1:
+            try:
+                out = matched[0](tool_name, args, result)
+            except Exception:
+                return result
+            return out if out is not None else result
+
+        outs: list = [None] * len(matched)
+        # Thread-local-bound: en ESTE hilo (ven el snapshot capturado por su pre).
+        for i, fn in enumerate(matched):
+            if fn.__name__ in _THREAD_LOCAL_POST_HOOKS:
                 try:
-                    out = fn(tool_name, args, current)
+                    outs[i] = fn(tool_name, dict(args), result)
                 except Exception:
-                    continue
-                if out is not None:
-                    current = out
+                    outs[i] = None
+        # Independientes: en paralelo, propagando el canal de impresión al worker
+        # (threading.local no se hereda → cada worker reinyecta hook_print_fn).
+        parallel = [(i, fn) for i, fn in enumerate(matched)
+                    if fn.__name__ not in _THREAD_LOCAL_POST_HOOKS]
+        if parallel:
+            print_fn = getattr(_tl, "hook_print_fn", None)
+
+            def _run(item):
+                i, fn = item
+                if print_fn is not None:
+                    _tl.hook_print_fn = print_fn
+                try:
+                    return i, fn(tool_name, dict(args), result)
+                except Exception:
+                    return i, None
+
+            if len(parallel) == 1:
+                i, out = _run(parallel[0])
+                outs[i] = out
+            else:
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=len(parallel)) as ex:
+                    for i, out in ex.map(_run, parallel):
+                        outs[i] = out
+
+        # Recombinar en orden de registro: base + el sufijo que cada hook añadió.
+        # Todos los post-hooks devuelven `result + anotación` o None; el guard
+        # startswith preserva el comportamiento serial si alguno remplazara el result.
+        current = result
+        for out in outs:
+            if out is None or out == result:
+                continue
+            current = current + out[len(result):] if out.startswith(result) else out
         return current
 
     @property

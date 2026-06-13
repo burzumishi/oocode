@@ -69,9 +69,11 @@ class OOConfig(BaseModel):
     max_summary_chars:       int   = 2100
     max_tool_result_tokens:  int   = 800
     auto_continue_max:       int   = 8   # auto-continuaciones máx. por turno (0=desactivado)
-    context_high_water:      float = 0.70  # fracción de max_tokens para truncado 2ª pasada
+    context_high_water:      float = 0.70  # fracción para disparo de pre-compactación en background
     context_tool_max_chars:  int   = 3000  # chars máx. por tool result en 2ª pasada
+    context_compact_target:  float = 0.50  # fracción objetivo TRAS compactar (2ª pasada trunca hasta bajar de aquí)
     ctx_mode:                str   = "mini"  # contexto del workspace al arrancar: "mini" | "full"
+    plan_approval:           bool  = False   # plan-mode al arrancar: pide aprobación de planes (/plan)
 
     # ── Embeddings ────────────────────────────────────────────────────────────
     embed_model:                str   = "nomic-embed-text-v2-moe:latest"
@@ -102,6 +104,9 @@ class OOConfig(BaseModel):
     # ── Workspace ─────────────────────────────────────────────────────────────
     ws_max_memory_lines: int = 50    # líneas de MEMORY.md en el mini-context
     ws_max_daily_chars:  int = 2000  # chars del log diario en el mini-context
+    ws_oocode_md_warn_kb: int = 8    # aviso si OOCODE.md supera N KB (se carga entero igual)
+    ws_oocode_md_max_kb:  int = 24   # techo duro: trunca OOCODE.md con marcador si supera N KB
+    ws_memory_full_max_chars: int = 8000  # tope de chars de MEMORY.md en /ctx full (0 = sin tope)
 
     # ── SearXNG ───────────────────────────────────────────────────────────────
     searxng_url:         str  = ""
@@ -121,6 +126,7 @@ class OOConfig(BaseModel):
 
     # ── Apariencia ────────────────────────────────────────────────────────────
     accent_color: str = "cyan"    # persiste entre sesiones; clave de COLOR_PRESETS
+    suggestions_enabled: bool = True  # sugerencia contextual del siguiente mensaje (franja idle TUI)
 
     # ── Plugins / Skills enabled lists ────────────────────────────────────────
     plugins_enabled: list[str] = []
@@ -149,7 +155,11 @@ class OOConfig(BaseModel):
     mcp_system_assistant_enabled:    bool  = True
     mcp_devops_assistant_enabled:    bool  = True
     mcp_database_assistant_enabled:  bool  = False
-    mcp_home_office_assistant_enabled: bool = False
+    mcp_word_assistant_enabled:     bool = False
+    mcp_excel_assistant_enabled:    bool = False
+    mcp_pptx_assistant_enabled:     bool = False
+    mcp_mail_assistant_enabled:     bool = False
+    mcp_cmdb_assistant_enabled:     bool = False
     mcp_security_assistant_enabled:   bool = False
     mcp_iot_assistant_enabled:          bool = False
     mcp_http_client_assistant_enabled:  bool = False
@@ -203,6 +213,7 @@ class OOConfig(BaseModel):
     webui_port:           int  = 4000
     webui_log_file:       str  = ""   # vacío = ~/.oocode/logs/webserver.log
     webui_log_max_size:   int  = 5
+    webui_permission_prompt: bool = False  # pide confirmación de permisos en el navegador
 
     # ── Subagentes ────────────────────────────────────────────────────────────
     subagents_max_concurrent:    int = 4
@@ -274,7 +285,7 @@ class OOConfig(BaseModel):
         """
         if self.inference_timeout_override > 0:
             return self.inference_timeout_override
-        per_model = self.model_configs.get(model_name, {}).get("timeoutSeconds")
+        per_model = self.model_configs.get(self._resolve_model_key(model_name), {}).get("timeoutSeconds")
         if per_model is not None:
             return int(per_model)
         if self.fallback_active_config:
@@ -283,10 +294,37 @@ class OOConfig(BaseModel):
 
     # ── Propiedades derivadas del modelo activo ────────────────────────────────
 
+    @staticmethod
+    def _norm_model_name(s: str) -> str:
+        """Normaliza un nombre de modelo para emparejar config: minúsculas, sin el
+        prefijo de registry/namespace (todo antes del último '/') y sin el tag ':latest'.
+        Ej.: 'batiai/qwen3.5-9b:latest' → 'qwen3.5-9b'. NO toca tags de tamaño (':9b')."""
+        s = (s or "").strip().lower()
+        if "/" in s:
+            s = s.rsplit("/", 1)[1]
+        if s.endswith(":latest"):
+            s = s[: -len(":latest")]
+        return s
+
+    def _resolve_model_key(self, model_name: str) -> str:
+        """Clave de models.configs que corresponde a `model_name`. Match EXACTO primero;
+        si no, compara normalizado (sin registry ni ':latest') para que p.ej.
+        'batiai/qwen3.5-9b:latest' case con una entrada 'qwen3.5-9b' o
+        'qwen3.5-9b:latest'. Sin coincidencia devuelve el nombre original."""
+        if not model_name:
+            return ""
+        if model_name in self.model_configs:
+            return model_name
+        target = self._norm_model_name(model_name)
+        for key in self.model_configs:
+            if self._norm_model_name(key) == target:
+                return key
+        return model_name
+
     @property
     def active_model_config(self) -> dict:
-        """Config del modelo activo, o {} si no hay entrada per-modelo."""
-        return self.model_configs.get(self.model or "", {})
+        """Config del modelo activo, o {} si no hay entrada per-modelo (match robusto)."""
+        return self.model_configs.get(self._resolve_model_key(self.model or ""), {})
 
     @property
     def effective_context_window(self) -> Optional[int]:
@@ -357,7 +395,7 @@ class OOConfig(BaseModel):
 
     def get_model_input_types(self, model_name: str) -> list[str]:
         """Devuelve los tipos de input soportados por el modelo: ['text'] o ['text', 'image']."""
-        return self.model_configs.get(model_name, {}).get("input", ["text"])
+        return self.model_configs.get(self._resolve_model_key(model_name), {}).get("input", ["text"])
 
     @property
     def active_model_input_types(self) -> list[str]:
@@ -365,14 +403,17 @@ class OOConfig(BaseModel):
         return self.get_model_input_types(self.model or "")
 
     def get_model_thinking(self, model_name: str) -> tuple[str, bool]:
-        """Devuelve (think_level, reasoning) guardados para el modelo."""
-        t = self.model_configs.get(model_name, {}).get("thinking", {})
+        """Devuelve (think_level, reasoning) guardados para el modelo (match robusto)."""
+        t = self.model_configs.get(self._resolve_model_key(model_name), {}).get("thinking", {})
         return t.get("think_level", "off"), bool(t.get("reasoning", False))
 
     def save_model_thinking(self, model_name: str, think_level: str, reasoning: bool) -> None:
         """Persiste think_level y reasoning de un modelo en oocode.json."""
         if not model_name:
             return
+        # Persistir en la entrada que YA resuelve para este modelo (evita crear un
+        # duplicado 'batiai/qwen3.5-9b:latest' cuando ya existe 'qwen3.5-9b').
+        model_name = self._resolve_model_key(model_name)
         if model_name not in self.model_configs:
             self.model_configs[model_name] = {}
         existing_t = self.model_configs[model_name].get("thinking", {})
@@ -494,7 +535,9 @@ class OOConfig(BaseModel):
             auto_continue_max       = _get("context", "autoContinueMax"),
             context_high_water      = _get("context", "highWater"),
             context_tool_max_chars  = _get("context", "toolMaxChars"),
+            context_compact_target  = _get("context", "compactTarget"),
             ctx_mode                = (_get("context", "ctxMode") if _get("context", "ctxMode") in ("mini", "full") else "mini"),
+            plan_approval           = bool(_get("context", "planApproval")),
 
             embed_model                 = _get("embeddings", "model"),
             embed_max_input_chars       = _get("embeddings", "maxInputChars"),
@@ -522,6 +565,9 @@ class OOConfig(BaseModel):
 
             ws_max_memory_lines = _get("workspace", "maxMemoryLines"),
             ws_max_daily_chars  = _get("workspace", "maxDailyChars"),
+            ws_oocode_md_warn_kb = _get("workspace", "oocodeMdWarnKb"),
+            ws_oocode_md_max_kb  = _get("workspace", "oocodeMdMaxKb"),
+            ws_memory_full_max_chars = _get("workspace", "memoryFullMaxChars"),
 
             searxng_url         = _get("searxng", "url"),
             searxng_enabled     = _get("searxng", "enabled"),
@@ -538,6 +584,7 @@ class OOConfig(BaseModel):
             log_max_files = _get("logging", "maxFiles"),
 
             accent_color    = raw.get("appearance", {}).get("accentColor", "cyan"),
+            suggestions_enabled = bool(raw.get("appearance", {}).get("suggestions", True)),
 
             plugins_enabled = raw.get("plugins", {}).get("enabled", []),
             skills_enabled  = raw.get("skills",  {}).get("enabled", []),
@@ -564,8 +611,32 @@ class OOConfig(BaseModel):
             mcp_system_assistant_enabled = raw.get("mcp", {}).get(
                 "systemAssistant", DEFAULT_CONFIG["mcp"]["systemAssistant"]
             ).get("enabled", True),
-            mcp_home_office_assistant_enabled = raw.get("mcp", {}).get(
-                "homeOfficeAssistant", DEFAULT_CONFIG["mcp"]["homeOfficeAssistant"]
+            # word/excel/pptx/mail/cmdb: nacidos del split de home_office (v0.4.4). Cadena de
+            # fallback legacy: word/excel/pptx ← officeAssistant ← homeOfficeAssistant;
+            # mail/cmdb ← homeOfficeAssistant. Así, quien tuviera el MCP ofimática legacy
+            # activo no pierde la funcionalidad al actualizar.
+            mcp_word_assistant_enabled = raw.get("mcp", {}).get(
+                "wordAssistant",
+                raw.get("mcp", {}).get("officeAssistant",
+                    raw.get("mcp", {}).get("homeOfficeAssistant", {"enabled": False}))
+            ).get("enabled", False),
+            mcp_excel_assistant_enabled = raw.get("mcp", {}).get(
+                "excelAssistant",
+                raw.get("mcp", {}).get("officeAssistant",
+                    raw.get("mcp", {}).get("homeOfficeAssistant", {"enabled": False}))
+            ).get("enabled", False),
+            mcp_pptx_assistant_enabled = raw.get("mcp", {}).get(
+                "pptxAssistant",
+                raw.get("mcp", {}).get("officeAssistant",
+                    raw.get("mcp", {}).get("homeOfficeAssistant", {"enabled": False}))
+            ).get("enabled", False),
+            mcp_mail_assistant_enabled = raw.get("mcp", {}).get(
+                "mailAssistant",
+                raw.get("mcp", {}).get("homeOfficeAssistant", {"enabled": False})
+            ).get("enabled", False),
+            mcp_cmdb_assistant_enabled = raw.get("mcp", {}).get(
+                "cmdbAssistant",
+                raw.get("mcp", {}).get("homeOfficeAssistant", {"enabled": False})
             ).get("enabled", False),
             mcp_security_assistant_enabled = raw.get("mcp", {}).get(
                 "securityAssistant", DEFAULT_CONFIG["mcp"]["securityAssistant"]
@@ -636,6 +707,8 @@ class OOConfig(BaseModel):
                                          DEFAULT_CONFIG["webui"]["logFile"]),
             webui_log_max_size = raw.get("webui", {}).get("logMaxSizeMb",
                                          DEFAULT_CONFIG["webui"]["logMaxSizeMb"]),
+            webui_permission_prompt = bool(raw.get("webui", {}).get("permissionPrompt",
+                                         DEFAULT_CONFIG["webui"].get("permissionPrompt", False))),
 
             subagents_max_concurrent    = raw.get("subagents", {}).get("maxConcurrent",
                                                DEFAULT_CONFIG["subagents"]["maxConcurrent"]),
@@ -679,7 +752,11 @@ class OOConfig(BaseModel):
             "systemAssistant" not in raw.get("mcp", {}) or
             "devopsAssistant" not in raw.get("mcp", {}) or
             "databaseAssistant" not in raw.get("mcp", {}) or
-            "homeOfficeAssistant" not in raw.get("mcp", {}) or
+            "wordAssistant" not in raw.get("mcp", {}) or
+            "excelAssistant" not in raw.get("mcp", {}) or
+            "pptxAssistant" not in raw.get("mcp", {}) or
+            "mailAssistant" not in raw.get("mcp", {}) or
+            "cmdbAssistant" not in raw.get("mcp", {}) or
             "securityAssistant" not in raw.get("mcp", {}) or
             "iotAssistant" not in raw.get("mcp", {}) or
             "httpClientAssistant" not in raw.get("mcp", {})
@@ -741,7 +818,9 @@ class OOConfig(BaseModel):
         ctx["autoContinueMax"]     = self.auto_continue_max
         ctx["highWater"]           = self.context_high_water
         ctx["toolMaxChars"]        = self.context_tool_max_chars
+        ctx["compactTarget"]       = self.context_compact_target
         ctx["ctxMode"]             = self.ctx_mode
+        ctx["planApproval"]        = self.plan_approval
 
         # Embeddings
         emb = raw.setdefault("embeddings", {})
@@ -775,6 +854,9 @@ class OOConfig(BaseModel):
         ws = raw.setdefault("workspace", {})
         ws["maxMemoryLines"] = self.ws_max_memory_lines
         ws["maxDailyChars"]  = self.ws_max_daily_chars
+        ws["oocodeMdWarnKb"] = self.ws_oocode_md_warn_kb
+        ws["oocodeMdMaxKb"]  = self.ws_oocode_md_max_kb
+        ws["memoryFullMaxChars"] = self.ws_memory_full_max_chars
 
         # SearXNG
         sx = raw.setdefault("searxng", {})
@@ -796,6 +878,7 @@ class OOConfig(BaseModel):
 
         # Apariencia
         raw.setdefault("appearance", {})["accentColor"] = self.accent_color
+        raw.setdefault("appearance", {})["suggestions"] = self.suggestions_enabled
 
         # Plugins / Skills enabled lists
         raw.setdefault("plugins", {})["enabled"] = sorted(self.plugins_enabled)
@@ -833,7 +916,11 @@ class OOConfig(BaseModel):
         mcp_sec["requestTimeout"] = self.mcp_request_timeout
         mcp_sec.setdefault("oocodeAssistant", {})["enabled"] = self.mcp_oocode_assistant_enabled
         mcp_sec.setdefault("systemAssistant", {})["enabled"] = self.mcp_system_assistant_enabled
-        mcp_sec.setdefault("homeOfficeAssistant", {})["enabled"] = self.mcp_home_office_assistant_enabled
+        mcp_sec.setdefault("wordAssistant",  {})["enabled"] = self.mcp_word_assistant_enabled
+        mcp_sec.setdefault("excelAssistant", {})["enabled"] = self.mcp_excel_assistant_enabled
+        mcp_sec.setdefault("pptxAssistant",  {})["enabled"] = self.mcp_pptx_assistant_enabled
+        mcp_sec.setdefault("mailAssistant",  {})["enabled"] = self.mcp_mail_assistant_enabled
+        mcp_sec.setdefault("cmdbAssistant",  {})["enabled"] = self.mcp_cmdb_assistant_enabled
         mcp_sec.setdefault("securityAssistant", {})["enabled"]   = self.mcp_security_assistant_enabled
         mcp_sec.setdefault("devopsAssistant",   {})["enabled"] = self.mcp_devops_assistant_enabled
         mcp_sec.setdefault("databaseAssistant", {})["enabled"] = self.mcp_database_assistant_enabled
@@ -890,6 +977,7 @@ class OOConfig(BaseModel):
         wu["port"]         = self.webui_port
         wu["logFile"]      = self.webui_log_file
         wu["logMaxSizeMb"] = self.webui_log_max_size
+        wu["permissionPrompt"] = self.webui_permission_prompt
 
         # Subagentes
         sa = raw.setdefault("subagents", {})
@@ -920,8 +1008,8 @@ class OOConfig(BaseModel):
 
         CONFIG_FILE.write_text(json.dumps(raw, indent=2, ensure_ascii=False))
 
-    def load_oocode_md(self) -> Optional[str]:
-        """Carga OOCODE.md: workspace → project_dir → cwd, en ese orden."""
+    def _resolve_oocode_md(self) -> Optional[Path]:
+        """Resuelve el OOCODE.md activo: workspace → project_dir → cwd, en ese orden."""
         seen: set[str] = set()
         candidates: list[Path] = []
         for base in [
@@ -938,5 +1026,51 @@ class OOConfig(BaseModel):
                 candidates.append(p)
         for path in candidates:
             if path.exists():
-                return path.read_text()
+                return path
         return None
+
+    def load_oocode_md(self) -> Optional[str]:
+        """Carga OOCODE.md (workspace → project_dir → cwd).
+
+        Se inyecta ENTERO en el system prompt cada turno. Como red de seguridad
+        contra prompts gigantes, si supera el techo duro `ws_oocode_md_max_kb` se
+        trunca con un marcador VISIBLE (nunca en silencio). El aviso 'blando' por
+        encima de `ws_oocode_md_warn_kb` lo da `oocode_md_warning()` una sola vez
+        (startup / /doctor), no en cada turno.
+        """
+        path = self._resolve_oocode_md()
+        if path is None:
+            return None
+        text = path.read_text()
+        max_bytes = max(0, int(self.ws_oocode_md_max_kb)) * 1024
+        if max_bytes and len(text.encode("utf-8")) > max_bytes:
+            cut = text.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
+            text = (
+                cut.rstrip()
+                + f"\n\n… [OOCODE.md truncado a {self.ws_oocode_md_max_kb} KB — "
+                f"recorta o divide el fichero para que el agente vea todas las instrucciones]"
+            )
+        return text
+
+    def oocode_md_warning(self) -> Optional[str]:
+        """Aviso (string) si OOCODE.md supera el umbral blando en KB, o None.
+
+        Pensado para mostrarse UNA vez (arranque, /doctor), no por turno.
+        """
+        warn_bytes = max(0, int(self.ws_oocode_md_warn_kb)) * 1024
+        if not warn_bytes:
+            return None
+        path = self._resolve_oocode_md()
+        if path is None:
+            return None
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return None
+        if size <= warn_bytes:
+            return None
+        return (
+            f"OOCODE.md: {size / 1024:.1f} KB (>{self.ws_oocode_md_warn_kb} KB) — "
+            f"se inyecta entero en el system prompt cada turno; considera dividir o "
+            f"resumir las instrucciones."
+        )

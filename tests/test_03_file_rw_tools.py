@@ -108,6 +108,116 @@ class TestEditFile:
         assert "Error" in result
 
 
+class TestEditFileFlexible:
+    """Match tolerante a whitespace: reduce fallos por espacios/indentación triviales."""
+
+    def test_trailing_whitespace_on_inner_line(self, tmp_path):
+        f = tmp_path / "c.c"
+        f.write_text("/* DNS */\n#define ENABLE_DNS /**/   \n#define X\n")  # trailing ws
+        # El modelo NO pone el trailing ws en la 2ª línea
+        r = edit_file(str(f), "/* DNS */\n#define ENABLE_DNS /**/",
+                      "/* DNS off */\n#undef ENABLE_DNS")
+        assert "aplicada" in r
+        assert "DNS off" in f.read_text() and "#define X" in f.read_text()
+
+    def test_tab_vs_spaces_indent(self, tmp_path):
+        f = tmp_path / "c.c"
+        f.write_text("void f() {\n\tint x = 1;\n}\n")     # fichero con TAB
+        r = edit_file(str(f), "void f() {\n    int x = 1;\n}",  # modelo con 4 espacios
+                      "void f() {\n    int x = 2;\n}")
+        assert "aplicada" in r
+        assert "int x = 2;" in f.read_text()
+
+    def test_uniform_indent_shift(self, tmp_path):
+        f = tmp_path / "p.py"
+        f.write_text("class A:\n    def g(self):\n        return 1\n")
+        # old/new sin la indentación de clase; se reindenta al aplicar
+        r = edit_file(str(f), "def g(self):\n    return 1",
+                      "def g(self):\n    return 2")
+        assert "aplicada" in r
+        assert f.read_text() == "class A:\n    def g(self):\n        return 2\n"
+
+    def test_ambiguous_flexible_not_applied(self, tmp_path):
+        f = tmp_path / "c.c"
+        f.write_text("  x = 1;\n\tx = 1;\n")   # mismo contenido, distinto whitespace
+        r = edit_file(str(f), "x = 1;", "x = 2;")
+        # 'x = 1;' es substring exacto 2 veces → ambiguo, no toca
+        assert "Error" in r
+        assert "x = 2;" not in f.read_text()
+
+    def test_exact_still_works(self, tmp_path):
+        f = tmp_path / "c.c"
+        f.write_text("int a = 1;\nint b = 2;\n")
+        r = edit_file(str(f), "int a = 1;", "int a = 9;")
+        assert "aplicada" in r and "int a = 9;" in f.read_text()
+
+    def test_interior_tabs_norm_level(self, tmp_path):
+        """Nivel 4 (norm): tabs INTERIORES de alineación (C estilo GNU) vs espacios
+        del modelo — strip no basta (el whitespace difiere dentro de la línea)."""
+        f = tmp_path / "c.c"
+        f.write_text("ch_printf_color (ch,\n\t\t _(\"hint\"),\n\t\t get_hint (50));\n")
+        # El modelo reproduce la alineación interior con espacios
+        r = edit_file(str(f),
+                      "ch_printf_color (ch,\n   _(\"hint\"),\n   get_hint (50));",
+                      "ch_printf_color (ch,\n   _(\"hint\"),\n   get_hint (level));")
+        assert "aplicada" in r
+        assert "get_hint (level));" in f.read_text()
+
+    def test_norm_ambiguous_not_applied(self, tmp_path):
+        """norm también exige match ÚNICO: dos zonas iguales al normalizar → no toca."""
+        f = tmp_path / "c.c"
+        f.write_text("a\tb;\nfin1;\na  b;\nfin2;\n")
+        r = edit_file(str(f), "a b;", "a c;")
+        assert "Error" in r
+        assert "a c;" not in f.read_text()
+
+
+class TestReadFileBanner:
+    """skip_comment_banner colapsa cabeceras de licencia largas conservando line numbers."""
+
+    def test_banner_collapsed_keeps_line_numbers(self, tmp_path):
+        f = tmp_path / "c.c"
+        banner = "/*\n" + "\n".join(f" * Author {i}" for i in range(12)) + "\n */\n"
+        f.write_text(banner + "#include <stdio.h>\nint main(){return 0;}\n")
+        out = read_file(str(f), skip_comment_banner=True)
+        assert "cabecera de comentario/licencia" in out
+        assert "15\t#include <stdio.h>" in out   # numeración preservada (banner=14 líneas)
+
+    def test_preproc_directives_not_collapsed(self, tmp_path):
+        f = tmp_path / "c.c"
+        # Sin banner /* */: solo #include (directivas) → NO se colapsan
+        f.write_text("#include <a.h>\n#include <b.h>\nint main(){}\n")
+        out = read_file(str(f), skip_comment_banner=True)
+        assert "cabecera" not in out
+        assert "1\t#include <a.h>" in out
+
+    def test_no_banner_skip_by_default(self, tmp_path):
+        f = tmp_path / "c.c"
+        banner = "/*\n" + "\n".join(f" * x{i}" for i in range(12)) + "\n */\n"
+        f.write_text(banner + "int main(){}\n")
+        out = read_file(str(f))   # default: no skip
+        assert "1\t/*" in out and "cabecera" not in out
+
+    def test_python_hash_banner(self, tmp_path):
+        f = tmp_path / "m.py"
+        f.write_text("\n".join(f"# Author {i}" for i in range(10)) + "\nimport os\nx = 1\n")
+        out = read_file(str(f), skip_comment_banner=True)
+        assert "cabecera" in out and "11\timport os" in out
+
+    def test_sql_dash_banner(self, tmp_path):
+        f = tmp_path / "q.sql"
+        f.write_text("\n".join(f"-- line {i}" for i in range(9)) + "\nSELECT 1;\n")
+        out = read_file(str(f), skip_comment_banner=True)
+        assert "cabecera" in out and "10\tSELECT 1;" in out
+
+    def test_python_hash_is_comment_not_preproc(self, tmp_path):
+        """En Python `#` SÍ es comentario (a diferencia de C donde es directiva)."""
+        f = tmp_path / "m.py"
+        f.write_text("\n".join(f"# c{i}" for i in range(8)) + "\nprint(1)\n")
+        out = read_file(str(f), skip_comment_banner=True)
+        assert "cabecera" in out
+
+
 class TestEditFiles:
     def test_single_edit(self, tmp_path):
         f = tmp_path / "a.py"

@@ -1,6 +1,6 @@
 " OOCode VIM Plugin — Wrapper completo del TUI OOCode local
 " Repositorio: https://github.com/burzumishi/oocode
-" Versión:     3.1.0
+" Versión:     3.2.0
 "
 " INSTALACIÓN (vim-plug):
 "   Plug 'burzumishi/oocode', { 'rtp': 'extensions/vim' }

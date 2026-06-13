@@ -108,7 +108,7 @@ pyperclip>=1.8.0       # Portapapeles (/copy)
 flask                  # WebUI (puerto 4000)
 ```
 
-### Dependencias opcionales — Office (home-office-assistant MCP)
+### Dependencias opcionales — Office (word/excel/pptx-assistant MCP)
 
 ```bash
 pip install python-docx>=1.0 python-pptx>=1.0 openpyxl>=3.1 pillow docxtpl

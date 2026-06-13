@@ -427,6 +427,7 @@ class TestOocodemdTrustCheck:
         _cmd_init(str(tmp_path), _FakeCfg(), None)
         content = (tmp_path / "OOCODE.md").read_text()
         assert "## Comandos" in content
+        assert "## Ficheros clave" in content   # ficheros + funcionalidad (política OOCODE.md)
         assert "## Notas para el agente" in content
 
     def test_cmd_init_detects_python_project(self, tmp_path):

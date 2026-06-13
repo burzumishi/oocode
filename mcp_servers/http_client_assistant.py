@@ -1249,7 +1249,7 @@ _TOOLS = [
             "properties": {
                 "url":              {"type": "string",  "description": "URL completa del endpoint"},
                 "method":           {"type": "string",  "description": "Método HTTP: GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS (default: GET)"},
-                "body":             {                   "description": "Body de la petición: string JSON o objeto (se serializa automáticamente)"},
+                "body":             {"type": ["string", "object"], "description": "Body de la petición: string JSON o objeto (se serializa automáticamente)"},
                 "headers":          {"type": "object",  "description": "Headers HTTP adicionales como objeto JSON"},
                 "auth":             {"type": "object",  "description": "Auth: {type: 'bearer', token: '...'} o {type: 'basic', username: '...', password: '...'}"},
                 "timeout":          {"type": "integer", "description": "Timeout en segundos (max 120, default 10)"},
@@ -1328,7 +1328,7 @@ _TOOLS = [
                 "text_a":  {"type": "string", "description": "Primer texto inline (alternativa a url_a)"},
                 "text_b":  {"type": "string", "description": "Segundo texto inline (alternativa a url_b)"},
                 "method":  {"type": "string", "description": "Método HTTP para ambas URLs (default: GET)"},
-                "body":    {                  "description": "Body para ambas requests (si aplica)"},
+                "body":    {"type": ["string", "object"], "description": "Body para ambas requests (si aplica)"},
                 "headers": {"type": "object", "description": "Headers para ambas requests"},
                 "label_a": {"type": "string", "description": "Etiqueta para el lado A del diff"},
                 "label_b": {"type": "string", "description": "Etiqueta para el lado B del diff"},
@@ -1346,8 +1346,8 @@ _TOOLS = [
                 "spec_url":      {"type": "string",  "description": "URL de la spec OpenAPI (alternativa a spec_path)"},
                 "endpoint":      {"type": "string",  "description": "Path del endpoint, ej. /api/users/{id}"},
                 "method":        {"type": "string",  "description": "Método HTTP (default: GET)"},
-                "request_body":  {                   "description": "Body del request a validar (objeto o string JSON)"},
-                "response_body": {                   "description": "Body del response a validar (objeto o string JSON)"},
+                "request_body":  {"type": ["object", "string"], "description": "Body del request a validar (objeto o string JSON)"},
+                "response_body": {"type": ["object", "string"], "description": "Body del response a validar (objeto o string JSON)"},
                 "response_status":{"type": "integer","description": "Status code del response (default: 200)"},
             },
         },
@@ -1371,7 +1371,7 @@ _TOOLS = [
             "type": "object",
             "properties": {
                 "url":     {"type": "string",  "description": "URL WebSocket: ws://... o wss://..."},
-                "message": {                   "description": "Mensaje a enviar (string o objeto JSON)"},
+                "message": {"type": ["string", "object"], "description": "Mensaje a enviar (string o objeto JSON)"},
                 "timeout": {"type": "integer", "description": "Tiempo de espera en segundos (max 60, default 10)"},
             },
             "required": ["url", "message"],
@@ -1425,7 +1425,7 @@ _TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "urls":            {                   "description": "URLs a verificar: string separado por comas o array JSON"},
+                "urls":            {"type": ["string", "array"], "description": "URLs a verificar: string separado por comas o array JSON"},
                 "timeout":         {"type": "integer", "description": "Timeout por URL en segundos (max 30, default 5)"},
                 "expected_status": {"type": "integer", "description": "Status code esperado (default: 200)"},
                 "show_body":       {"type": "boolean", "description": "Mostrar fragmento del body (default: false)"},

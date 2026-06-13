@@ -69,14 +69,30 @@ def random_color(exclude: str = "") -> str:
     options = [c for c in COLOR_PRESETS if c != exclude]
     return random.choice(options or list(COLOR_PRESETS))
 
+# Cláusula común a todos los niveles con razonamiento: el modelo (sobre todo los
+# locales tipo qwen3.5) tiende a volcar TODA su comunicación en el canal <think> y a
+# devolver una respuesta visible mínima o vacía → el usuario solo ve 💭 + tools y casi
+# nada de texto real. Esto reencuadra el razonamiento como canal INTERNO y exige que la
+# respuesta VISIBLE siga narrando — el equivalente al comportamiento de Claude (piensa
+# en su bloque, pero escribe texto al usuario en cada paso).
+_THINK_VISIBLE = (
+    " Tu razonamiento (💭) es un canal INTERNO: el usuario NO lo ve como narración. "
+    "Por eso, en CADA respuesta escribe 1-2 frases de texto VISIBLE antes de las "
+    "herramientas — también al EXPLORAR (di qué buscas y qué vas hallando: 'busco la "
+    "definición de X en Y', 'el error está en Z:línea'), no solo al decidir o editar. "
+    "Nunca encadenes herramientas con la respuesta visible vacía confiando en que el 💭 "
+    "ya lo explica: el 💭 no se lee como hilo de la conversación. Piensa todo lo que "
+    "necesites, pero deja SIEMPRE una línea de texto visible en cada paso."
+)
+
 THINK_PROMPTS = {
     "off":     "",
     "minimal": "\nSé conciso y directo en tu respuesta.",
-    "low":     "\nPiensa paso a paso antes de responder.",
-    "on":      "\nPiensa cuidadosamente. Considera múltiples enfoques antes de responder.",
-    "medium":  "\nPiensa cuidadosamente. Considera múltiples enfoques antes de responder.",
-    "high":    "\nRazona en profundidad: explora casos extremos, evalúa alternativas, piensa exhaustivamente. Muestra tu razonamiento antes de la respuesta final.",
-    "full":    "\nRazona en profundidad: explora casos extremos, evalúa alternativas, piensa exhaustivamente. Muestra tu razonamiento antes de la respuesta final.",
+    "low":     "\nPiensa paso a paso antes de responder." + _THINK_VISIBLE,
+    "on":      "\nPiensa cuidadosamente. Considera múltiples enfoques antes de responder." + _THINK_VISIBLE,
+    "medium":  "\nPiensa cuidadosamente. Considera múltiples enfoques antes de responder." + _THINK_VISIBLE,
+    "high":    "\nRazona en profundidad: explora casos extremos, evalúa alternativas, piensa exhaustivamente. Muestra tu razonamiento antes de la respuesta final." + _THINK_VISIBLE,
+    "full":    "\nRazona en profundidad: explora casos extremos, evalúa alternativas, piensa exhaustivamente. Muestra tu razonamiento antes de la respuesta final." + _THINK_VISIBLE,
 }
 
 THINK_LEVELS  = ["off", "minimal", "low", "on", "medium", "high", "full"]
@@ -102,6 +118,11 @@ class RuntimeSettings:
     # ── Permisos ────────────────────────────────────────────────────────────
     elevated: str = "ask"         # off | on | ask | full
 
+    # ── Plan-mode (aprobación previa) ─────────────────────────────────────────
+    # Si True, plan_create presenta el plan al usuario y ESPERA su aprobación antes de
+    # ejecutarlo (vía ask_user). Modo plan. Opt-in (/plan on).
+    plan_approval: bool = False
+
     # ── Visualización de uso ────────────────────────────────────────────────
     usage_display: str = "tokens" # off | tokens | full
 
@@ -119,8 +140,13 @@ class RuntimeSettings:
 
     def think_injection(self) -> str:
         base = THINK_PROMPTS.get(self.think_level, "")
-        if self.reasoning and self.think_level == "off":
-            return "\nMuestra tu razonamiento paso a paso antes de dar la respuesta final."
-        if self.reasoning:
-            return base + "\nMuestra tu razonamiento paso a paso."
-        return base
+        if not self.reasoning:
+            return base
+        # `reasoning` activo: el canal <think> YA está habilitado por el parámetro `think`,
+        # así que NO reforzamos "muestra tu razonamiento paso a paso" — con modelos parcos
+        # (9B) esa frase hacía que volcaran todo al <think> y dejaran la respuesta visible
+        # vacía. Lo que falta es TEXTO visible: garantizamos _THINK_VISIBLE una sola vez
+        # (los niveles != off ya lo incluyen; off/minimal no, así que lo añadimos).
+        if self.think_level == "off":
+            return "\nPiensa paso a paso antes de responder." + _THINK_VISIBLE
+        return base if _THINK_VISIBLE in base else base + _THINK_VISIBLE

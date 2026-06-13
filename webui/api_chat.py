@@ -18,6 +18,18 @@ bp = Blueprint("api_chat", __name__)
 
 _ELEVATED_MODES = ("off", "on", "ask", "full")
 
+# Slash MUTADORES (paridad con el TUI _QUEUE_SLASH_CMDS): cambian contexto/modelo/estado
+# del turno. Con el agente ocupado se ENCOLAN (FIFO) y se ejecutan al terminar el turno;
+# el resto de slash de estado (formas de display) pasan al momento. Se compara por comando
+# base (primer token).
+_WEBUI_QUEUE_SLASH = frozenset({
+    "/new", "/reset", "/clear", "/compact", "/resume",
+    "/model", "/models", "/switch", "/agent",
+    "/session", "/branch",
+    "/elevated", "/elev", "/think", "/reasoning", "/ctx",
+    "/init",
+})
+
 
 def _restore_webui_session(loop, sess: dict, prefix: str) -> tuple[int, Optional[str]]:
     """Restaura una sesión pasada en el WebUI: contexto del LLM + historial mostrado.
@@ -47,9 +59,14 @@ def _restore_webui_session(loop, sess: dict, prefix: str) -> tuple[int, Optional
         return 0, f"Error restaurando sesión: {exc}"
 
 
-def _handle_webui_slash(message: str, sess: dict) -> Optional[str]:
+def _handle_webui_slash(message: str, sess: dict, force: bool = False) -> Optional[str]:
     """Intercepta slash commands de estado que no deben ir al LLM.
-    Devuelve el texto de respuesta si fue manejado, None si debe ir al LLM."""
+    Devuelve el texto de respuesta si fue manejado, None si debe ir al LLM.
+
+    `force=True` (drenaje de cola tras terminar el turno): salta los guards de "agente
+    activo" — el turno ya terminó aunque el hilo de drenaje siga vivo, así que es seguro
+    mutar contexto/modelo. Sin force, los mutadores se rechazan mientras el agente corre
+    (red de seguridad; en la práctica el cliente los encola antes de llegar aquí)."""
     loop = sess.get("loop")
     if not loop:
         return None
@@ -59,6 +76,12 @@ def _handle_webui_slash(message: str, sess: dict) -> Optional[str]:
     cmd      = parts[0].lower()
     args     = parts[1].strip() if len(parts) > 1 else ""
 
+    def _busy() -> bool:
+        if force:
+            return False
+        _t = sess.get("thread")
+        return bool(_t and _t.is_alive())
+
     if cmd == "/session":
         if not args:
             try:
@@ -66,8 +89,7 @@ def _handle_webui_slash(message: str, sess: dict) -> Optional[str]:
                 return f"Sesión activa: {sid_cur}…  ·  usa /session <id> o el panel 📚 Sesiones para restaurar"
             except Exception:
                 return "Usa /session <id> o el panel 📚 Sesiones para restaurar una sesión."
-        _t = sess.get("thread")
-        if _t and _t.is_alive():
+        if _busy():
             return "⚠  El agente está activo — espera a que termine o usa /kill."
         count, err = _restore_webui_session(loop, sess, args)
         if err:
@@ -91,9 +113,22 @@ def _handle_webui_slash(message: str, sess: dict) -> Optional[str]:
         }[args]
         return f"✓  elevated → {args}  ({desc})"
 
+    if cmd == "/plan":
+        rt = getattr(loop, "rt", None)
+        if rt is None:
+            return "⚠ plan-mode no disponible."
+        a = args.strip().lower()
+        if a in ("on", "off"):
+            rt.plan_approval = (a == "on")
+        state = "ON" if getattr(rt, "plan_approval", False) else "OFF"
+        if a in ("on", "off"):
+            return (f"✓  plan-mode → {state}" +
+                    ("  (el agente pedirá tu aprobación antes de ejecutar cada plan)"
+                     if state == "ON" else "  (los planes se ejecutan directamente)"))
+        return f"plan-mode: {state}  ·  usa /plan on|off"
+
     if cmd == "/new":
-        _t = sess.get("thread")
-        if _t and _t.is_alive():
+        if _busy():
             return "⚠  El agente está activo — usa /kill para detenerlo primero."
         try:
             loop.context.clear()
@@ -103,8 +138,7 @@ def _handle_webui_slash(message: str, sess: dict) -> Optional[str]:
         return "✓  Nueva sesión iniciada — historial y contexto borrados"
 
     if cmd == "/compact":
-        _t = sess.get("thread")
-        if _t and _t.is_alive():
+        if _busy():
             return "⚠  El agente está activo — espera a que termine o usa /kill."
         try:
             loop.context.compact()
@@ -136,26 +170,53 @@ def api_chat_send():
     if loop is None:
         return jsonify({"error": "Agente no disponible — reintenta en unos segundos"}), 503
 
-    with sess["lock"]:
-        if sess.get("thread") and sess["thread"].is_alive():
-            return jsonify({"error": "El agente está procesando otra petición"}), 409
+    _busy = bool(sess.get("thread") and sess["thread"].is_alive())
+    _is_slash = message.startswith('/')
+    _base = message.split()[0].lower() if _is_slash else ""
+    q = sess["queue"]
 
+    # Guardar SOLO el input del usuario en el historial compartido con el TUI
+    # (~/.oocode/history, formato prompt_toolkit).
+    append_input_history(message)
+
+    # ── Agente OCUPADO: clasificar (paridad con el TUI) ──────────────────────
+    if _busy:
+        # Slash de DISPLAY (no mutador) → pasa al momento; su respuesta se emite como
+        # 'slash_result' (NO thinking/done: no debe tocar el ciclo de vida del turno
+        # en curso). El cliente lo renderiza como línea de sistema independiente.
+        if _is_slash and _base not in _WEBUI_QUEUE_SLASH:
+            slash_resp = _handle_webui_slash(message, sess)
+            if slash_resp is not None:
+                sess["history"].append({
+                    "role": "assistant", "text": slash_resp,
+                    "ts": time.time(), "id": os.urandom(4).hex(),
+                })
+                q.put({"type": "slash_result", "text": slash_resp})
+                return jsonify({"ok": True, "sid": sid, "passthrough": True})
+            # None → slash destinado al LLM → tratar como mensaje (se encola abajo)
+        # Mensaje o slash MUTADOR → encolar FIFO; se procesa al terminar el turno.
+        with sess["lock"]:
+            _pq = sess.setdefault("pending_queue", [])
+            _pq.append({"message": message, "images": images, "is_slash": _is_slash})
+            _pos = len(_pq)
+        sess["history"].append({
+            "role": "user", "text": message, "queued": True,
+            "ts": time.time(), "id": os.urandom(4).hex(),
+        })
+        q.put({"type": "queued", "text": message, "pos": _pos})
+        return jsonify({"ok": True, "sid": sid, "queued": True, "pos": _pos})
+
+    # ── Agente LIBRE ─────────────────────────────────────────────────────────
     # Registrar en historial
     sess["history"].append({
         "role": "user", "text": message,
         "ts": time.time(), "id": os.urandom(4).hex(),
     })
-    
-    # Guardar SOLO el input del usuario en el historial compartido con el TUI
-    # (~/.oocode/history, formato prompt_toolkit). La respuesta del agente NO se
-    # escribe aquí — es conversación, no input del prompt.
-    append_input_history(message)
 
     # Interceptar slash commands de estado (no van al LLM)
-    if message.startswith('/'):
+    if _is_slash:
         slash_resp = _handle_webui_slash(message, sess)
         if slash_resp is not None:
-            q = sess["queue"]
             q.put({"type": "thinking"})
             q.put({"type": "text", "text": slash_resp})
             sess["history"].append({
@@ -173,12 +234,47 @@ def api_chat_send():
             sess["loop"].run_for_webui(message, images=_images)
         except Exception as exc:
             sess["loop"]._webui_emit({"type": "error", "error": str(exc)})
+        finally:
+            _drain_webui_queue(sess)
 
     t = threading.Thread(target=_run, daemon=True, name=f"webui-turn-{sid[:6]}")
     sess["thread"] = t
     t.start()
 
     return jsonify({"ok": True, "sid": sid})
+
+
+def _drain_webui_queue(sess: dict) -> None:
+    """Procesa la cola FIFO tras terminar un turno (llamado desde el finally del hilo de
+    turno). Los slash mutadores se ejecutan con force=True (turno ya terminado); los
+    mensajes se ejecutan secuencialmente en este mismo hilo. /kill vacía la cola."""
+    q = sess["queue"]
+    while True:
+        with sess["lock"]:
+            _pq = sess.setdefault("pending_queue", [])
+            if not _pq:
+                return
+            item = _pq.pop(0)
+        msg = item["message"]
+        if item.get("is_slash"):
+            try:
+                resp = _handle_webui_slash(msg, sess, force=True)
+            except Exception as exc:
+                resp = f"⚠ Error en comando «{msg}»: {exc}"
+            if resp is not None:
+                sess["history"].append({
+                    "role": "assistant", "text": resp,
+                    "ts": time.time(), "id": os.urandom(4).hex(),
+                })
+                q.put({"type": "slash_result", "text": resp})
+                continue   # seguir drenando
+            # resp None → slash destinado al LLM: tratar como mensaje (cae abajo)
+        # Mensaje (o slash LLM): ejecutar el turno secuencialmente en este hilo.
+        try:
+            sess["loop"].run_for_webui(msg, images=item.get("images") or None)
+        except Exception as exc:
+            sess["loop"]._webui_emit({"type": "error", "error": str(exc)})
+        # tras el turno, el bucle continúa drenando el resto de la cola
 
 
 # ── GET /api/chat/stream ─────────────────────────────────────────────────────
@@ -204,6 +300,9 @@ def api_chat_stream():
                 my_gen = 0
 
         # ── Bug fix 3: Envolver en try/except para nunca crashear y siempre enviar 'done'
+        # GAP 4 — rastreo de cliente conectado: el _ask_fn de permisos solo pregunta si
+        # hay ≥1 stream SSE vivo. Incremento perezoso (el loop puede tardar en iniciarse).
+        _counted_loop = None
         try:
             yield 'data: {"type":"connected"}\n\n'
 
@@ -216,6 +315,14 @@ def api_chat_stream():
                     cur_gen = _WEBUI_SESSIONS.get(sid, {}).get("_gen", my_gen)
                 if cur_gen > my_gen:
                     break
+
+                # Contar este cliente en cuanto el loop esté disponible (una sola vez).
+                if _counted_loop is None:
+                    _lp = _WEBUI_SESSIONS.get(sid, {}).get("loop")
+                    if _lp is not None:
+                        _cur = getattr(_lp, "_webui_sse_clients", 0)
+                        _lp._webui_sse_clients = (_cur if isinstance(_cur, int) else 0) + 1
+                        _counted_loop = _lp
 
                 try:
                     ev = q.get(timeout=2.0)
@@ -280,6 +387,18 @@ def api_chat_stream():
                 yield 'data: {"type":"done","response":""}\n\n'
             except Exception:
                 pass
+        finally:
+            # Cliente desconectado: descontar. Si era el último y había un permiso esperando,
+            # desbloquearlo (denegar) para no colgar el turno tras cerrar el navegador.
+            if _counted_loop is not None:
+                _cur = getattr(_counted_loop, "_webui_sse_clients", 1)
+                _counted_loop._webui_sse_clients = max(0, (_cur if isinstance(_cur, int) else 1) - 1)
+                _pev = getattr(_counted_loop, "_webui_perm_event", None)
+                if (_counted_loop._webui_sse_clients == 0
+                        and _pev is not None and hasattr(_pev, "is_set")
+                        and not _pev.is_set()):
+                    _counted_loop._webui_perm_answer = "n"
+                    _counted_loop._webui_perm_event.set()
 
     return Response(
         gen(),
@@ -412,6 +531,33 @@ def api_chat_status():
     except Exception:
         pass
 
+    # Think/reasoning — paridad con el bloque "think:med.+r" del toolbar TUI
+    rt = getattr(loop, "rt", None)
+    think_level = getattr(rt, "think_level", "off")
+    if think_level not in ("off", "minimal", "low", "medium", "high"):
+        think_level = "off"
+    reasoning   = bool(getattr(rt, "reasoning", False) is True)
+
+    # Memoria semántica — nº total de mems guardadas (capability, como "⬢ mem:41" en TUI)
+    mem_count = 0
+    mem_sys   = getattr(loop, "memory", None)
+    if mem_sys is not None:
+        try:
+            if mem_sys.has_memories():
+                mem_count = len(mem_sys.list_all())
+        except Exception:
+            pass
+
+    # RAG — ficheros/chunks indexados (capability, como "✦ rag:590f/4923c" en TUI)
+    rag_files = rag_chunks = 0
+    _rag = getattr(loop, "_workspace_rag", None)
+    if _rag is not None:
+        try:
+            rag_files  = int(getattr(_rag, "indexed_files", 0) or 0)
+            rag_chunks = int(getattr(_rag, "index_size", 0) or 0)
+        except Exception:
+            pass
+
     return jsonify({
         "connected":        True,
         "agent_emoji":      getattr(cfg, "agent_emoji", "🤖"),
@@ -434,6 +580,11 @@ def api_chat_status():
         "rag_on":           rag_on,
         "elevated":         elevated,
         "vision_on":        vision_on,
+        "think_level":      think_level,
+        "reasoning":        reasoning,
+        "mem_count":        mem_count,
+        "rag_files":        rag_files,
+        "rag_chunks":       rag_chunks,
     })
 
 
@@ -476,6 +627,22 @@ def api_chat_kill():
     # la fuerza el socket (también el de los subagentes, que comparten el pool del
     # padre) y mata todos los subagentes/equipos activos vía kill_all(). Antes solo
     # ponía el flag + kill_event, sin abortar el LLM en vuelo (seguía generando).
+    # /kill descarta la cola de entradas pendientes (paridad con el TUI).
+    with sess["lock"]:
+        _n_queued = len(sess.get("pending_queue", []))
+        sess["pending_queue"] = []
+
+    # Si hay un ask_user esperando respuesta, desbloquearlo (answer=None → cancelado).
+    _qev = getattr(loop, "_webui_question_event", None)
+    if _qev is not None and not _qev.is_set():
+        loop._webui_question_answer = None
+        _qev.set()
+    # Si hay un permiso esperando, desbloquearlo (deny por seguridad).
+    _pev = getattr(loop, "_webui_perm_event", None)
+    if _pev is not None and not _pev.is_set():
+        loop._webui_perm_answer = "n"
+        _pev.set()
+
     summary = {"subagents": 0}
     extras  = {"jobs": 0, "wip": 0}
     try:
@@ -510,7 +677,63 @@ def api_chat_kill():
         "subagents": summary.get("subagents", 0),
         "jobs": extras.get("jobs", 0),
         "wip": extras.get("wip", 0),
+        "queued_discarded": _n_queued,
     })
+
+
+# ── POST /api/chat/answer ────────────────────────────────────────────────────
+
+@bp.route('/api/chat/answer', methods=['POST'])
+def api_chat_answer():
+    """Respuestas del usuario a un ask_user multi-pregunta (evento SSE 'question').
+
+    Body: {"answers": [{"selection": [idx0based], "free_text": "..."}, …]} paralelo a las
+    preguntas. Deja la lista en loop._webui_question_answer y dispara el evento donde
+    espera _ask_user_webui. (Retrocompat: acepta también {selection, free_text} suelto)."""
+    sid = _get_or_create_sid()
+    if sid not in _WEBUI_SESSIONS:
+        return jsonify({"ok": False, "error": "Sin sesión activa"}), 404
+    sess = _WEBUI_SESSIONS[sid]
+    loop = sess.get("loop")
+    if not loop:
+        return jsonify({"ok": False, "error": "Loop no disponible"}), 503
+    data = request.get_json(silent=True) or {}
+    raw = data.get("answers")
+    if raw is None and ("selection" in data or "free_text" in data):
+        raw = [data]                      # retrocompat: una sola respuesta
+    answers = []
+    for a in (raw or []):
+        sel = [int(i) for i in (a or {}).get("selection", []) if isinstance(i, (int, float))]
+        answers.append({"selection": sel, "free_text": str((a or {}).get("free_text", "") or "")})
+    loop._webui_question_answer = answers
+    ev = getattr(loop, "_webui_question_event", None)
+    if ev is not None:
+        ev.set()
+    return jsonify({"ok": True})
+
+
+# ── POST /api/chat/permission ────────────────────────────────────────────────
+
+@bp.route('/api/chat/permission', methods=['POST'])
+def api_chat_permission():
+    """Respuesta del usuario a un prompt de permiso (evento SSE 'permission'). GAP 4.
+
+    Body: {"choice": "s"|"n"|"siempre"}. Desbloquea el _ask_fn que espera en el hilo del
+    turno (loop._webui_perm_event)."""
+    sid = _get_or_create_sid()
+    if sid not in _WEBUI_SESSIONS:
+        return jsonify({"ok": False, "error": "Sin sesión activa"}), 404
+    loop = _WEBUI_SESSIONS[sid].get("loop")
+    if not loop:
+        return jsonify({"ok": False, "error": "Loop no disponible"}), 503
+    choice = str((request.get_json(silent=True) or {}).get("choice", "n")).lower()
+    if choice not in ("s", "n", "siempre"):
+        choice = "n"
+    loop._webui_perm_answer = choice
+    ev = getattr(loop, "_webui_perm_event", None)
+    if ev is not None:
+        ev.set()
+    return jsonify({"ok": True})
 
 
 # ── POST /api/chat/elevated ──────────────────────────────────────────────────

@@ -1,4 +1,4 @@
-"""Renderer: todos los componentes visuales de OOCode al estilo Claude Code."""
+"""Renderer: todos los componentes visuales de OOCode."""
 import random
 import time
 from pathlib import Path
@@ -282,7 +282,8 @@ def print_config(config) -> None:
     elif _api_type == "ollama":
         t.add_row("Servidor",  config.ollama_host)
     t.add_row("Workspace", config.workspace)
-    t.add_row("Contexto",  f"{config.max_context_tokens} tokens máx.")
+    t.add_row("Contexto",  f"{config.effective_max_context_tokens:,} tokens máx. "
+                           f"(ventana {config.effective_context_window or '—'})")
     console.print(t)
 
     console.print()
@@ -337,45 +338,9 @@ def print_spawn_footer(agent_name: str) -> None:
 # ── Sesiones ───────────────────────────────────────────────────────────────────
 
 
-def print_context(context, config, session) -> None:
-    """Muestra el estado actual del contexto y la sesión."""
-    from agent.session import _ago
-    stats = session.stats()
-    msg_count = len(context.messages)
-    # Estimación: 4 chars ≈ 1 token
-    est_chars = sum(len(str(m.get("content", ""))) for m in context.messages)
-    est_tokens = est_chars // 4
-    max_tokens = config.max_context_tokens
-    session_short = stats["session_id"][:8]
-
-    console.print()
-    console.rule("[bold cyan]Contexto[/bold cyan]", style="blue")
-    console.print()
-
-    t = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
-    t.add_column("key", style="dim", no_wrap=True)
-    t.add_column("val", style="white")
-
-    t.add_row("Sesión",   f"[dim]{session_short}…[/dim]  [dim]{_ago(stats['started_at'])}[/dim]")
-    t.add_row("Modelo",   f"[bold cyan]{config.model or '—'}[/bold cyan]")
-    t.add_row("Agente",   f"{config.agent_emoji} {config.agent_name} [dim]({config.agent_id})[/dim]")
-    t.add_row("Mensajes", f"[white]{msg_count}[/white] [dim]en contexto[/dim]")
-    t.add_row(
-        "Tokens",
-        f"[white]~{_fmt_tokens(est_tokens)}[/white] [dim]/ {_fmt_tokens(max_tokens)} máx. (estimado)[/dim]",
-    )
-    t.add_row(
-        "Uso Ollama",
-        f"[white]{_fmt_tokens(stats['input_tokens'])}[/white] [dim]entrada[/dim]  "
-        f"[white]{_fmt_tokens(stats['output_tokens'])}[/white] [dim]salida[/dim]",
-    )
-    t.add_row(
-        "Progreso",
-        _ctx_bar(est_tokens, max_tokens, width=20) + f"  [dim]{int(min(est_tokens/max_tokens,1)*100)}%[/dim]",
-    )
-    t.add_row("Compactaciones", str(stats["compactions"]) if stats["compactions"] else "[dim]ninguna[/dim]")
-    console.print(t)
-    console.print()
+# (print_context eliminada 2026-06: función muerta, sin consumidores. Duplicaba
+#  print_ctx_status pero con estimación cruda //4 y config.max_context_tokens (8000),
+#  dando cifras de tokens erróneas. Usar print_ctx_status, que toma context.stats().)
 
 
 def print_usage(session) -> None:
@@ -455,7 +420,7 @@ def print_sessions(sessions: list[dict], current_id: str) -> None:
 # ── Status / Gateway / Runtime ─────────────────────────────────────────────────
 
 def print_status(config, session, runtime, context) -> None:
-    """Vista general de estado del sistema al estilo /status de OpenClaw."""
+    """Vista general de estado del sistema (/status)."""
     from agent.session import _ago
 
     console.print()
@@ -480,11 +445,13 @@ def print_status(config, session, runtime, context) -> None:
 
     console.print()
 
-    # Contexto
+    # Contexto — usar el estimador real (token_estimate cuenta content+tool_calls+thinking
+    # con CPT por tipo) y el límite efectivo del modelo, no la estimación cruda //4 ni el
+    # fallback config.max_context_tokens (8000), que daban cifras erróneas.
     msg_count = len(context.messages)
-    est_tokens = sum(len(str(m.get("content", ""))) for m in context.messages) // 4
+    est_tokens = context.token_estimate()
     row("Mensajes",  f"[white]{msg_count}[/white] [dim]en contexto[/dim]")
-    row("Tokens est.", f"[white]~{_fmt_tokens(est_tokens)}[/white] / {_fmt_tokens(config.max_context_tokens)}")
+    row("Tokens est.", f"[white]~{_fmt_tokens(est_tokens)}[/white] / {_fmt_tokens(context.max_tokens)}")
     row("Ollama uso", f"{_fmt_tokens(stats['input_tokens'])}↑  {_fmt_tokens(stats['output_tokens'])}↓")
 
     console.print()
@@ -508,7 +475,7 @@ def print_status(config, session, runtime, context) -> None:
 
 
 def print_gateway_status(config) -> None:
-    """Estado del servidor Ollama (equivalente a /gateway-status de OpenClaw)."""
+    """Estado del servidor Ollama (/gateway-status)."""
     from api.ollama import list_ollama_models
 
     console.print()
@@ -581,7 +548,9 @@ def print_ctx_status(context, config, runtime) -> None:
         if stats["has_summary"] else "[dim]ninguno[/dim]"
     )
     t.add_row("Resumen compact.", summary_status)
-    t.add_row("Límite tokens",   f"[dim]{config.max_context_tokens}[/dim]")
+    # Mismo límite que la barra de arriba (stats["max_tokens"] = effective_max_context_tokens),
+    # no el fallback config.max_context_tokens (8000) que era incoherente con la barra.
+    t.add_row("Límite tokens",   f"[dim]{stats['max_tokens']:,}[/dim]")
     console.print(t)
 
     if stats["has_summary"]:
@@ -887,12 +856,14 @@ def print_config_full(config) -> None:
         ]),
         ("Backend (api)", _backend_rows),
         ("Contexto", [
-            ("maxTokens",           str(config.max_context_tokens)),
+            ("maxContextTokens",    f"{config.effective_max_context_tokens:,} (efectivo; ventana {config.effective_context_window or '—'})"),
             ("minKeep",             str(config.compact_min_keep)),
             ("compactThreshold",    str(config.compact_threshold)),
             ("maxSummaryChars",     str(config.max_summary_chars)),
             ("maxToolResultTokens", str(config.max_tool_result_tokens)),
             ("autoContinueMax",     str(config.auto_continue_max)),
+            ("ctxMode",             config.ctx_mode),
+            ("planApproval",        "on" if config.plan_approval else "off"),
         ]),
         ("Embeddings", [
             ("modelo",       config.embed_model),

@@ -4,5 +4,7 @@ DEFAULTS = {
     "host":      "0.0.0.0",           # IP de escucha (0.0.0.0 = todas las interfaces)
     "port":      4000,                 # puerto HTTP del WebUI
     "logFile":   "",                   # ruta del log (vacío = ~/.oocode/logs/webserver.log)
-    "logMaxSizeMb": 5                  # tamaño máximo del log antes de rotar
+    "logMaxSizeMb": 5,                 # tamaño máximo del log antes de rotar
+    "permissionPrompt": False          # True = pide confirmación de permisos en el navegador
+                                       # (solo si hay cliente SSE conectado; si no, auto-aprueba)
 }

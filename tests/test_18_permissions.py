@@ -138,90 +138,94 @@ class TestDefaultConfigCoverage:
 # ── 2. resolve_mode() para cada tool ─────────────────────────────────────────
 
 class TestResolveMode:
-    @pytest.mark.parametrize("tool", _AUTO_TOOLS)
-    def test_auto_tool_resolves_auto(self, tool):
+    # NOTA: la lógica de resolución es idéntica para CADA tool de la lista (solo depende
+    # de su categoría auto/ask, no del nombre). Recorremos la lista entera dentro de un
+    # único test en vez de parametrizar (que generaba ~850 casos triviales) — misma
+    # cobertura (se comprueba cada tool), recuento mínimo.
+    def test_auto_tools_resolve_auto(self):
         pm = _make_pm()
-        assert pm.resolve_mode(tool) == "auto", f"'{tool}' debe ser auto"
+        for tool in _AUTO_TOOLS:
+            assert pm.resolve_mode(tool) == "auto", f"'{tool}' debe ser auto"
 
-    @pytest.mark.parametrize("tool", _ASK_TOOLS)
-    def test_ask_tool_resolves_ask(self, tool):
+    def test_ask_tools_resolve_ask(self):
         pm = _make_pm()
-        assert pm.resolve_mode(tool) == "ask", f"'{tool}' debe ser ask"
+        for tool in _ASK_TOOLS:
+            assert pm.resolve_mode(tool) == "ask", f"'{tool}' debe ser ask"
 
-    @pytest.mark.parametrize("tool", _ASK_TOOLS)
-    def test_ask_tool_resolves_auto_when_elevated_full(self, tool):
+    def test_ask_tools_resolve_auto_when_elevated_full(self):
         pm = _make_pm()
         pm.set_elevated("full")
-        assert pm.resolve_mode(tool) == "auto", f"full: '{tool}' debe ser auto"
+        for tool in _ASK_TOOLS:
+            assert pm.resolve_mode(tool) == "auto", f"full: '{tool}' debe ser auto"
 
-    @pytest.mark.parametrize("tool", _ASK_TOOLS)
-    def test_ask_tool_resolves_deny_when_elevated_off(self, tool):
+    def test_ask_tools_resolve_deny_when_elevated_off(self):
         pm = _make_pm()
         pm.set_elevated("off")
-        assert pm.resolve_mode(tool) == "deny", f"off: '{tool}' debe ser deny"
+        for tool in _ASK_TOOLS:
+            assert pm.resolve_mode(tool) == "deny", f"off: '{tool}' debe ser deny"
 
-    @pytest.mark.parametrize("tool", _AUTO_TOOLS)
-    def test_auto_tool_stays_auto_when_elevated_off(self, tool):
+    def test_auto_tools_stay_auto_when_elevated_off(self):
         """elevated='off' solo bloquea tools 'ask'; las 'auto' siguen siendo auto."""
         pm = _make_pm()
         pm.set_elevated("off")
-        assert pm.resolve_mode(tool) == "auto", (
-            f"off: '{tool}' es auto en config, debe seguir siendo auto"
-        )
+        for tool in _AUTO_TOOLS:
+            assert pm.resolve_mode(tool) == "auto", (
+                f"off: '{tool}' es auto en config, debe seguir siendo auto"
+            )
 
-    @pytest.mark.parametrize("tool", _AUTO_TOOLS)
-    def test_auto_tool_stays_auto_when_elevated_ask(self, tool):
+    def test_auto_tools_stay_auto_when_elevated_ask(self):
         """elevated='ask' (neutral) no cambia tools que ya son 'auto'."""
         pm = _make_pm()
         pm.set_elevated("ask")
-        assert pm.resolve_mode(tool) == "auto", (
-            f"ask neutral: '{tool}' debe seguir siendo auto"
-        )
+        for tool in _AUTO_TOOLS:
+            assert pm.resolve_mode(tool) == "auto", (
+                f"ask neutral: '{tool}' debe seguir siendo auto"
+            )
 
-    @pytest.mark.parametrize("tool", _ASK_TOOLS)
-    def test_ask_tool_stays_ask_when_elevated_ask(self, tool):
+    def test_ask_tools_stay_ask_when_elevated_ask(self):
         """elevated='ask' (neutral) no cambia tools que son 'ask'."""
         pm = _make_pm()
         pm.set_elevated("ask")
-        assert pm.resolve_mode(tool) == "ask", (
-            f"ask neutral: '{tool}' debe seguir siendo ask"
-        )
+        for tool in _ASK_TOOLS:
+            assert pm.resolve_mode(tool) == "ask", (
+                f"ask neutral: '{tool}' debe seguir siendo ask"
+            )
 
-    @pytest.mark.parametrize("tool", _ASK_TOOLS)
-    def test_ask_tool_resolves_auto_when_elevated_on(self, tool):
+    def test_ask_tools_resolve_auto_when_elevated_on(self):
         """elevated='on' convierte ask → auto (respeta deny)."""
         pm = _make_pm()
         pm.set_elevated("on")
-        assert pm.resolve_mode(tool) == "auto", f"on: '{tool}' debe ser auto"
+        for tool in _ASK_TOOLS:
+            assert pm.resolve_mode(tool) == "auto", f"on: '{tool}' debe ser auto"
 
 
 # ── 3. MCP tool name resolution ───────────────────────────────────────────────
 
 class TestMcpNameResolution:
-    @pytest.mark.parametrize("tool", _AUTO_TOOLS)
-    def test_mcp_auto_tool_resolves_correctly(self, tool):
+    def test_mcp_auto_tools_resolve_correctly(self):
         """mcp_oocode_assistant_<tool> hereda el permiso bare."""
         pm = _make_pm()
-        mcp_name = f"mcp_oocode_assistant_{tool}"
-        assert pm.resolve_mode(mcp_name) == "auto", (
-            f"'{mcp_name}' debe ser auto (hereda de '{tool}')"
-        )
+        for tool in _AUTO_TOOLS:
+            mcp_name = f"mcp_oocode_assistant_{tool}"
+            assert pm.resolve_mode(mcp_name) == "auto", (
+                f"'{mcp_name}' debe ser auto (hereda de '{tool}')"
+            )
 
-    @pytest.mark.parametrize("tool", _ASK_TOOLS)
-    def test_mcp_ask_tool_resolves_correctly(self, tool):
+    def test_mcp_ask_tools_resolve_correctly(self):
         """mcp_oocode_assistant_<tool> hereda 'ask' del nombre bare."""
         pm = _make_pm()
-        mcp_name = f"mcp_oocode_assistant_{tool}"
-        assert pm.resolve_mode(mcp_name) == "ask", (
-            f"'{mcp_name}' debe ser ask (hereda de '{tool}')"
-        )
+        for tool in _ASK_TOOLS:
+            mcp_name = f"mcp_oocode_assistant_{tool}"
+            assert pm.resolve_mode(mcp_name) == "ask", (
+                f"'{mcp_name}' debe ser ask (hereda de '{tool}')"
+            )
 
-    @pytest.mark.parametrize("tool", _ASK_TOOLS)
-    def test_mcp_ask_tool_becomes_auto_with_full(self, tool):
+    def test_mcp_ask_tools_become_auto_with_full(self):
         pm = _make_pm()
         pm.set_elevated("full")
-        mcp_name = f"mcp_oocode_assistant_{tool}"
-        assert pm.resolve_mode(mcp_name) == "auto"
+        for tool in _ASK_TOOLS:
+            mcp_name = f"mcp_oocode_assistant_{tool}"
+            assert pm.resolve_mode(mcp_name) == "auto"
 
     def test_unknown_mcp_tool_defaults_to_ask(self):
         pm = _make_pm()
@@ -243,13 +247,13 @@ class TestMcpNameResolution:
 # ── 4. check() — auto tools never ask ────────────────────────────────────────
 
 class TestCheckAutoTools:
-    @pytest.mark.parametrize("tool", _AUTO_TOOLS)
-    def test_auto_tool_check_returns_true_without_asking(self, tool):
+    def test_auto_tools_check_returns_true_without_asking(self):
         """Tools auto nunca deben invocar ask_fn."""
-        pm, calls = _make_pm_ask_fn(["s"])
-        result = pm.check(tool, f"calling {tool}")
-        assert result is True, f"'{tool}' auto debe retornar True"
-        assert calls == [], f"'{tool}' auto no debe invocar ask_fn, pero llamó: {calls}"
+        for tool in _AUTO_TOOLS:
+            pm, calls = _make_pm_ask_fn(["s"])
+            result = pm.check(tool, f"calling {tool}")
+            assert result is True, f"'{tool}' auto debe retornar True"
+            assert calls == [], f"'{tool}' auto no debe invocar ask_fn, pero llamó: {calls}"
 
     def test_auto_tool_check_no_ask_fn_needed(self):
         """Tools auto funcionan aunque ask_fn sea None."""
@@ -262,35 +266,35 @@ class TestCheckAutoTools:
 # ── 5. check() — ask tools prompt the user ────────────────────────────────────
 
 class TestCheckAskTools:
-    @pytest.mark.parametrize("tool", _ASK_TOOLS)
-    def test_ask_tool_invokes_ask_fn(self, tool):
+    def test_ask_tools_invoke_ask_fn(self):
         """Tools 'ask' deben invocar ask_fn exactamente una vez."""
-        pm, calls = _make_pm_ask_fn(["s"])
-        result = pm.check(tool, f"calling {tool}")
-        assert result is True
-        assert len(calls) == 1, (
-            f"'{tool}' debe invocar ask_fn 1 vez, invocó {len(calls)}"
-        )
-        assert calls[0][0] == tool
+        for tool in _ASK_TOOLS:
+            pm, calls = _make_pm_ask_fn(["s"])
+            result = pm.check(tool, f"calling {tool}")
+            assert result is True
+            assert len(calls) == 1, (
+                f"'{tool}' debe invocar ask_fn 1 vez, invocó {len(calls)}"
+            )
+            assert calls[0][0] == tool
 
-    @pytest.mark.parametrize("tool", _ASK_TOOLS)
-    def test_ask_tool_denied_when_user_says_no(self, tool):
-        pm, calls = _make_pm_ask_fn(["n"])
-        result = pm.check(tool, f"calling {tool}")
-        assert result is False, f"'{tool}' debe ser denegado cuando user dice 'n'"
+    def test_ask_tools_denied_when_user_says_no(self):
+        for tool in _ASK_TOOLS:
+            pm, calls = _make_pm_ask_fn(["n"])
+            result = pm.check(tool, f"calling {tool}")
+            assert result is False, f"'{tool}' debe ser denegado cuando user dice 'n'"
 
-    @pytest.mark.parametrize("tool", _ASK_TOOLS)
-    def test_ask_tool_session_auto_after_siempre(self, tool):
+    def test_ask_tools_session_auto_after_siempre(self):
         """'siempre' añade la tool a session_auto: segunda llamada no pregunta."""
-        pm, calls = _make_pm_ask_fn(["siempre", "s"])
-        # Primera llamada: pregunta y responde "siempre"
-        r1 = pm.check(tool, "test")
-        assert r1 is True
-        assert len(calls) == 1
-        # Segunda llamada: no debe preguntar (ya en session_auto)
-        r2 = pm.check(tool, "test")
-        assert r2 is True
-        assert len(calls) == 1, f"Segunda llamada no debe invocar ask_fn para '{tool}'"
+        for tool in _ASK_TOOLS:
+            pm, calls = _make_pm_ask_fn(["siempre", "s"])
+            # Primera llamada: pregunta y responde "siempre"
+            r1 = pm.check(tool, "test")
+            assert r1 is True
+            assert len(calls) == 1
+            # Segunda llamada: no debe preguntar (ya en session_auto)
+            r2 = pm.check(tool, "test")
+            assert r2 is True
+            assert len(calls) == 1, f"Segunda llamada no debe invocar ask_fn para '{tool}'"
 
     def test_ask_fn_not_called_when_in_session_auto(self):
         """Si una tool está en session_auto, check() retorna True sin preguntar."""

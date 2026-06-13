@@ -97,11 +97,20 @@ def _build_style(accent: str) -> Style:
         "sub-name":     "#bb66ff bold",      # emoji + id del subagente
         "sub-chat":     "#00e5ff bold",      # 💬 parpadeante (comunicación sub↔principal)
         # ── Task progress panel ────────────────────────────────────────────────
-        "task-done":     "#00cc66",                     # ✔ verde brillante
-        "task-active":   "#00e5ff bold",                # ◼ cyan brillante
+        "task-done":        "#00cc66 strike",           # ✔ verde + tachado (completada)
+        "option-done":      "#00cc66",                   # ask_user: opción/pregunta ya respondida (verde)
+        "task-active":      "#00e5ff bold",             # ◈ animación diamante (otros usos)
+        "task-active-mark": "#00cc66 bold",             # ◼ cuadrado verde (tarea en curso)
+        "task-active-text": "#ffffff bold",             # texto en curso — blanco negrita
         # ── Status window — spinner thinking ──────────────────────────────────
+        "status-main":      "#ff4455 bold",             # frase principal multitarea — rojo
         "status-word":      "#00e5ff bold",             # Cavilando… — cyan neón
         "status-phrase":    "#ffcc00 bold italic",      # sinaptizando más… — ámbar vivo
+        # ◉ spinner pulsante — respira verde↔cyan al mismo ritmo que el ● del live block
+        "spin-pulse-0":     "#00cc66 bold",             # verde
+        "spin-pulse-1":     "#00e5ff bold",             # cyan neón
+        "spin-pulse-2":     "#7af0ff bold",             # cyan claro (pico)
+        "spin-pulse-3":     "#00e5ff bold",             # cyan neón (transición suave)
         "time-dim":         "#667799",                  # (22s · ) — gris azulado normal
         # ── Status window — barra de contexto coloreada ───────────────────────
         "status-bar-ok":    "#00cc66 bold",             # ▰▰▰ verde (ctx < 60%)

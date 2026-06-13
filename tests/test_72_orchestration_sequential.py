@@ -103,3 +103,26 @@ def test_single_call_never_parallel():
     loop = _make_loop()
     *_, safe_parallel = _dispatch(loop, ["read_file"])
     assert safe_parallel is False
+
+
+def test_edit_batch_forces_sequential():
+    """Lote con ediciones → secuencial: cada edición pasa por _show_tool_running_header
+    (auto-split por fichero + diff por edición), no se vuelca agrupado al final."""
+    loop = _make_loop()
+    *_, safe_parallel = _dispatch(loop, ["edit_file", "edit_file"])
+    assert safe_parallel is False
+
+
+def test_mixed_read_and_edit_forces_sequential():
+    """read + edit en el mismo lote → secuencial (la edición no debe paralelizarse)."""
+    loop = _make_loop()
+    *_, safe_parallel = _dispatch(loop, ["read_file", "edit_file", "grep_code"])
+    assert safe_parallel is False
+
+
+def test_replace_tools_force_sequential():
+    """smart_replace/regex_replace/write_file también fuerzan secuencial en lote."""
+    for wt in ("smart_replace", "regex_replace", "write_file", "bulk_replace"):
+        loop = _make_loop()
+        *_, safe_parallel = _dispatch(loop, ["read_file", wt])
+        assert safe_parallel is False, f"{wt} debería forzar secuencial"

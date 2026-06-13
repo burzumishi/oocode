@@ -21,7 +21,7 @@ from agent.chatlog import ChatLogger
 from agent.memory import MemorySystem
 from agent.session import SessionManager
 from agent.runtime import RuntimeSettings, COLOR_PRESETS
-from tools.registry import ToolRegistry
+from tools.registry import ToolRegistry, _PATH_ALIAS_FAMILY
 from tools.permissions import PermissionManager
 from tools.hooks import _is_modify_tool
 from workspace.manager import WorkspaceManager
@@ -36,21 +36,28 @@ from agent.loop_helpers import (  # noqa: F401
     _TIMEOUT_SENTINEL, _FALLBACK_MIN_CHARS, _THINKING_WORDS, _MULTITASK_WORDS,
     _TASK_PREFLIGHT_PHRASES, _TASK_ICON_COLORS, _PREFLIGHT_USER_GREETINGS,
     _SINGLE_PREFLIGHT_GENERIC, _PF_ACTIONS, _PF_DOMAINS, _PF_PHRASES,
-    _MULTI_ICON_STYLES, _COMPACT_LOCK, _DONE_WORDS, _NEAR_FINISH_PHRASES,
+    _COMPACT_LOCK, _DONE_WORDS, _NEAR_FINISH_PHRASES,
     _TOOL_ALIASES, _IMG_EXTENSIONS,
     _SUBAGENT_COLORS, _TOOL_LIVE_VERBS,
     SYSTEM_HEADER, _TOOL_GROUPS, _TASK_KEYWORDS, SYSTEM_RULES,
     filter_system_rules,
+    normalize_ask_questions, format_ask_questions_result,
     _pick_preflight_phrase, _fmt_elapsed, _fmt_tokens, _rag_display,
     _is_complex_query, _load_images_b64, _ctx_bar, _compact_hint,
-    _pbar_thin_ratio, _sfmt, _bar_style, _hint_styled,
+    _pbar_thin_ratio, _sfmt, _bar_style, _hint_styled, _spin_pulse_cls, _spin_pulse_rich,
     _make_compact_summary,
-    _make_tool_preview, _pick_file_switch_phrase,
+    _make_tool_preview, _pick_file_switch_phrase, _pick_file_continue_phrase,
     _SUBAGENT_SPINNER_POLL, _MAX_PLAN_TASKS, _BASH_OVERUSE_RATIO,
-    _ORCHESTRATION_TOOLS, _COLD_START_RE,
+    _ORCHESTRATION_TOOLS, _CMD_CONCERN_TOOLS, _COLD_START_RE,
 )
 from webui.loop_webui import WebUIMixin
 from ui.loop_tui import TUIDisplayMixin
+
+# Patrones de detección de tareas en un plan (numeradas / bullets). Compilados una sola
+# vez a nivel de módulo — antes _detect_tasks los recompilaba en cada invocación.
+_TASK_NUM_RE    = re.compile(r'^(\s*)(?:\d+[.):\-]|paso\s+\d+[).::-]?)\s+(.+)', re.I)
+_TASK_BULLET_RE = re.compile(r'^(\s*)[-*•–·]\s+(.+)')
+
 
 class AgentLoop(TUIDisplayMixin, WebUIMixin):
     def __init__(
@@ -123,6 +130,7 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             max_summary_chars=config.max_summary_chars,
             high_water=config.context_high_water,
             tool_max_chars=config.context_tool_max_chars,
+            compact_target=config.context_compact_target,
         )
         # Reutilizar cliente externo si se proporciona (subagentes comparten el del padre
         # para que el modelo no se descargue/recargue entre llamadas).
@@ -220,6 +228,8 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         # Plan de tareas con tracking visual — alimenta el task progress panel del TUI
         # Cada entrada: {text: str, status: "pending"|"active"|"done", start_ts: float, end_ts: float}
         self._plan_tasks: list[dict] = []
+        # Resumen/gerundio del plan activo (frase principal roja del spinner multitarea)
+        self._plan_summary: str = ""
         # Número de mensajes en context cuando la tarea activa actual empezó.
         # min_keep adaptativo en compactación: preserva el turno de la tarea activa.
         self._plan_active_msg_idx: int = -1
@@ -238,6 +248,8 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         self._turn_block_has_header: bool = False  # True si el batch ya mostró un ● header
         self._turn_expanded: bool = False
         self._current_write_target: str = ""   # Último fichero editado/escrito (para auto-split)
+        self._last_write_target: str = ""      # Sobrevive al flush: frase continuación vs cambio
+        self._block_has_cmd: bool = False      # El bloque abierto contiene comandos (bash/make…)
         # Fichero actual procesado por tools de búsqueda (para mostrar en spinner)
         self._tool_current_file: str = ""
         # Live block callbacks (inyectados por OOCodeApp; None en modo REPL)
@@ -251,6 +263,9 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         self._live_tool_count: int = 0   # tools completadas en el live block actual
         # True si el modelo emitió texto al usuario en el turno actual
         self._turn_text_emitted: bool = False
+        # Razonamiento (<think>) de la última respuesta del modelo — se muestra como
+        # narración si think_level != off. Vacío cuando el modelo no razona (default).
+        self._last_thinking: str = ""
         # Buffer de salida para subagentes: max 12 líneas visibles por turno
         self._sub_lines_shown: int = 0
         _MAX_SUB_LINES_PER_TURN = 12
@@ -309,41 +324,46 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         else:
             workspace_ctx = self.ws.load_mini_context()
 
-        # Memorias semánticamente relevantes para este turno.
-        # _turn_mem_snippet se calcula una sola vez al inicio de run() y se
-        # reutiliza en las iteraciones siguientes (tool calls del mismo turno).
-        if not self.is_subagent:
-            if self._turn_mem_snippet is None:
-                try:
-                    self._webui_emit({"type": "embed_flash", "op": "read"})
-                    self._turn_mem_snippet = self.memory.context_snippet(
-                        self._last_user_msg
-                    )
-                except Exception as e:
-                    log.debug("mem_snippet_error", error=str(e))
-                    self._turn_mem_snippet = ""
-            mem_snippet = self._turn_mem_snippet
-        else:
-            mem_snippet = ""
+        # Memoria semántica + RAG: ambos hacen un embed síncrono (round-trip a Ollama)
+        # del mensaje del usuario. Se calculan una sola vez por turno (cache `is None`).
+        # Antes corrían EN SERIE → doble latencia de embed antes del primer token; ahora
+        # se solapan en un hilo (I/O-bound: el GIL se libera durante el round-trip, y cada
+        # subsistema usa su propio cliente de embeddings, sin estado compartido).
+        def _compute_mem() -> None:
+            try:
+                self._webui_emit({"type": "embed_flash", "op": "read"})
+                self._turn_mem_snippet = self.memory.context_snippet(self._last_user_msg)
+            except Exception as e:
+                log.debug("mem_snippet_error", error=str(e))
+                self._turn_mem_snippet = ""
 
-        # RAG automático: fragmentos de código relevantes del workspace
-        rag_snippet = ""
-        if self._workspace_rag is not None and not self.is_subagent:
-            if self._turn_rag_snippet is None:
-                try:
-                    self._workspace_rag.ensure_indexed()
-                    _rag_top_k, _rag_thresh = self._rag_params_for_turn(
-                        self._last_user_msg
-                    )
-                    self._turn_rag_snippet = self._workspace_rag.context_snippet(
-                        self._last_user_msg,
-                        top_k=_rag_top_k,
-                        threshold=_rag_thresh,
-                    )
-                except Exception as e:
-                    log.debug("rag_snippet_error", error=str(e))
-                    self._turn_rag_snippet = ""
-            rag_snippet = self._turn_rag_snippet
+        def _compute_rag() -> None:
+            try:
+                self._workspace_rag.ensure_indexed()
+                _rag_top_k, _rag_thresh = self._rag_params_for_turn(self._last_user_msg)
+                self._turn_rag_snippet = self._workspace_rag.context_snippet(
+                    self._last_user_msg, top_k=_rag_top_k, threshold=_rag_thresh,
+                )
+            except Exception as e:
+                log.debug("rag_snippet_error", error=str(e))
+                self._turn_rag_snippet = ""
+
+        _need_mem = (not self.is_subagent) and self._turn_mem_snippet is None
+        _need_rag = (self._workspace_rag is not None and not self.is_subagent
+                     and self._turn_rag_snippet is None)
+        if _need_mem and _need_rag:
+            _rag_t = threading.Thread(target=_compute_rag, name="oocode-rag-embed", daemon=True)
+            _rag_t.start()
+            _compute_mem()
+            _rag_t.join()
+        elif _need_mem:
+            _compute_mem()
+        elif _need_rag:
+            _compute_rag()
+
+        mem_snippet = (self._turn_mem_snippet or "") if not self.is_subagent else ""
+        rag_snippet = ((self._turn_rag_snippet or "")
+                       if (self._workspace_rag is not None and not self.is_subagent) else "")
 
         # OOCODE.md del proyecto (si existe)
         oocode_md = self.config.load_oocode_md()
@@ -392,6 +412,22 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         if self.plugins:
             plugin_injection = self.plugins.system_injection()
 
+        # Subagente: trabajador interno. Anula la regla de "habla cálido con el usuario"
+        # (que va dirigida al agente que conversa con la persona) — el subagente reporta
+        # al agente PRINCIPAL, así que nada de saludos/presentaciones ni dirigirse al
+        # usuario por su nombre: directo al trabajo y a los resultados.
+        subagent_section = ""
+        if self.is_subagent:
+            subagent_section = (
+                "\n## Eres un SUBAGENTE (trabajador interno)\n"
+                "Te ha lanzado el agente principal para una tarea acotada; tu salida la "
+                "lee ÉL (se muestra en tu bloque). NO saludes ni te presentes ('¡Hola!', "
+                "'¡Por supuesto!', no te dirijas al usuario por su nombre): empieza "
+                "DIRECTAMENTE por el trabajo y reporta conciso qué hiciste, qué hallaste y "
+                "el resultado (cifras/rutas). No puedes preguntar (`ask_user` no está "
+                "disponible aquí): elige la opción más razonable y continúa.\n"
+            )
+
         think_section = self.rt.think_injection()
         extra_rules = f"\n{self._extra_rules}" if self._extra_rules else ""
         # Orden del system prompt:
@@ -424,6 +460,7 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             f"{agents_section}"
             f"{extra_dirs_section}"
             f"{plugin_injection}\n"
+            f"{subagent_section}"
             f"{mem_snippet}\n"
             f"{rag_snippet}"
             f"{think_section}{extra_rules}"
@@ -471,7 +508,7 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         elif not self.capture_output:
             console.print(f"\n  {body}\n")
 
-    # Nombres de display al estilo Claude Code: verb capitalizado en lugar del snake_case interno
+    # Nombres de display: verb capitalizado en lugar del snake_case interno
     _TOOL_DISPLAY_NAMES: dict[str, str] = {
         "bash":             "Bash",
         "read_file":        "Read",
@@ -554,16 +591,42 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             base = p.rsplit("/", 1)[-1]
             return base if len(base) <= max_len else base[:max_len] + "…"
 
+        def _arg_path(d: dict) -> str:
+            """Ruta del fichero tolerante a alias (path/file/file_path/filename…).
+            El modelo a veces llama edit_file(file=…) — sin esto el contexto salía
+            vacío y el ● caía a 'Editing Update' en vez de 'Editing (db.c)'."""
+            if not isinstance(d, dict):
+                return ""
+            for _a in _PATH_ALIAS_FAMILY:
+                v = d.get(_a)
+                if v:
+                    return str(v)
+            return ""
+
         if name in ("read_file", "write_file"):
-            p   = args.get("path", "")
+            p   = _arg_path(args)
             off = args.get("offset", "")
             lim = args.get("limit", "")
             rng = (f":{off}" if off else "") + (f"+{lim}" if lim else "")
             return _esc(f"({_short_path(p)}{rng})") if p else ""
+        if name == "read_files":
+            ps = args.get("paths") or args.get("files") or []
+            if isinstance(ps, list) and ps:
+                extra = f" +{len(ps) - 1}" if len(ps) > 1 else ""
+                return _esc(f"({_short_path(str(ps[0]))}{extra})")
+            p = _arg_path(args)
+            return _esc(f"({_short_path(p)})") if p else ""
+        if name in ("read_sections", "code_outline", "ls_dir", "ls_file",
+                    "tree", "file_stat"):
+            # Tools de lectura/listado con verbo propio en el ● (Reading/Listing/
+            # Checking…): sin esto el bullet caía a solo "Reading" sin el fichero
+            # (el ⎿ sí lo mostraba). Tolerante a alias de ruta (file/path/…).
+            p = _arg_path(args)
+            return _esc(f"({_short_path(p)})") if p else ""
         if name in ("edit_file", "edit_files"):
-            p = args.get("path", "") or (
-                args.get("edits", [{}])[0].get("path", "") if isinstance(args.get("edits"), list) else ""
-            )
+            p = _arg_path(args)
+            if not p and isinstance(args.get("edits"), list) and args["edits"]:
+                p = _arg_path(args["edits"][0]) if isinstance(args["edits"][0], dict) else ""
             return _esc(f"({_short_path(p)})") if p else ""
         if name in ("grep_code", "grep_file"):
             pat  = str(args.get("pattern", ""))
@@ -633,7 +696,7 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                          suppress_header: bool = False,
                          pre_shown: bool = False,
                          batch_idx: int = -1) -> None:
-        """Muestra un tool call al estilo Claude Code:
+        """Muestra un tool call:
 
           ● ToolName(contexto)
             ⎿  primera línea del resultado
@@ -674,6 +737,10 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                 "ok":      _is_ok,
                 "n_lines": len(_result_str.splitlines()),
                 "preview": _prev,
+                # Paridad TUI: una edición completada con éxito cierra su unidad
+                # visual (el cliente hace _finishToolBlock y la siguiente tool
+                # abre bloque nuevo) — un bloque con diff por edición.
+                "is_modify": _is_modify_tool(name),
             }
             # Tarjeta de descarga: SOLO para entregables que el usuario pide producir
             # (documentos ofimáticos, PDF, exports). NUNCA para ediciones de código
@@ -779,8 +846,18 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                     elif allowed:
                         self._render_tool_diff_print(name, args if isinstance(args, dict) else {}, _result_str)
                 elif name in self._MEM_TOOLS:
-                    # Herramientas de memoria: resultado compacto inline (ya tienen ◐)
+                    # Herramientas de memoria: resultado compacto inline (ya tienen ◐).
+                    # Van FUERA del bloque de tools (el header cerró el live block), así
+                    # que NO cuentan en el ⎿ del bloque siguiente: salir sin tocar el
+                    # contador live.
                     self._show_inline_compact_result(name, args, _result_str, allowed)
+                    return
+                elif name == "task_done":
+                    # task_done cierra la unidad visual de su tarea (el header ya hizo
+                    # flush) y su narración salió estática vía _render_task_narration.
+                    # El resultado ("✔ Tarea N/M…") es guía para el modelo, no display:
+                    # no bufferizar ni contar en el ⎿ del bloque siguiente.
+                    return
                 else:
                     # Todas las demás: bufferizar en _turn_block para resumen agrupado
                     self._turn_block.append((name, args if isinstance(args, dict) else {}, _result_str, allowed))
@@ -790,6 +867,15 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                     self._update_live_tools_cb(self._live_tool_count)
                 if getattr(self, "_update_live_current_tool_cb", None):
                     self._update_live_current_tool_cb("")
+                # Edición completada con éxito → CERRAR la unidad visual aquí:
+                # exploración + razonamiento + ESTA edición + su diff pasan
+                # YA al buffer estático, visibles al momento — en vez de seguir apilando
+                # más ediciones del mismo fichero en el live block y soltar todos los
+                # diffs de golpe al final ("Used 16 tools"). La siguiente write tool
+                # reabre su propio bloque en _show_tool_running_header; una edición
+                # FALLIDA no cierra (el reintento se queda en el mismo bloque).
+                if _is_modify and _is_ok and allowed:
+                    self._flush_turn_block()
                 return
 
             # Ejecución paralela: acumular en _turn_block para resumen compacto al final
@@ -921,16 +1007,62 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                 self._render_tool_diff_print(name, args if isinstance(args, dict) else {},
                                              str(result))
 
+    def _is_duplicate_bullet(self, text: str, tool_calls: list) -> bool:
+        """True si las tools de este turno deben ACUMULARSE en el bloque ● ya abierto en
+        vez de arrancar un ● nuevo.
+
+        Dos casos se asignan al mensaje anterior (el bloque vivo):
+        1. **Texto vacío** (tool-only turn de qwen3.5): no hay mensaje nuevo que mostrar,
+           así que las tools pertenecen al ● del mensaje ya mostrado. Sin esto cada turno
+           sin texto generaba un ● "…" suelto en vez de adjuntarse al mensaje anterior.
+        2. **Preámbulo idéntico**: el modelo reemite PALABRA POR PALABRA el mismo texto
+           cada iteración ejecutando tools distintas → se acumulan bajo un solo ●
+           (⎿ "Ran N commands") en vez de duplicar el bullet.
+
+        Requisitos en ambos: no subagente, hay tool_calls (en auto-continue siempre hay;
+        sin tools el turno acaba) y hay un bloque abierto donde acumular (_bullet_block_open).
+        Tras compactar mid-turn, _show_compact_reset re-ancla ese bloque al mensaje
+        re-pintado, de modo que las tools post-compactación también se le asignan.
+        """
+        if self.capture_output or not tool_calls:
+            return False
+        if not getattr(self, "_bullet_block_open", False):
+            return False
+        _norm = " ".join(text.split()) if text else ""
+        if not _norm:
+            return True   # tool-only turn → adjuntar al mensaje anterior
+        return _norm == getattr(self, "_last_displayed_bullet", None)
+
+    def _is_new_reasoning(self, thinking: str) -> bool:
+        """True si `thinking` (💭) es un razonamiento NUEVO respecto al último que
+        abrió/separó un paso — la señal que usa run() para abrir un bloque nuevo en
+        iteraciones de continuación dup/tool-only.
+
+        Por qué: con `reasoning` activo el modelo razona ANTES de cada acción (un paso
+        nuevo del trabajo) pero reemite el MISMO preámbulo de texto o ninguno, así que
+        sin esto todos los pasos se fusionan bajo un único "Used N tools". El 💭 distinto
+        es el separador real entre pasos (estructura estilo Claude Code: 💭 → ● acción →
+        tools → ⎿). Devuelve False si el pensamiento está vacío o es IDÉNTICO al anterior
+        (el modelo repite el mismo razonamiento) → no trocea por ruido."""
+        norm = " ".join((thinking or "").split()).lower()
+        if not norm:
+            return False
+        return norm != getattr(self, "_last_step_thinking", "")
+
     def _flush_turn_block(self) -> None:
         """Cierra el live block (si activo) y resetea el buffer de tools del turno.
 
         Llamado antes de cada nuevo ● y al final del turno. En TUI mode con live block,
         hace flush del bloque dinámico al buffer estático con el summary final.
         """
+        # El bloque (si lo había) se cierra aquí → ya no hay dónde acumular bullets dup.
+        # El concern del bloque (fichero en curso / comandos) muere con él.
+        self._bullet_block_open = False
+        self._current_write_target = ""
+        self._block_has_cmd = False
         if self.capture_output:
             self._turn_block = []
             self._turn_block_has_header = False
-            self._current_write_target = ""
             return
 
         # TUI con live block: cerrar el bloque dinámico con summary compacto
@@ -946,7 +1078,6 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             self._live_tool_count = 0
             self._turn_block = []
             self._turn_block_has_header = False
-            self._current_write_target = ""
             return
 
         # REPL fallback: print ⎿ summary al buffer estático
@@ -965,17 +1096,65 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
 
         self._turn_block = []
         self._turn_block_has_header = False
-        self._current_write_target = ""
 
 
     def _extract_write_target(self, name: str, args: dict) -> str:
-        """Extrae la ruta del fichero destino de una write/replace tool."""
-        p = (args.get("path") or args.get("file_path") or
+        """Extrae la ruta del fichero destino de una write/replace tool.
+
+        Cubre TODOS los nombres de parámetro de ruta de las modify tools:
+        `path` (edit_file, lsp_rename…), `file_path` (write_file) y `file`
+        (smart_replace, regex_replace). Si falta uno, el auto-split por fichero
+        NUNCA dispara para esa tool y las ediciones de varios ficheros se
+        acumulan bajo un mismo bloque — fue exactamente el bug con smart_replace
+        (el steering anti-fallos empuja hacia ella, así que era el caso común).
+        """
+        p = (args.get("path") or args.get("file_path") or args.get("file") or
              args.get("filepath") or args.get("output_path") or "")
         if not p and "edits" in args and isinstance(args["edits"], list):
             edits = args["edits"]
             p = edits[0].get("path", "") if edits else ""
         return str(p) if p else ""
+
+    def _tools_concern(self, tool_calls: list) -> str:
+        """Concern (asunto) de la PRÓXIMA tanda de tool_calls de una iteración.
+
+        Devuelve:
+          • ``"file:<ruta>"`` — la tanda contiene write tools (la primera fija el
+            fichero): la unidad visual es "trabajo sobre ese fichero".
+          • ``"cmd"`` — la tanda ejecuta comandos (bash/make_run/run_script…): la
+            unidad es "un intento de compilación/ejecución".
+          • ``""`` — solo lectura/exploración (read/grep/ls…): NEUTRAL, no define
+            unidad propia (acompaña al bloque que esté abierto).
+
+        Lo usa run() para detectar el cambio de asunto en iteraciones tool-only:
+        cuando el bloque abierto es de comandos y llegan ediciones (o viceversa),
+        el bloque se cierra y la tanda nueva abre el suyo — sin esto, un intento
+        de compilación + razonamientos + ediciones de ficheros acababan TODOS bajo
+        un mismo "Used N tools" y la conversación no fluía.
+        """
+        parsed: list[tuple[str, dict]] = []
+        for tc in tool_calls or []:
+            try:
+                name = getattr(getattr(tc, "function", None), "name", "") or ""
+                name = _TOOL_ALIASES.get(name, name)
+                args = getattr(getattr(tc, "function", None), "arguments", {}) or {}
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except Exception:
+                        args = {}
+                parsed.append((name, args if isinstance(args, dict) else {}))
+            except Exception:
+                continue
+        for name, args in parsed:
+            if _is_modify_tool(name):
+                tgt = self._extract_write_target(name, args)
+                # Sin ruta extraíble no hay concern fiable → neutral (no romper).
+                return f"file:{tgt}" if tgt else ""
+        for name, _args in parsed:
+            if name in _CMD_CONCERN_TOOLS:
+                return "cmd"
+        return ""
 
     def _show_tool_running_header(self, name: str, args: dict) -> None:
         """Imprime el header de tool ANTES de ejecutarla.
@@ -992,6 +1171,12 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         ctx     = self._call_context(name, args)
         is_mem_tool = name in self._MEM_TOOLS
 
+        # Concern del bloque abierto: registrar que contiene comandos de ejecución.
+        # Lo consume run() para cerrar el bloque cuando la siguiente tanda tool-only
+        # cambia de asunto (comandos → edición de fichero, o viceversa).
+        if name in _CMD_CONCERN_TOOLS:
+            self._block_has_cmd = True
+
         _in_webui = getattr(self, "_webui_queue", None) is not None
 
         # WebUI: plan_create se representa con el evento 'plan' — no emitir tool_start
@@ -1006,8 +1191,21 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         # textos del subagente acababan fuera de su bloque.
         if _in_webui and name != "spawn_subagent":
             ctx_plain = self._strip_rich(ctx).strip()
+            # is_modify / write_target alimentan el auto-split por fichero del WebUI
+            # (paridad con el TUI: una edición sobre un fichero DISTINTO abre bloque
+            # nuevo; read+razonamiento+ediciones del MISMO fichero quedan en uno).
+            _wt_modify = _is_modify_tool(name)
+            _wt_path   = self._extract_write_target(name, args) if _wt_modify else ""
+            import os as _os_wt
+            _wt_base   = _os_wt.path.basename(_wt_path) if _wt_path else ""
             self._webui_emit({"type": "tool_start", "tool": display, "raw": name,
-                              "context": ctx_plain})
+                              "context": ctx_plain,
+                              "is_modify": _wt_modify, "write_target": _wt_base})
+            # Mantener el concern de fichero también en WebUI (el TUI lo fija más
+            # abajo en su rama): alimenta la detección de cambio de asunto de run()
+            # → reasoning con new_step=true cierra el bloque en el cliente.
+            if _wt_path:
+                self._current_write_target = _wt_path
 
         # Tools de orquestación (spawn_subagent/explore/create_team/run_team/spawn_fanout)
         # en TUI son la excepción: NO deben alimentar el live block del ● anterior. Estas
@@ -1020,18 +1218,35 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         if _orch_tui and self._flush_live_block_cb:
             self._flush_turn_block()
 
+        # Tools de memoria (mem_save/workspace_remember) en TUI: misma excepción —
+        # son acciones de continuidad del agente, NO trabajo sobre ficheros del
+        # proyecto. Su ◐ ⬡ va FUERA del bloque de tools (cerramos el live block y
+        # se imprimen estáticas), en vez de quedar enterradas en el "Used N tools"
+        # de la edición en curso.
+        _mem_tui = (is_mem_tool and not self.is_subagent and not _in_webui)
+        if _mem_tui and self._flush_live_block_cb:
+            self._flush_turn_block()
+
+        # task_done marca el FIN de una tarea del plan: cierra la unidad visual de la
+        # tarea que termina ANTES de ejecutarse, de modo que la narración del desenlace
+        # (● de _render_task_narration, durante la ejecución) salga ESTÁTICA al nivel
+        # de la conversación, entre el bloque que se cierra y el de la tarea siguiente
+        # — antes caía en _live_block_body y quedaba enterrada como los 💭.
+        _step_tui = (name == "task_done" and not self.is_subagent and not _in_webui)
+        if _step_tui and self._flush_live_block_cb:
+            self._flush_turn_block()
+
         # Live block TUI: actualizar la línea |◐ con nombre de tool y preview de args
         if (getattr(self, "_update_live_tool_start_cb", None) and self._status_cb
-                and not _orch_tui):
+                and not _orch_tui and not _mem_tui and not _step_tui):
             # Actualización atómica label+preview en una sola operación (evita double-flash)
             self._update_live_tool_start_cb(f"{display}:", _make_tool_preview(name, args))
             # ●: actualizar con verbo en gerundio + contexto breve
             if getattr(self, "_update_live_bullet_cb", None):
                 _ctx_plain2 = self._strip_rich(ctx).strip()
-                _verb = _TOOL_LIVE_VERBS.get(name, "Using")
-                _ctx_brief = (_ctx_plain2[:45] if _ctx_plain2 else display).strip()
+                _label = self._live_verb_label(name, _ctx_plain2[:45], display)
                 self._update_live_bullet_cb(
-                    f"{_verb} {_ctx_brief}…  (ctrl+o to expand)"
+                    f"{_label}…  (ctrl+o to expand)"
                 )
         # spawn_subagent: header especial ● [emoji nombre]: tarea (live block ya cerrado arriba)
         if name == "spawn_subagent" and not self.is_subagent:
@@ -1071,8 +1286,11 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             # El resto se bufferiza en _turn_block para resumen agrupado al final.
             _is_modify = _is_modify_tool(name)
             if _is_modify:
-                # Auto-split: si el target es un fichero diferente al anterior, cerrar el bloque
-                # actual con ⎿ y abrir uno nuevo con ● "Updating <nuevo-fichero>".
+                # Auto-split por fichero: SOLO al cambiar a un fichero distinto del que
+                # veníamos tocando, cerramos el bloque y abrimos uno nuevo. Mientras se
+                # trabaja sobre el MISMO fichero (read + razonamiento + varias ediciones)
+                # todo queda en UN bloque. La 1ª edición tras explorar ese fichero NO
+                # rompe el bloque (la exploración y la edición del fichero van juntas).
                 _new_tgt = self._extract_write_target(name, args)
                 if (_new_tgt and getattr(self, "_current_write_target", "") and
                         _new_tgt != self._current_write_target and
@@ -1086,12 +1304,32 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                     if getattr(self, "_start_live_block_cb", None):
                         self._start_live_block_cb(_switch_phrase)
                         self._live_tool_count = 0
+                        # El bloque reabierto acumula las tools siguientes (dedup ON)
+                        self._bullet_block_open = True
                     else:
                         self._print(
                             f"\n  [bold green]●[/bold green] {_esc(_switch_phrase)}"
                         )
+                elif (_new_tgt and not getattr(self, "_bullet_block_open", False)
+                        and getattr(self, "_start_live_block_cb", None)):
+                    # No hay bloque abierto — típico tras el cierre post-diff de la
+                    # edición anterior (_show_tool_block flushea la unidad al completar
+                    # un write con éxito). Esta edición abre SU propia unidad visual
+                    # (un bloque con header + diff por edición, no
+                    # ediciones huérfanas sin ● ni │). Frase según continúe el MISMO
+                    # fichero (_last_write_target sobrevive al flush) o cambie a otro.
+                    import os as _ost2
+                    _bn2 = _ost2.path.basename(_new_tgt)
+                    if _new_tgt == getattr(self, "_last_write_target", ""):
+                        _reopen_phrase = _pick_file_continue_phrase(_bn2)
+                    else:
+                        _reopen_phrase = _pick_file_switch_phrase(_bn2)
+                    self._start_live_block_cb(_reopen_phrase)
+                    self._live_tool_count = 0
+                    self._bullet_block_open = True
                 if _new_tgt:
                     self._current_write_target = _new_tgt
+                    self._last_write_target = _new_tgt
                 self._print(
                     f"  [bold green]◐[/bold green] [bold]{_esc(display)}[/bold][dim]{ctx}[/dim]"
                 )
@@ -1149,6 +1387,25 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         opts.pop("keep_alive", None)
         return opts
 
+    def _think_param(self):
+        """Valor `think` para el backend a partir de rt.think_level/reasoning.
+
+        Mapeo AUTORITATIVO (el usuario controla el canal de razonamiento):
+          • off + reasoning off → False  (apaga el thinking; muchos modelos —p.ej.
+            qwen3.5— razonan por defecto si no se pasa el parámetro, así que /think
+            off DEBE enviar False para silenciarlo de verdad).
+          • off + reasoning on  → True   (/reasoning on fuerza pensamiento básico).
+          • minimal/low/medium/high → nivel graduado.
+        SIN esto, /think y /reasoning se guardaban en config pero NUNCA llegaban a la
+        petición ('muy pocos mensajes' con /think high). Los modelos sin soporte de
+        thinking se manejan con retry defensivo en el backend (OllamaBackend)."""
+        from api.base import THINK_LEVEL_MAP
+        lvl = (getattr(self.rt, "think_level", "off") or "off").lower()
+        reasoning = bool(getattr(self.rt, "reasoning", False))
+        if lvl == "off":
+            return True if reasoning else False
+        return THINK_LEVEL_MAP.get(lvl, True)
+
     # ── LLM call ─────────────────────────────────────────────────────────────
 
     def _close_stream_connection(self) -> None:
@@ -1169,9 +1426,31 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         except Exception as e:
             log.warning("client_rebuild_failed", error=str(e))
 
+    @staticmethod
+    def _inject_no_think(messages: list) -> list:
+        """Devuelve una copia de `messages` con ` /no_think` añadido al último mensaje de
+        usuario (qwen3/qwen3.5 desactivan su bloque <think> solo en esa llamada; no cambia
+        rt.think_level). Para modelos que no reconocen el token es texto inerte → inocuo.
+
+        Se usa en los retries de tool calls XML malformados: la generación sin thinking es
+        más corta y determinística, lo que reduce la probabilidad de XML mal cerrado (tags
+        incorrectos) y de truncación por agotar el presupuesto de tokens.
+        """
+        out = list(messages)
+        for _i in range(len(out) - 1, -1, -1):
+            if out[_i].get("role") == "user":
+                _content = out[_i].get("content") or ""
+                if isinstance(_content, str):
+                    out = (list(out[:_i])
+                           + [{**out[_i], "content": _content + " /no_think"}]
+                           + list(out[_i + 1:]))
+                break
+        return out
+
     def _stream_response(self, messages: list, tools: list) -> tuple[str, list, int, int]:
         self._rebuild_client_if_needed()
         opts = self._build_options()
+        self._last_thinking = ""   # se rellena en el path de streaming si el modelo razona
 
         # Subagentes y modo captura: sync, sin spinner (evita Live en TUI)
         if self.capture_output or self.is_subagent:
@@ -1183,7 +1462,11 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                     tools=tools,
                     model_params=opts,
                     timeout=fb_timeout,
+                    think=self._think_param(),
                 )
+                # Subagentes también narran: su razonamiento se muestra con │ en el
+                # bloque del padre (antes este path lo descartaba siempre).
+                self._last_thinking = getattr(resp, "thinking", "") or ""
                 return resp.text, resp.tool_calls, resp.input_tokens, resp.output_tokens
             except TimeoutError:
                 self._last_elapsed = float(fb_timeout) if fb_timeout else 0.0
@@ -1207,6 +1490,7 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                          else random.choice(_THINKING_WORDS))
 
         text_parts:        list[str] = []
+        thinking_parts:    list[str] = []   # razonamiento del modelo (canal <think>)
         tool_calls_result: list      = []
         inp_tokens = 0
         out_tokens = 0
@@ -1218,6 +1502,7 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                 messages=messages,
                 tools=tools,
                 model_params=opts,
+                think=self._think_param(),
             )
 
             if self._status_cb:
@@ -1244,6 +1529,14 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                                 break   # kill solicitado: dejar de emitir chunks
                             if chunk.thinking:
                                 _think_chars_sh[0] += len(chunk.thinking)
+                                thinking_parts.append(chunk.thinking)
+                                # El thinking ES actividad del modelo: cuenta para el
+                                # watchdog de timeout (con think alto el modelo puede
+                                # razonar minutos sin emitir texto — sin esto se mataba
+                                # el stream a mitad de razonamiento y los 💭 se perdían)
+                                # y para el contador ~N↓ del spinner. Paridad con el
+                                # path REPL, que ya lo sumaba a _out_chars_r.
+                                _out_chars_sh[0] += len(chunk.thinking)
                                 if _max_think_chars > 0 and _think_chars_sh[0] > _max_think_chars:
                                     _kill_ev.set()
                                     break  # thinking excesivo: abortar y reintentar sin thinking
@@ -1283,6 +1576,10 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                 while not _done_ev.wait(timeout=_POLL_INTERVAL):
                     elapsed    = time.time() - t_start
                     frame      = _SPINNER_FRAMES[fi % len(_SPINNER_FRAMES)]
+                    # Icono del spinner con pulso de color sutil (verde↔cyan) para line1
+                    # del status. El `frame` crudo se conserva para _sep_label (etiqueta
+                    # estática entre bloques, que NO debe llevar marcadores de estilo).
+                    _pframe    = _sfmt(_spin_pulse_cls(fi), frame)
                     ctx_s      = self.context.stats()
                     cpct       = int(ctx_s["tokens_estimate"] / max(ctx_s["max_tokens"], 1) * 100)
                     plain_bar  = _ctx_bar(ctx_s["tokens_estimate"], ctx_s["max_tokens"], 10, plain=True)
@@ -1312,17 +1609,28 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                             break
                     if _active_task_txt:
                         _tlabel = _active_task_txt.rstrip()
-                        # Modo multitarea: ◈ animado + "Multitarea:" coloreado + progreso + tarea
-                        _tok_up = f"↑{_fmt_tokens(self._turn_inp)}" if self._turn_inp > 0 else ""
-                        _tok_dn = f"↓~{_fmt_tokens(approx_out)}" if approx_out > 0 else ""
-                        _tok_inline = "  ·  " + "  ".join(filter(None, [_tok_up, _tok_dn])) if (_tok_up or _tok_dn) else ""
-                        _prog = f"[{_plan_done + 1}/{_plan_total}]" if _plan_total > 1 else ""
-                        _mic_st = _MULTI_ICON_STYLES[(fi // 2) % len(_MULTI_ICON_STYLES)]
-                        _diamond = _sfmt(_mic_st, "◈")
-                        _multi_lbl = _sfmt("status-word", "Multitarea:")
-                        line1 = f"{frame}  {_diamond} {_multi_lbl} {_prog}  {_tlabel}  ({_time_str}{_tok_inline})"
+                        # Modo multitarea: frase principal (resumen del plan) en ROJO +
+                        # la misma palabra de "pensamiento" y frases/colores del modo single.
+                        # La tarea activa NO va aquí — se muestra abajo en la lista (◼) de _get_status_text.
+                        _main_phrase = (getattr(self, "_plan_summary", "") or _tlabel).rstrip()
+                        _mp = _sfmt("status-main", _main_phrase)
+                        _word = _sfmt("status-word", f"{thinking_word}…")
+                        if elapsed > 25:
+                            _phrase = _NEAR_FINISH_PHRASES[(fi // 5) % len(_NEAR_FINISH_PHRASES)]
+                            _inner = _word + " " + _sfmt("status-phrase", _phrase)
+                        else:
+                            _inner = _word
+                        _tok_up = f"{_fmt_tokens(self._turn_inp)}↑" if self._turn_inp > 0 else ""
+                        _tok_dn = f"~{_fmt_tokens(approx_out)}↓" if approx_out > 0 else ""
+                        _tok_s = " ".join(filter(None, [_tok_up, _tok_dn]))
+                        _tok_s = f" {_tok_s} tokens" if _tok_s else ""
+                        _paren = (
+                            _sfmt("time-dim", "(") + _inner
+                            + _sfmt("time-dim", f" · {_time_str} ·{_tok_s})")
+                        )
+                        line1 = f"{_pframe} {_mp} {_paren}"
                         line2 = ""  # task list se renderiza desde _plan_tasks en _get_status_text
-                        self._sep_label = f"{frame} {_tlabel}"
+                        self._sep_label = f"{frame} {_main_phrase}"
                     else:
                         _display_word = f"{thinking_word}…"
                         # Colorear la palabra de pensamiento y la frase near-finish
@@ -1336,7 +1644,7 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                         else:
                             _tp_col = _sfmt("time-dim", f"({_time_str})")
                         line1 = (
-                            f"{frame}  "
+                            f"{_pframe} "
                             + _sfmt("status-word", _display_word)
                             + f"  {_tp_col}"
                         )
@@ -1344,7 +1652,7 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                         _bstyle = _bar_style(cpct, thresh_pct)
                         _cbar = _sfmt(_bstyle, plain_bar)
                         _chint = _hint_styled(cpct, thresh_pct)
-                        line2 = f"↳  {tok_part}ctx: {_cbar} {cpct}%{_chint}{mem_part}{rag_part}"
+                        line2 = f"↳ {tok_part}ctx: {_cbar} {cpct}%{_chint}{mem_part}{rag_part}"
                         self._sep_label = f"{frame} {_display_word}"
                     self._status_cb(f"{line1}\n{line2}")
                     fi += 1
@@ -1407,6 +1715,7 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                                     break
                                 if chunk.thinking:
                                     _out_chars_r[0] += len(chunk.thinking)
+                                    thinking_parts.append(chunk.thinking)
                                 if chunk.text:
                                     text_parts.append(chunk.text)
                                     _out_chars_r[0] += len(chunk.text)
@@ -1442,7 +1751,8 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                             elapsed = time.time() - t_start
                             frame   = _SPINNER_FRAMES[fi % len(_SPINNER_FRAMES)]
                             txt = Text()
-                            txt.append(f"  {frame}  ", style=f"bold {rich_col}")
+                            # Icono pulsante (verde↔cyan), mismo respirar que el ● / status
+                            txt.append(f"  {frame}  ", style=f"bold {_spin_pulse_rich(fi)}")
                             if _has_active_plan:
                                 txt.append("◈ multitarea  ", style="dim cyan")
                             txt.append(f"{thinking_word}…  ", style="dim italic")
@@ -1476,6 +1786,8 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                             if self._kill_requested:
                                 self._close_stream_connection()
                                 break
+                            if chunk.thinking:
+                                thinking_parts.append(chunk.thinking)
                             if chunk.text:
                                 text_parts.append(chunk.text)
                             if chunk.tool_calls:
@@ -1487,7 +1799,8 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                             elapsed = time.time() - t_start
                             frame   = _SPINNER_FRAMES[fi % len(_SPINNER_FRAMES)]
                             txt = Text()
-                            txt.append(f"  {frame}  ", style=f"bold {rich_col}")
+                            # Icono pulsante (verde↔cyan), mismo respirar que el ● / status
+                            txt.append(f"  {frame}  ", style=f"bold {_spin_pulse_rich(fi)}")
                             if _has_active_plan:
                                 txt.append("◈ multitarea  ", style="dim cyan")
                             txt.append(f"{thinking_word}…  ", style="dim italic")
@@ -1512,6 +1825,13 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             error_str = str(error)
             log.error("llm_error", model=self._active_model(), error=error_str)
 
+            # PRESERVAR el razonamiento ya acumulado del intento fallido: el modelo
+            # pensó (a veces mucho — es justo lo que truncó el XML) antes del error,
+            # y todos los returns de este bloque lo descartaban (los retries van con
+            # /no_think → tampoco traen thinking nuevo). Era una de las causas de
+            # "los 💭 se pierden": cada iteración con retry salía muda.
+            self._last_thinking = "".join(thinking_parts).strip()
+
             # Errores de parsing XML: el modelo generó tool calls en formato XML
             # en lugar de JSON nativo. Ollama devuelve status_code=-1 con
             # "XML syntax error" cuando el XML está malformado o truncado.
@@ -1534,50 +1854,46 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                     "[yellow]⚡[/yellow]  Thinking agotó el presupuesto de tokens "
                     "— XML de tool call truncado. Reintentando sin thinking…"
                 )
-                # Añadir /no_think al último mensaje de usuario para que qwen3 desactive
-                # su bloque <think> solo en esta llamada (no cambia rt.think_level)
-                retry_messages = list(messages)
-                for _i in range(len(retry_messages) - 1, -1, -1):
-                    if retry_messages[_i].get("role") == "user":
-                        _m = retry_messages[_i]
-                        _content = (_m.get("content") or "")
-                        if isinstance(_content, str):
-                            retry_messages = (
-                                list(retry_messages[:_i])
-                                + [{**_m, "content": _content + " /no_think"}]
-                                + list(retry_messages[_i + 1:])
-                            )
-                        break
+                retry_messages = self._inject_no_think(messages)
                 try:
                     _r = self.client.chat_sync(
                         model=self._active_model(),
                         messages=retry_messages,
                         tools=tools,
                         model_params=opts,
+                        think=False,   # forzar sin pensamiento en el retry
                     )
+                    if getattr(_r, "thinking", ""):
+                        self._last_thinking = (self._last_thinking + "\n\n" + _r.thinking).strip()
                     return _r.text, _r.tool_calls, _r.input_tokens, _r.output_tokens
                 except Exception as _retry_exc:
                     log.warn("xml_eof_retry_failed", error=str(_retry_exc))
                     # Caer al mensaje de error original
 
-            # Para errores XML no-EOF: retry simple antes de rendirse.
+            # Para errores XML no-EOF: retry antes de rendirse.
             # "element <function> closed by </parameter>" es no-determinístico:
             # el modelo a veces genera cierre erróneo; un retry suele producir XML válido.
+            # Reintentamos con /no_think (igual que el caso EOF): la generación sin
+            # thinking es más corta y determinística → menos probabilidad de re-malformar
+            # el XML. Para modelos sin soporte de /no_think es texto inerte (inocuo).
             partial = "".join(text_parts)
             if _is_xml and not _is_eof_truncation:
                 log.warn("xml_malformed_retry", model=self._active_model(),
                          error=error_str[:120])
                 self._notice(
                     "[yellow]⚡[/yellow]  XML de tool call malformado "
-                    "(tag incorrecto) — reintentando…"
+                    "(tag incorrecto) — reintentando sin thinking…"
                 )
                 try:
                     _r2 = self.client.chat_sync(
                         model=self._active_model(),
-                        messages=messages,
+                        messages=self._inject_no_think(messages),
                         tools=tools,
                         model_params=opts,
+                        think=False,   # forzar sin pensamiento en el retry
                     )
+                    if getattr(_r2, "thinking", ""):
+                        self._last_thinking = (self._last_thinking + "\n\n" + _r2.thinking).strip()
                     return _r2.text, _r2.tool_calls, _r2.input_tokens, _r2.output_tokens
                 except Exception as _rx2:
                     log.warn("xml_malformed_retry_failed", error=str(_rx2)[:80])
@@ -1614,6 +1930,9 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             return msg, [], 0, 0
 
         text = "".join(text_parts)
+        # Razonamiento del modelo (canal <think>) de esta respuesta — lo lee el run loop
+        # para mostrarlo como narración. Antes se descartaba (solo se contaba para tokens).
+        self._last_thinking = "".join(thinking_parts).strip()
 
         if self._status_cb:
             self._status_cb("")
@@ -1836,6 +2155,54 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         except Exception:
             return ""
 
+    def _suggest_followup(self) -> str:
+        """Genera (vía LLM, llamada corta) una sugerencia de 1 línea del siguiente
+        mensaje probable del usuario, a partir de la última respuesta del agente.
+
+        Pensado para llamarse en BACKGROUND tras cerrar el turno: el TUI la muestra
+        en la franja idle ('⎿ Sugerencia: …'). Usa un cliente PROPIO (build_client)
+        en vez de self.client para no interferir con el streaming del siguiente turno
+        si el usuario envía otro mensaje mientras esto corre. Devuelve "" si no aplica.
+        """
+        if self.capture_output or self.is_subagent:
+            return ""
+        if not getattr(self.config, "suggestions_enabled", True):
+            return ""
+        last = (self._last_response or "").strip()
+        if len(last) < 20:
+            return ""
+        # La cola de la respuesta es donde el modelo suele proponer el siguiente paso
+        # o preguntar; recortamos para no inflar el prompt (coste).
+        tail = last[-1500:]
+        prompt_text = (
+            "Sugiere el SIGUIENTE mensaje que el usuario probablemente escribiría en "
+            "respuesta a esta última respuesta del agente. Devuelve SOLO una frase corta "
+            "(máx 8 palabras), en el mismo idioma del agente, sin comillas ni prefijos, "
+            "redactada como si la escribiera el usuario (imperativo o respuesta directa). "
+            "Si no hay continuación natural, responde exactamente: NONE\n\n"
+            f"Última respuesta del agente:\n\"\"\"\n{tail}\n\"\"\""
+        )
+        try:
+            from api import build_client
+            client = build_client(self.config)
+            opts = dict(self._build_options())
+            opts["num_predict"] = 24   # límite de salida (Ollama nativo; openai/anthropic lo mapean a max_tokens)
+            _r = client.chat_sync(
+                model=self._active_model(),
+                messages=[{"role": "user", "content": prompt_text}],
+                tools=[],
+                model_params=opts,
+            )
+            text = (_r.text or "").strip()
+            # Quedarse con la 1ª línea y limpiar comillas/prefijos típicos
+            text = text.splitlines()[0].strip() if text else ""
+            text = text.strip('"').strip("«»").strip("'").strip()
+            if not text or text.upper() == "NONE" or len(text) > 80:
+                return ""
+            return text
+        except Exception:
+            return ""
+
     def _maybe_precompact_idle(self) -> None:
         """I: lanza compactación en background si el contexto está entre high_water y compact_threshold.
 
@@ -1864,13 +2231,24 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
 
     def _do_compact(self, with_summary: bool = True) -> int:
         """Compacta el contexto con barra de progreso. Devuelve msgs eliminados."""
-        # Garantiza cliente fresco antes de cualquier llamada LLM del resumen,
-        # independientemente del caller (turn loop, /compact, atajo de teclado).
-        self._rebuild_client_if_needed()
-        dropped_count = self._do_compact_impl(with_summary)
-        if dropped_count > 0 and getattr(self.config, "snapshots_save_on_compact", False):
-            self._save_session_snapshot()
-        return dropped_count
+        # _compact_running se activa AQUÍ — punto de entrada común a todos los
+        # callers (/compact, F3, pre-compact idle). Antes solo se activaba muy
+        # adentro de _do_compact_locked (rama TUI), dejando una ventana de carrera:
+        # un mensaje enviado durante esa ventana (o un resumen LLM lento) hacía
+        # que run() no esperara y arrancara CONCURRENTE a ctx.compact(), corrompiendo
+        # ctx.messages. Activarlo al inicio garantiza que run() (loop.py:_compact_running.wait)
+        # encole el siguiente turno hasta que la compactación termine.
+        self._compact_running.set()
+        try:
+            # Garantiza cliente fresco antes de cualquier llamada LLM del resumen,
+            # independientemente del caller (turn loop, /compact, atajo de teclado).
+            self._rebuild_client_if_needed()
+            dropped_count = self._do_compact_impl(with_summary)
+            if dropped_count > 0 and getattr(self.config, "snapshots_save_on_compact", False):
+                self._save_session_snapshot()
+            return dropped_count
+        finally:
+            self._compact_running.clear()
 
     def _do_compact_impl(self, with_summary: bool = True) -> int:
         """Implementación real de compactación — llamada desde _do_compact.
@@ -2075,7 +2453,10 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                 "Lo más probable: el cambio YA está aplicado (de un turno anterior) o el texto que buscas no existe.\n"
                 "1. read_file(path) UNA sola vez y compáralo con lo que querías lograr.\n"
                 "2. Si el cambio ya está presente → DÍSELO al usuario y continúa con lo siguiente. NO edites.\n"
-                "3. Si de verdad falta y no consigues el texto exacto → explica el bloqueo al usuario y pide ayuda."
+                "3. Si de verdad falta y no consigues el texto exacto → usa "
+                "ask_user(question, options=[…]) para que el usuario decida cómo proceder "
+                "(p.ej. saltar, reintentar de otra forma, o darte el texto exacto), en vez "
+                "de seguir intentando a ciegas."
             )
         if cnt == 2:
             snippet = self._recovery_snippet(p)
@@ -2088,15 +2469,26 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                     "CONTENIDO REAL ACTUAL del fichero (cópialo literal si todavía hay que editar):\n"
                     f"{snippet}\n"
                     "→ Si arriba ves que el cambio YA está hecho: NO edites, informa al usuario.\n"
-                    "→ Si falta: usa edit_file con old_string copiado EXACTO de arriba (no de memoria)."
+                    "→ Si falta: NO repitas edit_file con el mismo texto. Cambia de herramienta — "
+                    "smart_replace(path, pattern=…) o regex_replace (toleran espacios/indentación), "
+                    "o edit_file con old_string copiado EXACTO de arriba (no de memoria)."
                 )
             else:
-                body += "→ Lee el fichero con read_file(path) y copia el texto literal."
+                body += (
+                    "→ Lee con context_before_edit(path, target=…) para obtener el texto literal exacto, "
+                    "o cambia a smart_replace/regex_replace (toleran diferencias de espacios)."
+                )
             return body + (f"\n{extra}" if extra else "")
+        # 1.er fallo: el match exacto de edit_file es frágil ante espacios/indentación
+        # (causa #1 de estos fallos). Antes de reintentar, leer el texto literal y, sobre
+        # todo, considerar las tools robustas en vez de insistir con edit_file exacto.
         return (
-            f"\n\n⚡ AGENTE [fallo al modificar {base}]: el texto buscado no coincide. "
-            "Lee el fichero real antes de reintentar — read_file(path) o read_sections(path, ['Funcion']) — "
-            "y copia el texto literal (espacios e indentación incluidos)."
+            f"\n\n⚡ AGENTE [fallo al modificar {base}]: el texto buscado no coincide (espacios/indentación). "
+            "NO reintentes el mismo edit_file a ciegas. Opciones, de más a menos robusta:\n"
+            "• smart_replace(path, pattern=…) o regex_replace — toleran diferencias de espacios/indentación.\n"
+            "• context_before_edit(path, target='función o línea') — te da el texto EXACTO para copiar.\n"
+            "• read_file(path, offset, limit) con ventana amplia (≥40 líneas) y copia literal — "
+            "evita leer trozos de 10-15 líneas que no dan contexto suficiente."
             + (f"\n{extra}" if extra else "")
         )
 
@@ -2145,23 +2537,60 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                     with open(_exp_edit, encoding="utf-8", errors="replace") as _ef:
                         _edit_content = _ef.read()
                     if _old_str not in _edit_content:
-                        _first_line = _old_str.strip().split("\n")[0][:60]
-                        _prefix20 = _first_line[:25].strip()
-                        _close = [
-                            f"  L{i + 1}: {l.strip()[:80]}"
-                            for i, l in enumerate(_edit_content.split("\n"))
-                            if _prefix20 and _prefix20 in l
-                        ][:3]
-                        _close_str = (
-                            "\nLíneas similares encontradas:\n" + "\n".join(_close)
-                        ) if _close else ""
-                        return (
-                            f"⛔ PRE-EDIT FALLIDO: old_string no encontrado en '{_edit_path}'.\n"
-                            f"Primera línea buscada: {_first_line!r}\n"
-                            f"El texto debe coincidir exactamente (espacios, indentación, "
-                            f"saltos de línea).{_close_str}"
-                            + self._modify_failure_guidance(_edit_path)
-                        )
+                        # MISMO matcher tolerante que usará la tool (find_unique_span):
+                        # si encuentra un span ÚNICO (rstrip/strip/norm), DEJAR PASAR la
+                        # llamada — la edición se aplicará con tolerancia. El precheck
+                        # exacto anterior bloqueaba aquí y convertía toda la tolerancia
+                        # de edit_file en código muerto (causa real de la mayoría de
+                        # "PRE-EDIT FALLIDO" con ficheros indentados con tabs).
+                        from tools.filesystem import find_unique_span as _fus
+                        _fs, _fe, _flvl = _fus(_edit_content, _old_str)
+                        if _fs is not None:
+                            pass   # match tolerante único → proceder con la edición
+                        elif _flvl == "ambiguo":
+                            return (
+                                f"⛔ PRE-EDIT AMBIGUO: old_string aparece VARIAS veces en "
+                                f"'{_edit_path}' (también ignorando espacios/indentación).\n"
+                                f"Añade más líneas de contexto alrededor del cambio para "
+                                f"hacerlo único, o usa edit_files con replace_all si quieres "
+                                f"reemplazar todas las apariciones."
+                                + self._modify_failure_guidance(_edit_path)
+                            )
+                        else:
+                            # Sugerencias por SIMILITUD real (difflib sobre líneas
+                            # normalizadas), ancladas en la primera línea sustantiva del
+                            # old_string — no por substring del prefijo (devolvía basura
+                            # tipo ASCII-art cuando la 1ª línea era solo '}').
+                            import difflib as _dl
+                            _old_lines = [l for l in _old_str.split("\n") if l.strip()]
+                            _anchor = next(
+                                (l.strip() for l in _old_lines
+                                 if len(" ".join(l.split())) >= 5),
+                                (_old_lines[0].strip() if _old_lines else ""),
+                            )
+                            _f_lines = _edit_content.split("\n")
+                            _norm_map = {}
+                            for _i, _l in enumerate(_f_lines):
+                                _norm_map.setdefault(" ".join(_l.split()), _i)
+                            _cands = _dl.get_close_matches(
+                                " ".join(_anchor.split()), list(_norm_map), n=3, cutoff=0.6)
+                            _close = [
+                                f"  L{_norm_map[_c] + 1}: {_f_lines[_norm_map[_c]].strip()[:90]}"
+                                for _c in _cands
+                            ]
+                            _close_str = (
+                                "\nLíneas más parecidas en el fichero:\n" + "\n".join(_close)
+                            ) if _close else ""
+                            _first_line = _old_str.strip().split("\n")[0][:60]
+                            return (
+                                f"⛔ PRE-EDIT FALLIDO: old_string no encontrado en '{_edit_path}' "
+                                f"(ni con tolerancia de espacios/indentación/tabs).\n"
+                                f"Primera línea buscada: {_first_line!r}\n"
+                                f"El texto no está en el fichero — puede que el cambio YA esté "
+                                f"aplicado o que la zona haya cambiado: relee con read_file."
+                                f"{_close_str}"
+                                + self._modify_failure_guidance(_edit_path)
+                            )
                 except OSError:
                     pass  # El fichero no se puede leer → dejar que edit_file lo maneje
 
@@ -2293,9 +2722,9 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                     "USA grep_code o multi_grep — son más rápidos y soportan regex Python:\n"
                     "  • grep -r 'pat' dir/          → grep_code(pattern='pat', directory='dir/')\n"
                     "  • grep -rn 'p' --include='*.c' → grep_code(pattern='p', extensions=['c'], context_lines=2)\n"
-                    "  • grep -l 'pat' src/           → grep_code(pattern='pat', files_with_matches=true)\n"
-                    "  • grep -L 'pat' src/           → grep_code(pattern='pat', files_without_matches=true)\n"
-                    "  • grep -c 'pat' src/           → grep_code(pattern='pat', count_only=true)\n"
+                    "  • grep -l 'pat' dir/           → grep_code(pattern='pat', files_with_matches=true)\n"
+                    "  • grep -L 'pat' dir/           → grep_code(pattern='pat', files_without_matches=true)\n"
+                    "  • grep -c 'pat' dir/           → grep_code(pattern='pat', count_only=true)\n"
                     "  • grep 'p1'...; grep 'p2'...   → multi_grep(patterns=['p1','p2'], directory='dir/')\n"
                     "grep_code excluye .git/__pycache__/node_modules automáticamente."
                 ))
@@ -2467,8 +2896,8 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         Devuelve lista de ≥2 items (cada uno ≥10 chars), máximo 12.
         """
         lines = text.split('\n')
-        _num    = re.compile(r'^(\s*)(?:\d+[.):\-]|paso\s+\d+[).::-]?)\s+(.+)', re.I)
-        _bullet = re.compile(r'^(\s*)[-*•–·]\s+(.+)')
+        _num    = _TASK_NUM_RE
+        _bullet = _TASK_BULLET_RE
 
         # Prioridad 1: items numerados al nivel mínimo de indentación
         numbered: list[tuple[int, str]] = []
@@ -2747,7 +3176,7 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                 _ni = _ai + 1
                 _is_last = _ni >= _total_t
                 _next_hint = (
-                    f" Cuando termines, anuncia \"Tarea {_ni + 1}:\" y continúa."
+                    f" Al terminarla anuncia \"Tarea {_ni + 1}:\" y continúa."
                     if not _is_last
                     else " Ésta es la última tarea. Al terminarla: "
                          "(1) llama run_tests/test_file si modificaste código; "
@@ -2755,7 +3184,10 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                 )
                 hints.append(
                     f"\n📋 PLAN EN CURSO [{_done_t + 1}/{_total_t}]:\n{_task_lines}\n"
-                    f"→ Completando ahora: \"{_plan_tasks_g[_ai]['text']}\".{_next_hint}\n"
+                    f"→ Completando ahora: \"{_plan_tasks_g[_ai]['text']}\".\n"
+                    f"→ OBLIGATORIO al completar la tarea activa: llama task_done(message=\"qué hiciste y "
+                    f"por qué\") ANTES de empezar la siguiente. NO encadenes tools de dos tareas distintas "
+                    f"sin task_done entre medias: el usuario y el plan pierden el rastro.{_next_hint}\n"
                     f"→ NO respondas vacío. Usa tools o describe el avance.\n"
                     f"→ PROHIBIDO: no emitas \"{self._done_phrase_text()}\" mientras haya ◻ tareas pendientes "
                     f"o si mencionas \"Próximo paso\" / trabajo futuro en la misma respuesta.\n"
@@ -2779,6 +3211,19 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                 "  grep -r/l/L/c → grep_code | find -name → find_files(directory=…,name='*.ext') | ls -la → ls_dir\n"
                 "  sed -i → edit_file/regex_replace | wc -l → file_stat | git * → git_status/diff/…\n"
                 "bash es el ÚLTIMO RECURSO — solo cuando ninguna tool de la tabla cubre la necesidad."
+            )
+
+        # ── 1b. Preámbulo idéntico repetido en el auto-continue ──────────────
+        # Algunos modelos (qwen3.5) reemiten la MISMA frase introductoria cada
+        # iteración ejecutando tools distintas. No aporta nada y alarga el contexto
+        # (reforzando el bucle). El display ya colapsa el ● duplicado; aquí nudgeamos
+        # al modelo para que deje de repetirse y vaya directo a la acción.
+        if getattr(self, "_dup_bullet_streak", 0) >= 2:
+            hints.append(
+                f"\n⚡ EVALUACIÓN AGENTE [{self._dup_bullet_streak} preámbulos idénticos]: "
+                "Estás repitiendo PALABRA POR PALABRA la misma frase introductoria cada turno. "
+                "NO la repitas: ve directo a la siguiente acción (tool) sin preámbulo, o si ya "
+                "completaste el paso, resume el RESULTADO concreto y avanza. Nada de relleno."
             )
 
         # ── 2. Bloqueos consecutivos al final del historial ──────────────────
@@ -2869,12 +3314,20 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                     else " Si el fallo implica un error externo (API, librería, dependencia): "
                          "usa web_search para buscar la causa antes de seguir probando."
                 )
+                # Si ya buscó y sigue atascado, el problema puede ser de DIRECCIÓN (no
+                # técnico): involucra al usuario con una pregunta estructurada en vez de
+                # seguir adivinando. Solo el agente principal puede preguntar.
+                _ask_stuck = (
+                    " Si no es un error técnico sino que no sabes qué camino tomar: "
+                    "usa ask_user(question, options=[…]) para que el usuario decida, "
+                    "en vez de seguir probando a ciegas."
+                ) if (_already_searched and not self.is_subagent) else ""
                 hints.append(
                     f"\n⚡ EVALUACIÓN AGENTE [últimas {len(_last4)} acciones fallidas]: "
                     "Todo está fallando. PARA y replantea: "
                     "¿el path es correcto? ¿existe el fichero? (usa ls_dir o find_files). "
                     "¿es la tool adecuada? ¿tienes los argumentos correctos?"
-                    + _ws_stuck
+                    + _ws_stuck + _ask_stuck
                 )
 
         # ── 8. Edición sin lectura previa — antipatrón "edición ciega" ────────
@@ -2947,7 +3400,7 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                 f"\n⚡ EVALUACIÓN AGENTE [{_bash_antipattern_n} bash con grep/find/sed]: "
                 "Detectado uso de bash para operaciones con tools directas disponibles:\n"
                 "  grep -r/rn/l/L/c → grep_code(pattern, directory, extensions=['c'])\n"
-                "  find -name        → find_file(name='*.c', directory='src/')\n"
+                "  find -name        → find_file(name='*.c', directory='dir/')\n"
                 "  sed -i            → edit_file / regex_replace / bulk_replace\n"
                 "ESTAS LLAMADAS ESTÁN BLOQUEADAS — el agente las rechazará con ⛔."
             )
@@ -3092,19 +3545,32 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             )
 
         # ── 15. Turno silencioso — el modelo ejecuta tools sin comunicar nada ──
-        # Detecta cuando el agente lleva ≥2 tool calls en el turno sin haber
-        # emitido ningún texto al usuario. El usuario no puede ver los resultados
-        # de las tools, por lo que el silencio total deja al usuario sin contexto.
+        # Se evalúa con _turn_text_emitted, que refleja si la ÚLTIMA iteración emitió
+        # texto NUEVO (no vacío ni preámbulo repetido). Como _last_tool_calls se acumula
+        # durante todo el run(), basta con que la última respuesta fuera tool-only (o un
+        # texto repetido) para re-disparar el aviso — así el modelo no encadena decenas
+        # de read/grep/edit en silencio bajo un único ● ("Used 75 tools").
         if len(self._last_tool_calls) >= 2 and not getattr(self, "_turn_text_emitted", True):
+            # Nombra las ÚLTIMAS herramientas usadas en silencio: un nudge concreto
+            # ("acabas de usar grep_code, read_file, read_file") lanza mejor en modelos
+            # parcos (9B) que solo ejemplos genéricos — referencia su acción real.
+            _recent_silent = [n for n, _, _ in self._last_tool_calls[-4:]]
+            _recent_str = ", ".join(_recent_silent)
             hints.append(
-                f"\n⚡ EVALUACIÓN AGENTE [{len(self._last_tool_calls)} tools, sin texto al usuario]: "
-                "Llevas varias tool calls sin emitir ningún mensaje al usuario. "
-                "El usuario NO ve los resultados de las tools — SOLO ve tu texto. "
-                "OBLIGATORIO en la siguiente respuesta: escribe al menos UNA frase describiendo "
-                "qué estás haciendo o qué has encontrado. Ejemplos:\n"
-                "  • 'Revisando [fichero] para localizar la función de [nombre]...'\n"
-                "  • 'He encontrado el problema en [fichero], aplico el fix:'\n"
-                "  • 'Explorando la estructura del módulo [nombre]...'"
+                f"\n⚡ EVALUACIÓN AGENTE [{len(self._last_tool_calls)} tools acumuladas sin texto al usuario]: "
+                f"Acabas de usar {_recent_str} SIN narrar nada. El usuario NO ve las tools ni sus "
+                "resultados — SOLO ve tu texto, así que ahora mismo está a ciegas. "
+                "OBLIGATORIO en la siguiente respuesta: ANTES de seguir, escribe 1-2 frases de TEXTO VISIBLE "
+                "(NO en tu bloque de pensamiento 💭 — eso el usuario no lo lee como narración) contando qué "
+                "acabas de hacer y qué viene ahora, y a partir de aquí NARRA CADA ACCIÓN según avanzas — "
+                "tanto al EXPLORAR (no encadenes 10 grep/read en silencio: di qué buscas y qué vas hallando) "
+                "como al EDITAR (no agrupes 10 ediciones sin texto). Cuando termines un bloque de exploración, "
+                "RESUME lo que encontraste antes de seguir. Si decides algo (eliminar, mantener, refactorizar), "
+                "di el veredicto y el porqué. Ejemplos:\n"
+                "  • 'Busco la definición de [símbolo] en [módulo]…'\n"
+                "  • 'He encontrado el problema en [fichero]:line, aplico el fix:'\n"
+                "  • 'Revisados los 5 ficheros del módulo: el error está en X; ahora lo corrijo.'\n"
+                "  • 'En [fichero] sustituyo X por Y porque…; sigo con el siguiente.'"
             )
 
         # ── 15b. Arranque en frío a mitad de tarea ────────────────────────────
@@ -3184,6 +3650,171 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
 
     # ── Plan propio del agente — tools plan_create / task_done ───────────────
 
+    def _execute_ask_user(self, questions: list = None, question: str = "",
+                          options: list = None, multiSelect: bool = False) -> str:
+        """Pregunta(s) al usuario y BLOQUEA hasta que responda. Devuelve el mapa Q→A.
+
+        Schema canónico: questions=[{header, question, options:[{label, description}],
+        multiSelect}]. TOLERANTE: la forma plana question/options (modelo pequeño) se
+        normaliza a 1 pregunta. La UI añade '[escribir otra respuesta]' por pregunta.
+        Subagente / no interactivo → fallback (decide solo, NO se cuelga esperando)."""
+        qs = normalize_ask_questions(questions, question, options, bool(multiSelect))
+        if not qs:
+            return ("Error: ask_user requiere questions=[{question, options:[≥2 opciones]}] "
+                    "(o la forma simple question + options).")
+
+        if self.is_subagent or self.capture_output:
+            return ("[ask_user no disponible en este contexto (subagente / no interactivo): "
+                    "elige tú las opciones más razonables y continúa SIN preguntar]")
+
+        # NOTA: `ask_user` es una pregunta GENUINA del agente al usuario (p.ej. "¿compilo
+        # con flags A o B?") y SIEMPRE se muestra — `/elevated` NO la silencia. Elevated
+        # afecta a los PERMISOS de tools (auto-aprobar), no a las decisiones que el agente
+        # delega en el usuario. (La aprobación de plan SÍ se salta en elevado, pero eso se
+        # gestiona en `_execute_plan_create`, que ni siquiera llama aquí en ese modo.)
+        if getattr(self, "_webui_queue", None) is not None:
+            answers = self._ask_user_webui(qs)
+        else:
+            cb = getattr(self, "_ask_user_cb", None)
+            if cb is None:
+                return ("[ask_user no disponible (sin interfaz interactiva): elige la opción "
+                        "más razonable y continúa]")
+            try:
+                answers = cb(qs)
+            except Exception as e:
+                log.warn("ask_user_failed", error=str(e))
+                return f"[ask_user falló: {e}. Continúa con la opción más razonable]"
+
+        if not answers:
+            return "[el usuario no respondió o canceló. Continúa con la opción más razonable]"
+        agent_result, pairs = format_ask_questions_result(qs, answers)
+        self._render_ask_answers(pairs)   # bloque resumen en la conversación
+        return agent_result
+
+    def _ask_user_webui(self, questions: list):
+        """Emite el evento SSE 'question' (multi-pregunta) y bloquea hasta /api/chat/answer.
+
+        Devuelve la lista de answers [{selection:[idx], free_text}] paralela a `questions`,
+        o None si timeout/kill. El endpoint la deja en self._webui_question_answer."""
+        import threading as _th
+        ev = _th.Event()
+        self._webui_question_event = ev
+        self._webui_question_answer = None
+        self._webui_emit({"type": "question", "questions": [
+            {"header": q["header"], "question": q["question"],
+             "multiSelect": q["multiSelect"], "options": q["options"]}
+            for q in questions
+        ]})
+        if not ev.wait(timeout=900) or self._kill_requested:
+            return None
+        return self._webui_question_answer   # lista de {selection, free_text} | None
+
+    def _render_ask_answers(self, pairs: list) -> None:
+        """Vuelca el bloque resumen de respuestas del usuario a la conversación (TUI/WebUI)
+        antes de continuar con las tareas:  ● User answered OOCode's questions: ⎿ · Q → A."""
+        if not pairs:
+            return
+        if getattr(self, "_webui_queue", None) is not None:
+            self._webui_emit({"type": "ask_answers",
+                              "pairs": [{"q": q, "a": a} for q, a in pairs]})
+            return
+        if self.capture_output:
+            return
+        from rich.markup import escape as _e
+        self._print("\n  [bold green]●[/bold green] User answered OOCode's questions:")
+        for q, a in pairs:
+            # Colapsar saltos de línea de la pregunta (p.ej. un plan multilínea en la
+            # aprobación de plan) a una sola línea para no romper la alineación del ⎿ ·.
+            q1 = " ".join(str(q).split())
+            if len(q1) > 200:
+                q1 = q1[:197] + "…"
+            a1 = " ".join(str(a).split())
+            self._print(f"  [dim]⎿[/dim] · {_e(q1)} → [bold]{_e(a1)}[/bold]")
+
+    def _render_thinking(self, thinking: str) -> None:
+        """Muestra el razonamiento del modelo (canal <think>) como narración tenue.
+
+        Con `think_level != off` el modelo explica POR QUÉ hace cada cosa en su bloque
+        de pensamiento; antes se descartaba (solo se contaba para tokens) y el usuario
+        veía las tools sin explicación. Mostrarlo da el "porqué" de cada paso. Vacío
+        cuando el modelo no razona (default), así que es coste cero hasta activarlo.
+
+        IMPORTANTE: el 💭 NO cuenta como narración visible — NO toca
+        `_turn_text_emitted`. El razonamiento es un canal auxiliar (atenuado), no el
+        texto que el usuario lee como hilo de la conversación; si lo contáramos como
+        narración, con `/think` activo el modelo razonaría cada iteración y el backstop
+        del hint #15 (que fuerza una frase de texto VISIBLE) quedaría permanentemente
+        desactivado → el agente encadenaría decenas de tools sin un solo mensaje al
+        usuario (justo lo que se ve en producción). Coherente con la regla de
+        Comunicación 'tu razonamiento interno (💭) NO sustituye al texto visible'."""
+        txt = (thinking or "").strip()
+        if not txt:
+            return
+        # Cap defensivo ESCALADO por think_level: el usuario que activa /think high
+        # quiere VER el razonamiento completo, no un recorte de
+        # 1200 chars. Con niveles bajos mostramos lo esencial; con alto, casi todo.
+        _cap = {
+            "off":     1200, "minimal": 1200, "low": 2400,
+            "medium":  4000, "high":    12000, "full": 12000,
+        }.get((getattr(self.rt, "think_level", "off") or "off").lower(), 2400)
+        if len(txt) > _cap:
+            txt = txt[:_cap].rstrip() + " […]"
+        # NO marcamos _turn_text_emitted: el 💭 no es narración visible (ver docstring).
+        if getattr(self, "_webui_queue", None) is not None:
+            self._webui_emit({"type": "reasoning", "text": txt,
+                              "new_step": bool(getattr(self, "_reasoning_new_step", False))})
+            return
+        if self.capture_output:
+            return
+        from rich.markup import escape as _e
+        if self.is_subagent:
+            # Subagente: prefijo │ por línea (no soporta renderables Padding/Markdown).
+            for _ln in txt.split("\n"):
+                self._print(f"[dim italic]{_e(_ln)}[/dim italic]")
+            return
+        if getattr(self, "_bullet_block_open", False):
+            # Hay un bloque de tools abierto (trabajo sobre un fichero): el razonamiento
+            # intermedio va DENTRO del bloque, con prefijo │ como las tools, en vez de
+            # romperlo. Líneas planas (el bloque vivo no renderiza Markdown por línea).
+            for _i, _ln in enumerate(txt.split("\n")):
+                _mk = "💭 " if _i == 0 else "   "
+                self._print(f"  [dim]│[/dim] [dim italic]{_mk}{_e(_ln)}[/dim italic]")
+            return
+        # Sin bloque abierto (apertura de paso): Markdown atenuado y ALINEADO con la
+        # conversación — el bloque entero con padding izquierdo (col 2, como el ●), así
+        # las continuaciones y las listas no caen a la columna 0.
+        self._print(
+            Padding(Markdown("💭 " + txt), (1, 0, 0, 2)),
+            style="dim italic",
+        )
+
+    def _render_task_narration(self, message: str) -> None:
+        """Muestra al usuario el `message` de `task_done` como narración del desenlace
+        de la tarea.
+
+        Por qué importa: los modelos locales (qwen3.5) suelen poner su narración
+        ("Tarea 3: eliminé gettext.h porque no se usa") en el argumento `message` de
+        `task_done` en vez de en el canal de texto. Antes ese `message` se descartaba
+        por completo → el usuario solo veía avanzar el plan sin saber qué se hizo ni por
+        qué. Surfacearlo recupera narración que el modelo YA produce, sin depender de
+        que cambie de comportamiento. Cuenta como texto emitido para no nagear con el
+        hint #15 cuando el modelo sí ha comunicado por esta vía."""
+        msg = (message or "").strip()
+        if not msg:
+            return
+        self._turn_text_emitted = True
+        if getattr(self, "_webui_queue", None) is not None:
+            self._webui_emit({"type": "text", "text": msg})
+            return
+        if self.capture_output:
+            return
+        _ac = COLOR_PRESETS.get(self.rt.accent_color, COLOR_PRESETS["cyan"])[1]
+        _first, _, _rest = msg.partition("\n")
+        from rich.markup import escape as _e
+        self._print(f"\n  [bold {_ac}]●[/bold {_ac}] {_e(_first.strip())}")
+        if _rest.strip():
+            self._print(Padding(Markdown(_rest.strip()), (0, 0, 0, 4)))
+
     def _execute_plan_create(self, tasks: list, summary: str = "") -> str:
         """Crea o reemplaza el plan de tareas del agente.
 
@@ -3195,6 +3826,44 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         tasks = [str(t).strip() for t in tasks if str(t).strip()]
         if not tasks:
             return "Error: todas las tareas están vacías."
+
+        # ── Plan-mode: aprobación previa (opt-in, /plan on) ───────────────────
+        # Si está activo y hay usuario interactivo, presenta el plan y ESPERA su decisión
+        # antes de comprometerlo. `/plan on` es una elección EXPLÍCITA del usuario de
+        # aprobar planes, así que `/elevated` (que solo afecta a permisos de tools) NO la
+        # suprime — al igual que no suprime ask_user. En subagente/no-interactivo el
+        # fallback de _execute_ask_user no bloquea y se ejecuta el plan.
+        if (getattr(getattr(self, "rt", None), "plan_approval", False)
+                and not self.is_subagent and not self.capture_output):
+            # El plan se MUESTRA formateado en la conversación (legible, alineado); la
+            # pregunta del formulario es CORTA — meter el plan multilínea dentro de la
+            # "pregunta" lo dejaba ilegible en la barra de estado y el usuario acababa
+            # tecleando texto libre por error.
+            from rich.markup import escape as _mesc_pa
+            _ic_pa = _TASK_ICON_COLORS[int(time.time()) % len(_TASK_ICON_COLORS)]
+            _hdr_pa = summary[:100] if summary else f"{len(tasks)} tareas"
+            self._print(f"\n  [{_ic_pa}]◈[/{_ic_pa}]  [bold]Plan propuesto:[/bold] [dim]{_mesc_pa(_hdr_pa)}[/dim]")
+            for _i_pa, _t_pa in enumerate(tasks, 1):
+                _short_pa = (_t_pa[:80] + "…") if len(_t_pa) > 80 else _t_pa
+                self._print(f"  [dim]  {_i_pa}. {_mesc_pa(_short_pa)}[/dim]")
+            _ans = self._execute_ask_user(
+                questions=[{
+                    "header":   "Plan",
+                    "question": f"¿Apruebo y ejecuto este plan de {len(tasks)} tarea(s)?",
+                    "options":  [
+                        {"label": "Aprobar y ejecutar", "description": "Ejecuta el plan tal cual."},
+                        {"label": "Editar el plan",     "description": "Lo ajusto con tus indicaciones antes de ejecutar."},
+                        {"label": "Cancelar",           "description": "No se crea el plan."},
+                    ],
+                }])
+            _al = _ans.lower()
+            if "cancelar" in _al or "no eligió" in _al or "no respondió" in _al or "canceló" in _al:
+                return ("[Plan NO creado — el usuario lo canceló o no respondió. "
+                        "Pregúntale cómo prefiere proceder ANTES de volver a planificar.]")
+            if "editar" in _al:
+                return (f"[Plan NO creado — el usuario quiere ajustarlo. Su indicación: «{_ans}». "
+                        "Replantea el plan con esos cambios y vuelve a llamar plan_create.]")
+            # "Aprobar y ejecutar" (o respuesta libre que no es cancelar/editar) → continúa.
 
         # Borrar el plan anterior de TaskManager antes de reemplazarlo
         if not self.is_subagent and getattr(self, "tasks", None) is not None:
@@ -3210,6 +3879,7 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         ]
         self._plan_tasks[0]["status"] = "active"
         self._plan_tasks[0]["start_ts"] = time.time()
+        self._plan_summary = (summary or "").strip()
         _ctx = getattr(self, "context", None)
         self._plan_active_msg_idx = len(_ctx.messages) if _ctx is not None else 0
 
@@ -3332,15 +4002,28 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             #    _flush_live_block_cb("") es no-op si no había live block activo.
             if not self.capture_output and self._flush_live_block_cb:
                 self._flush_live_block_cb("")
+            # 2b. Narración del desenlace que el modelo puso en task_done(message=…).
+            self._render_task_narration(message)
             # 3. Panel ◈ Plan [N/total] al buffer estático (live block ya cerrado)
             if not self.capture_output:
                 self._print_plan_panel_update()
             # 4. Abrir nuevo live block con ● para la siguiente tarea,
-            #    creando el mismo efecto visual que Claude Code entre tareas.
+            #    creando un efecto visual de separación entre tareas.
             if not self.capture_output and self._start_live_block_cb:
                 from rich.markup import escape as _td_esc
                 self._start_live_block_cb(_td_esc(next_text))
                 self._live_tool_count = 0
+                # Sincronizar el estado de dedup con el live block recién reabierto:
+                # sin esto, _bullet_block_open/_last_displayed_bullet conservaban los
+                # valores del turno anterior (texto de la tarea YA cerrada). Si en el
+                # turno siguiente el modelo reemite el texto de ESTA tarea (típico en
+                # qwen3.5), _is_duplicate_bullet comparaba contra el bullet viejo → no
+                # coincidía → flush del bloque "Tarea N" recién abierto (vacío) + un ●
+                # duplicado. Anclar el bullet a next_text hace que las tools del turno
+                # siguiente (con o sin texto) se acumulen en este bloque. Mismo patrón
+                # que el re-anclaje de _show_compact_reset tras compactar mid-turn.
+                self._bullet_block_open = True
+                self._last_displayed_bullet = " ".join(next_text.split())
             return (
                 f"✔ Tarea {active_idx + 1}/{total} completada. "
                 f"Activa ahora [{done_count + 1}/{total}]: '{next_text}'. "
@@ -3359,6 +4042,13 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         self._flush_task_intermediate_summary()
         if not self.capture_output and self._flush_live_block_cb:
             self._flush_live_block_cb("")
+            # No se reabre live block (plan terminado): el flag debe reflejar que NO hay
+            # bloque abierto donde acumular. Dejarlo stale-True haría que un turno
+            # tool-only posterior intentara adjuntarse a un bloque ya cerrado (tools
+            # invisibles, el bug original de la compactación).
+            self._bullet_block_open = False
+        # Narración del desenlace de la última tarea (message de task_done).
+        self._render_task_narration(message)
         if not self.capture_output:
             self._print_plan_panel_update()
         return (
@@ -3454,6 +4144,17 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         - Writes con args idénticos dentro del turno devuelven una advertencia de duplicado
           en lugar de aplicar el cambio de nuevo (previene duplicación de código).
         """
+        # Normalizar alias de ruta (file→path…) ANTES de todo: precheck, extracción de
+        # write-target y tracking de fallos deben ver el nombre canónico. Sin esto, un
+        # edit_file(file=…) hacía que el precheck/preview no encontraran la ruta y la
+        # tool reventaba por `path` ausente (causa nº1 de fallos de edición en logs).
+        try:
+            _norm = self.registry.normalized_args(name, args)
+            if isinstance(_norm, dict):   # guard: mocks/registros atípicos no rompen el dispatch
+                args = _norm
+        except Exception as e:
+            log.debug("normalize_path_aliases_error", tool=name, error=str(e))
+
         # Pre-flight: bloquea scripts temporales y heredocs antes de ejecutar nada
         rejection = self._precheck_tool_call(name, args)
         if rejection is not None:
@@ -3525,9 +4226,20 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                 )
                 result = result_str
             self._turn_write_seen[key_hash] = result_str
-            # Registrar fichero editado para el reset visual post-compactación
+            # Registrar fichero editado para el reset visual post-compactación.
+            # OJO: detectar el ÉXITO real, no solo por prefijo — varios fallos NO empiezan
+            # por Error/⚠️/⛔ (edit_files "Validación fallida", smart_replace "⚠ … NO
+            # encontrado" con ⚠ plano sin selector). Si se contaran como éxito, resetearían
+            # el contador de fallos y el escalado de _modify_failure_guidance (1º→2º→stop)
+            # nunca avanzaría para esas tools.
             path = args.get("path", "")
-            if path and not result_str.startswith(("Error", "⚠️", "⛔")):
+            _rl = result_str.lower()
+            _is_fail = (result_str.startswith(("Error", "⚠️", "⛔", "⚠"))
+                        or "validación fallida" in _rl
+                        or "no encontrado" in _rl
+                        or "no se encontraron coincidencias" in _rl
+                        or "cadena no encontrada" in _rl)
+            if path and not _is_fail:
                 self._session_reads.append((str(path), None, True))
                 # Modificación exitosa → resetea el contador de fallos de ese fichero
                 getattr(self, "_failed_modify_by_path", {}).pop(str(path), None)
@@ -3658,6 +4370,31 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             _ep = str(args.get("path", "") or args.get("file_path", ""))
             if _ep:
                 getattr(self, "_failed_modify_by_path", {}).pop(_ep, None)
+
+        # ── smart_replace sin coincidencia de patrón ─────────────────────────
+        if name == "smart_replace" and "no encontrado" in result.lower():
+            _sp = str(args.get("path", "") or args.get("file_path", ""))
+            _pat = str(args.get("pattern", ""))[:80]
+            return result + self._modify_failure_guidance(
+                _sp, extra=f"Patrón smart_replace que no coincide: {_pat!r}."
+            )
+
+        # ── edit_files (batch atómico) — validación fallida ──────────────────
+        # Un solo old_string que no casa tumba TODO el lote (74% de fallo en las pruebas).
+        # Damos el contenido real del fichero que falló y desaconsejamos el lote grande:
+        # mejor editar de una en una o usar smart_replace (tolera espacios).
+        if name in ("edit_files",) and "validación fallida" in result.lower():
+            import re as _re_ef
+            _m = _re_ef.search(r'\(([^)]+)\):\s*cadena no encontrada', result)
+            _fp = _m.group(1) if _m else ""
+            if not _fp:
+                # fallback: ruta de la 1ª edición de los args
+                _edits = args.get("edits") or []
+                if _edits and isinstance(_edits[0], dict):
+                    _fp = _edits[0].get("path", "")
+            _extra_ef = ("edit_files es ATÓMICO: una edición que no casa cancela todo el lote. "
+                         "Edita de UNA EN UNA con edit_file/smart_replace, o corrige solo la edición fallida.")
+            return result + self._modify_failure_guidance(_fp, extra=_extra_ef)
 
         # ── Detector de bucles de búsqueda vacíos ────────────────────────────
         is_empty = ("Sin resultados" in result or "No se encontró" in result
@@ -3862,6 +4599,22 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         self._auto_continue_count = 0
         self._turn_text_emitted = False
         self._sub_lines_shown  = 0
+        # Dedup de preámbulos repetidos en el auto-continue: qwen3.5 y otros modelos
+        # reemiten el MISMO texto introductorio cada iteración ejecutando tools
+        # distintas. _last_displayed_bullet guarda el último texto mostrado (normalizado);
+        # _bullet_block_open indica si hay un live block vivo donde acumular. Cuando el
+        # texto coincide y el bloque sigue abierto, NO reimprimimos el ● — las tools del
+        # turno se acumulan bajo el mismo bloque (⎿ "Ran N commands"). _dup_bullet_streak
+        # cuenta repeticiones para nudgear al modelo vía _turn_guidance.
+        self._last_displayed_bullet: Optional[str] = None
+        self._bullet_block_open = False
+        self._dup_bullet_streak = 0
+        # Texto normalizado del último razonamiento (💭) que abrió/separó un paso.
+        # Permite que un 💭 DISTINTO en una iteración de continuación dup/tool-only
+        # abra su propio bloque (estructura por paso estilo Claude Code) sin trocear
+        # cuando el modelo repite el mismo pensamiento. Ver _is_new_reasoning / run().
+        self._last_step_thinking = ""
+        self._compacting_mid_turn = False
 
         import tools.hooks as _hooks_mod
         import tools.diff_renderer as _diff_mod
@@ -3884,6 +4637,8 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         self._turn_block_has_header = False
         self._turn_expanded = False
         self._current_write_target = ""
+        self._last_write_target = ""
+        self._block_has_cmd = False
         self._plan_tasks = []
 
     def _turn_start(self, user_message: str) -> tuple[list[str], float]:
@@ -3991,7 +4746,15 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         # pero si hay compactación ocurre primero — el segundo check es siempre no-op.
         self._rebuild_client_if_needed()
         if self.context.should_compact():
-            self._do_compact(with_summary=True)
+            # Marca de compactación MID-TURN (el agente sigue en el bucle y emitirá más
+            # tools): _show_compact_reset la usa para re-anclar el live block al mensaje
+            # re-pintado, de modo que las tools post-compactación (a menudo sin texto) se
+            # le asignen visiblemente. En idle/manual (sin esta marca) no se re-ancla.
+            self._compacting_mid_turn = True
+            try:
+                self._do_compact(with_summary=True)
+            finally:
+                self._compacting_mid_turn = False
 
         _think_active = getattr(self.rt, "think_level", "off") != "off"
         if _think_active and not self.capture_output and not self.is_subagent:
@@ -4252,6 +5015,53 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         for _ln in _lines[1:]:
             self._print(f"  {_mesc(_ln)}" if _ln.strip() else "")
 
+    def _live_verb_label(self, name: str, ctx_plain: str, display: str) -> str:
+        """Frase humana 'Verbo contexto' para el ● del live block.
+
+        Reglas: con contexto → 'Editing (db.c)'. SIN contexto y con verbo propio →
+        solo el verbo ('Editing') — antes colgaba el nombre interno de display y
+        producía 'Editing Update' (sin sentido). Para tools sin verbo propio
+        ('Using' implícito) sí mostramos el display: 'Using DockerInspect'."""
+        verb = _TOOL_LIVE_VERBS.get(name)
+        ctx  = (ctx_plain or "").strip()
+        if verb is None:
+            # Sin verbo propio: el nombre de display es la mejor pista de la acción.
+            base = f"Using {display}".strip() if display else "Using"
+            return f"{base} {ctx}".strip() if ctx else base
+        return f"{verb} {ctx}".strip() if ctx else verb
+
+    def _bullet_from_first_tool(self, tool_calls: list) -> str:
+        """Etiqueta para el ● cuando el LLM ejecuta tools SIN texto (qwen3.x).
+
+        Deriva 'Verbo contexto' de la PRIMERA tool (mismo formato que el ● live de
+        _show_tool_running_header / _update_live_bullet_cb) para usarla como bullet
+        INICIAL del live block en vez del placeholder '…'. El flush estático del live
+        block (ui/app.py:_flush_live_block) renderiza ese bullet inicial — sin esto el
+        usuario veía '● …' como header permanente del turno. Devuelve '' si no se puede
+        derivar (→ el caller cae a '…'). Texto plano (el caller lo escapa con _mesc).
+        """
+        if not tool_calls:
+            return ""
+        try:
+            tc   = tool_calls[0]
+            name = getattr(getattr(tc, "function", None), "name", "") or ""
+            name = _TOOL_ALIASES.get(name, name)
+            args = getattr(getattr(tc, "function", None), "arguments", {}) or {}
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    args = {}
+            display   = self._TOOL_DISPLAY_NAMES.get(name, name)
+            ctx_plain = self._strip_rich(self._call_context(name, args)).strip()
+            label     = self._live_verb_label(name, ctx_plain[:50], display)
+            if len(tool_calls) > 1:
+                label += f" (+{len(tool_calls) - 1})"
+            return label.strip()
+        except Exception as e:
+            log.debug("bullet_from_tool_error", error=str(e))
+            return ""
+
     def _turn_display_bullet(self, text: str, tool_calls: list) -> None:
         """Renderiza el ● con el texto del LLM y arranca el live block si hay tools."""
         from rich.markup import escape as _mesc
@@ -4261,7 +5071,17 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         if self.is_subagent:
             self._render_subagent_bullet(text, _ac)
             return
+        # Reglas horizontales markdown ('---', '***', '___') que el LLM emite como
+        # separador (p. ej. tras presentar un plan): no son texto informativo y como
+        # bullet darían un inútil "● ---". Se descartan SOLO para el display (el texto
+        # original sigue intacto en contexto/logs). Si tras quitarlas no queda texto,
+        # el bullet se etiqueta con la primera tool ("Running make clean…").
+        _sep_re = _re_bullet.compile(r'^[ \t]*([-*_])(?:[ \t]*\1){2,}[ \t]*$')
         text_clean = text.lstrip()
+        _tc_lines = text_clean.split('\n')
+        while _tc_lines and (not _tc_lines[0].strip() or _sep_re.match(_tc_lines[0])):
+            _tc_lines.pop(0)
+        text_clean = '\n'.join(_tc_lines)
         lines   = text_clean.split('\n', 1)
         first   = lines[0].rstrip()
         rest    = lines[1] if len(lines) > 1 else ""
@@ -4285,7 +5105,8 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             # ejecutar tools, cada bloque de párrafos merece su propio ●.
             # El live block usa el ÚLTIMO párrafo para que el ⎿ quede debajo del contexto
             # inmediato (en vez de bajo la frase introductoria lejana).
-            _mp_paras = [_p for _p in text_clean.split('\n\n') if _p.strip()]
+            _mp_paras = [_p for _p in text_clean.split('\n\n')
+                         if _p.strip() and not _sep_re.match(_p.strip())]
             if len(_mp_paras) > 1:
                 # Primer párrafo → ● estático (antes de activar el live block)
                 _mp0 = _mp_paras[0]
@@ -4332,7 +5153,11 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                         _body_extra = first[_max_hdr - 1:]
                 _bullet_text = _mesc(_hdr)
             else:
-                _bullet_text = "…"
+                # Tool-only turn (texto vacío): en vez del placeholder '…', etiquetar el
+                # bullet con la primera tool ('Running make…', 'Reading foo.py'…) para que
+                # el flush estático muestre QUÉ hizo el turno, no '…'.
+                _lbl = self._bullet_from_first_tool(tool_calls)
+                _bullet_text = _mesc(_lbl) if _lbl else "…"
                 _body_extra  = ""
 
             # ── Auto-split: planning text largo + write tools sin mención de fichero ──
@@ -4393,7 +5218,7 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                 _body = (_body_extra + "\n" + rest).lstrip('\n') if _body_extra else rest
                 if _plain_first and _body.strip():
                     console.print(Padding(Markdown(_body.lstrip('\n')), (0, 0, 0, 2)))
-                elif not _plain_first:
+                elif not _plain_first and text_clean.strip():
                     console.print(Padding(Markdown(text_clean), (0, 0, 0, 2)))
         else:
             # REPL o respuesta sin tools: ● estático normal
@@ -4568,10 +5393,21 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
             n in _ORCHESTRATION_TOOLS for _, n, _ in parsed_calls
         )
 
+        # Tools de modificación (edit/write/replace/patch): NUNCA se paralelizan.
+        # En paralelo se ejecutarían en el ThreadPool y sus resultados se vuelcan
+        # AGRUPADOS al final (un solo bloque "Used N tools" + todos los diffs de
+        # golpe), saltándose el auto-split por fichero de _show_tool_running_header.
+        # Forzando secuencial, cada edición pasa por el header → su propio bloque +
+        # diff a medida que ocurre (paridad TUI/WebUI: read+razonamiento+edición del
+        # mismo fichero en un bloque; edición de OTRO fichero abre bloque nuevo).
+        # Las lecturas/búsquedas sí siguen paralelas (son seguras y rápidas en lote).
+        _has_modify = any(_is_modify_tool(n) for _, n, _ in parsed_calls)
+
         _safe_parallel = (
             len(parsed_calls) > 1
             and not any(n == "bash" for _, n, _ in parsed_calls)
             and not _has_orchestration
+            and not _has_modify
             and not self.capture_output
         )
 
@@ -4973,8 +5809,18 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
         if self.rt.activation == "mention" and not self.capture_output:
             if not user_message.lower().startswith(self.config.agent_name.lower()):
                 return None
+        # Si hay una compactación en curso (manual /compact, F3 o pre-compact idle),
+        # encolar este turno: esperar a que TERMINE antes de tocar ctx.messages.
+        # OJO: _compact_running está *activado* mientras se compacta, así que
+        # Event.wait() retornaría de inmediato (espera a que se active, no a que se
+        # apague). Hay que sondear is_set() hasta que se limpie. _do_compact garantiza
+        # clear() en su finally, de modo que esto no puede colgarse indefinidamente
+        # aunque la compactación falle; el tope de 300s es una red de seguridad.
         if self._compact_running.is_set():
-            self._compact_running.wait(timeout=30.0)
+            _waited = 0.0
+            while self._compact_running.is_set() and _waited < 300.0:
+                time.sleep(0.1)
+                _waited += 0.1
 
         self._restore_plan_from_tasks()
         self._turn_reset_state(user_message, images)
@@ -5052,7 +5898,6 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
 
             if text:
                 self._advance_plan_task(text)
-                self._turn_text_emitted = True
                 full_output_parts.append(text)
                 # Último bloque de texto del agente, siempre actualizado (a diferencia
                 # de _last_response, que solo se fija en _turn_finish). Lo usa el
@@ -5061,9 +5906,129 @@ class AgentLoop(TUIDisplayMixin, WebUIMixin):
                 self._last_agent_msg = text
                 self.session.log_message("assistant", text)
                 self.chatlog.log_assistant(text)
+
+            # Render del turno: flush del bloque previo + arranque del live block para
+            # las tools de ESTE turno. Debe ejecutarse aunque el LLM NO haya emitido
+            # texto: qwen3.5 (y otros modelos) suelen devolver tool_calls SIN mensaje.
+            # Con el antiguo gate `if text:`, esas iteraciones no flusheaban _turn_block
+            # ni arrancaban el live block → las salidas de read/bash/grep (bufferizadas
+            # en _turn_block) y los contadores del live block quedaban invisibles hasta
+            # el final del run(); peor aún, el siguiente _flush_turn_block descartaba el
+            # buffer sin renderizar (live block inactivo). Sólo se veía cambiar "Pensando"
+            # y la GPU trabajando. Con tool_calls arrancamos el live block (● "…", que las
+            # propias tools sobrescriben con su verbo) para que todo sea visible en vivo.
+            #
+            # Dedup de preámbulos repetidos: si el texto de este turno es IDÉNTICO al
+            # último ● mostrado y el live block sigue abierto, NO reimprimimos el bullet —
+            # las tools de este turno se acumulan en el bloque vivo (⎿ "Ran N commands")
+            # en vez de generar un ● duplicado por iteración. Cuando el texto cambia, el
+            # flush cierra el bloque acumulado y arranca uno nuevo.
+            # Razonamiento del modelo (think_level != off) → narración tenue del "porqué",
+            # ANTES del bullet/tools. Vacío si no razona.
+            # Colocación del 💭 respecto al bloque de tools:
+            #  • Iteración de CONTINUACIÓN (dup/tool-only con bloque abierto): el bloque
+            #    NO se cierra; el razonamiento intermedio cae DENTRO (│ 💭, lo escribe el
+            #    hilo del agente en _live_block_body) — así read+razonamiento+edit del
+            #    mismo fichero quedan en UN bloque.
+            #  • Iteración que abre PASO NUEVO (texto nuevo no-dup → su propio ●): el
+            #    flush que iba a ocurrir igualmente unas líneas más abajo se ADELANTA
+            #    aquí, antes de renderizar el 💭 — así el razonamiento del paso queda
+            #    ENTRE bloques (Markdown 💭 al nivel de la conversación), no enterrado
+            #    como última línea │ 💭 del bloque que se estaba cerrando.
+            # OJO: esto NO es flush-por-razonamiento (regresión 2026-06-11 noche; guards
+            # en test_42): la frontera la decide el TEXTO nuevo — exactamente la misma
+            # condición del flush del elif de abajo, solo cambia el ORDEN respecto al 💭.
+            # Razonar por sí solo (iteración dup/tool-only) NUNCA cierra el bloque, y el
+            # ● del texto nuevo se muestra SIEMPRE (la rama elif no cambia).
+            _is_dup_bullet = self._is_duplicate_bullet(text, tool_calls)
+            # Cambio de ASUNTO en iteración de continuación (dup/tool-only): si el
+            # bloque abierto tiene un concern establecido (comandos de ejecución o
+            # un fichero en edición) y la tanda entrante tiene OTRO (cmd↔file, o un
+            # fichero distinto), la tanda es una unidad visual nueva — se cierra el
+            # bloque y la tanda abre el suyo (● etiquetado por su primera tool), con
+            # el 💭 de la iteración ENTRE ambos. Sin esto, "make + razonar errores +
+            # editar ficheros" se encadenaba bajo un solo "Used N tools".
+            # NO es la regresión flush-por-razonamiento (guards test_42): la decisión
+            # la toman las TOOLS entrantes, no el razonamiento; las tandas de solo
+            # lectura/exploración son neutrales ("" → nunca rompen) y el trabajo
+            # sobre el MISMO fichero (read+💭+ediciones) sigue en UN bloque.
+            if _is_dup_bullet:
+                _blk_concern = (
+                    f"file:{self._current_write_target}"
+                    if getattr(self, "_current_write_target", "") else
+                    ("cmd" if getattr(self, "_block_has_cmd", False) else "")
+                )
+                if _blk_concern:
+                    _next_concern = self._tools_concern(tool_calls)
+                    if _next_concern and _next_concern != _blk_concern:
+                        _is_dup_bullet = False
+            _thinking_shown = bool(self._last_thinking)
+            # Paso nuevo por TEXTO no-duplicado (frontera canónica de siempre): texto
+            # nuevo visible con un bloque abierto cierra el anterior y el 💭 va entre medias.
+            _text_step = bool(_thinking_shown and not _is_dup_bullet
+                              and (text or tool_calls)
+                              and getattr(self, "_bullet_block_open", False))
+            # Paso nuevo por RAZONAMIENTO distinto (estructura por paso estilo Claude
+            # Code): con `reasoning` activo el modelo razona antes de CADA acción pero
+            # reemite el mismo preámbulo (o ninguno), así que sin esto los pasos se
+            # fusionan en "Used N tools". Si el 💭 es NUEVO y hay un bloque YA con tools
+            # acumuladas + tools entrantes, la iteración es un paso nuevo: se cierra el
+            # bloque, el 💭 sale ENTRE bloques y se abre un ● etiquetado por la 1ª tool.
+            # Gated para NO trocear: solo con 💭 (modelos sin reasoning mantienen el
+            # merge), bloque abierto (≥1 tanda previa ya corrió) y 💭 != al anterior
+            # (repetir el mismo pensamiento NO abre paso). No es el flush-incondicional-
+            # al-razonar revertido en 2026-06-11: la decisión exige 💭 DISTINTO + tools.
+            _reasoning_step = bool(
+                _is_dup_bullet and _thinking_shown and tool_calls
+                and getattr(self, "_bullet_block_open", False)
+                and self._is_new_reasoning(self._last_thinking)
+            )
+            _new_step = _text_step or _reasoning_step
+            if _new_step:
                 self._flush_turn_block()
+            # Paridad WebUI: appendReasoning(newStep=true) cierra el bloque de tools
+            # del cliente y pinta el 💭 standalone — misma decisión que el TUI.
+            self._reasoning_new_step = _new_step
+            if _thinking_shown:
+                self._render_thinking(self._last_thinking)
+                self._last_step_thinking = " ".join(self._last_thinking.split()).lower()
+                self._last_thinking = ""
+
+            if _reasoning_step:
+                # Texto dup/vacío pero paso nuevo: abre bloque etiquetado por la 1ª tool
+                # (no repite el preámbulo ni suprime el ●). Conserva _last_displayed_bullet
+                # para que el dedup de preámbulos idénticos siga funcionando. En WebUI la
+                # separación la da el evento `reasoning` (new_step=True) que cierra el grupo
+                # de tools del cliente, así que ahí no se imprime bullet de consola.
+                self._dup_bullet_streak = 0
+                self._bullet_block_open = True
+                if not self.capture_output and getattr(self, "_webui_queue", None) is None:
+                    self._turn_display_bullet("", tool_calls)
+            elif _is_dup_bullet:
+                self._dup_bullet_streak = getattr(self, "_dup_bullet_streak", 0) + 1
+            elif (text or tool_calls):
+                self._dup_bullet_streak = 0
+                self._flush_turn_block()           # cierra bloque previo (_bullet_block_open=False)
                 if not self.capture_output:
                     self._turn_display_bullet(text, tool_calls)
+                    self._last_displayed_bullet = " ".join(text.split()) if text else ""
+                    if tool_calls:
+                        self._bullet_block_open = True
+
+            # Narración por iteración: la iteración "narra" solo si emite texto VISIBLE
+            # NUEVO (no vacío y no un preámbulo repetido). Tool-only o reemisión del
+            # mismo texto NO cuentan → el hint #15 (turno silencioso) se re-dispara a lo
+            # largo del run(). Antes esto era un flag de todo el run() que se quedaba en
+            # True tras el primer texto, así que el modelo podía encadenar decenas de
+            # tools (read/grep/edit) en iteraciones tool-only sin que nada lo empujara a
+            # narrar cada acción/fichero → el usuario veía "Used 75 tools" sin contexto.
+            # CRÍTICO: el razonamiento (<think>/💭) NO cuenta como narración. Con /think
+            # activo el modelo razona casi cada iteración; si el 💭 marcara el flag, el
+            # hint #15 quedaría desactivado todo el turno y el agente seguiría mudo pese
+            # a "pensar" (caso real en logs: 1 mensaje + ~25 tools sin narrar, incluido
+            # un giro importante). El 💭 se muestra igual (auxiliar), pero el usuario
+            # necesita TEXTO visible — eso es lo que mide este flag.
+            self._turn_text_emitted = bool(text) and not _is_dup_bullet
 
             if not tool_calls:
                 ctrl = self._turn_no_tools(text)

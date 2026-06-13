@@ -265,16 +265,17 @@ class TestSetServerEnabled:
         from agent.mcp_manager import set_server_enabled
         f = tmp_path / "oocode.json"
         f.write_text(json.dumps({"mcp": {"servers": []}}))
-        result = set_server_enabled("home-office-assistant", True, config_file=f)
+        result = set_server_enabled("word-assistant", True, config_file=f)
         assert result is True
         data = json.loads(f.read_text())
-        assert data["mcp"]["homeOfficeAssistant"]["enabled"] is True
+        assert data["mcp"]["wordAssistant"]["enabled"] is True
 
     def test_bundled_server_map_coverage(self):
         from agent.mcp_manager import _BUNDLED_SERVER_MAP
         expected = {
             "oocode-assistant", "system-assistant", "devops-assistant",
-            "database-assistant", "home-office-assistant",
+            "database-assistant", "word-assistant", "excel-assistant",
+            "pptx-assistant", "mail-assistant", "cmdb-assistant",
             "security-assistant", "iot-assistant", "http-client-assistant",
         }
         assert expected == set(_BUNDLED_SERVER_MAP.keys())

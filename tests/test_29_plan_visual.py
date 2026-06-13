@@ -48,6 +48,7 @@ def _make_loop(capture_output: bool = True):
     loop.session = MagicMock()
     loop.rt = MagicMock()
     loop.rt.verbose = False
+    loop.rt.plan_approval = False   # plan-mode es opt-in (default off); evita el formulario de aprobación
     loop.is_subagent = False
     loop.capture_output = capture_output
     loop._status_cb = None
@@ -233,6 +234,61 @@ class TestPlanCreateReturnFormat:
         long_task = "X" * 100
         loop._execute_plan_create([long_task, "T2"])
         assert loop._plan_tasks[0]["text"] == long_task  # sin truncar
+
+
+class TestTaskDoneNarration:
+    """El `message` de task_done se SURFACE al usuario (antes se descartaba).
+
+    Modelos locales (qwen3.5) ponen su narración en task_done(message=…) en vez de
+    en el canal de texto; sin esto, el usuario solo veía avanzar el plan sin saber
+    qué se hizo ni por qué.
+    """
+
+    def test_message_printed_to_user(self):
+        loop, printed = _make_visual_loop()
+        loop._flush_task_intermediate_summary = lambda: None
+        loop._print_plan_panel_update = lambda: None
+        loop._start_live_block_cb = None
+        loop._turn_text_emitted = False
+        loop._execute_plan_create(["T1", "T2"])
+        printed.clear()
+        loop._execute_task_done(message="gettext.h eliminado: no se usa en ningún .c")
+        joined = " ".join(str(p) for p in printed)
+        assert "gettext.h eliminado" in joined
+        # Narrar por task_done cuenta como texto emitido (no nagear con hint #15)
+        assert loop._turn_text_emitted is True
+
+    def test_empty_message_is_noop(self):
+        loop, printed = _make_visual_loop()
+        loop._flush_task_intermediate_summary = lambda: None
+        loop._print_plan_panel_update = lambda: None
+        loop._start_live_block_cb = None
+        loop._turn_text_emitted = False
+        loop._execute_plan_create(["T1", "T2"])
+        printed.clear()
+        loop._execute_task_done(message="")
+        joined = " ".join(str(p) for p in printed)
+        # Sin message no se inyecta narración (el flag no se toca aquí)
+        assert "●" not in joined or joined.strip() == ""
+
+    def test_message_emitted_to_webui(self):
+        loop = _make_loop(capture_output=False)
+        loop.rt = MagicMock()
+        loop.rt.plan_approval = False   # evita el bloqueo de aprobación de plan
+        loop._flush_task_intermediate_summary = lambda: None
+        loop._print_plan_panel_update = lambda: None
+        loop._start_live_block_cb = None
+        loop._flush_live_block_cb = None
+        emitted = []
+        loop._webui_emit = lambda ev: emitted.append(ev)
+        # Crear el plan SIN webui_queue (no dispara aprobación); luego activar el canal.
+        loop._execute_plan_create(["T1", "T2"])
+        loop._webui_queue = object()
+        loop._turn_text_emitted = False
+        emitted.clear()
+        loop._execute_task_done(message="compilado sin errores, 0 warnings")
+        texts = [e for e in emitted if e.get("type") == "text"]
+        assert any("compilado sin errores" in e.get("text", "") for e in texts)
 
 
 class TestTaskDoneReturnFormat:

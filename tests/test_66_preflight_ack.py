@@ -163,15 +163,15 @@ class TestPickPreflightPhrase(unittest.TestCase):
     # ── Nombre de usuario ─────────────────────────────────────────────────────
 
     def test_with_user_name_sometimes_includes_name(self):
-        results = [self.fn("crea un fichero", "Antonio") for _ in range(50)]
-        with_name = sum(1 for r in results if "Antonio" in r)
+        results = [self.fn("crea un fichero", "Alex") for _ in range(50)]
+        with_name = sum(1 for r in results if "Alex" in r)
         self.assertGreater(with_name, 0)
 
     def test_without_user_name_no_placeholder(self):
         for _ in range(20):
             r = self.fn("crea un fichero")
             self.assertNotIn("{user}", r)
-            self.assertNotIn("Antonio", r)
+            self.assertNotIn("Alex", r)
 
     def test_user_name_no_orphan_placeholder(self):
         for msg in ["crea fichero", "bug en código", "busca símbolo", "xyz"]:
@@ -222,6 +222,49 @@ class TestPickPreflightPhrase(unittest.TestCase):
         r = self.fn(msg)
         self.assertIsInstance(r, str)
         self.assertGreater(len(r), 0)
+
+    # ── Puerta de confianza: palabra blanda + sin dominio → frase neutral ─────
+
+    def _generic_set(self):
+        from agent.loop_helpers import _SINGLE_PREFLIGHT_GENERIC
+        return set(_SINGLE_PREFLIGHT_GENERIC)
+
+    def test_soft_run_no_domain_is_neutral(self):
+        # "¿qué pasa con esto?" usa 'pasa' (blanda) sin dominio → NO debe prometer
+        # ejecución; cae en frase neutral genérica.
+        r = self.fn("¿qué pasa con esto exactamente?")
+        self.assertNotIn("ejecut", r.lower())
+        self.assertNotIn("lanz", r.lower())
+        self.assertNotIn("arranc", r.lower())
+        self.assertIn(r, self._generic_set())
+
+    def test_soft_create_no_domain_is_neutral(self):
+        # "haz un resumen" usa 'haz' (blanda) sin dominio → NO debe prometer
+        # implementar/construir; cae en frase neutral.
+        r = self.fn("haz un resumen de esto por favor")
+        self.assertNotIn("implement", r.lower())
+        self.assertNotIn("construir", r.lower())
+        self.assertNotIn("desarrolla", r.lower())
+        self.assertIn(r, self._generic_set())
+
+    def test_soft_create_with_domain_stays_specific(self):
+        # 'haz' (blanda) PERO con dominio web → el dominio respalda la intención,
+        # se mantiene la frase específica (no regresión de test_75).
+        from agent.loop_helpers import _PF_PHRASES
+        r = self.fn("haz crawl de las noticias")
+        self.assertIn(r, _PF_PHRASES[("create", "web")], r)
+
+    def test_soft_run_with_domain_stays_specific(self):
+        # "pasa los tests" (blanda 'pasa') + dominio tests → frase específica.
+        r = self.fn("pasa los tests de pytest")
+        self.assertTrue(any(w in r.lower() for w in
+                            ["test", "suite", "prueba", "ejecutar", "lanzar"]), r)
+
+    def test_strong_verb_no_domain_stays_specific(self):
+        # Verbo FUERTE ('ejecuta') sin dominio → sigue siendo específico (confianza).
+        r = self.fn("ejecuta esto ahora mismo")
+        self.assertTrue(any(w in r.lower() for w in
+                            ["ejecut", "lanz", "arranc", "ejecución"]), r)
 
 
 if __name__ == "__main__":

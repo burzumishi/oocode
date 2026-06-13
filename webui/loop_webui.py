@@ -65,6 +65,10 @@ class WebUIMixin:
         else:
             compact_hint = ""
         tasks = getattr(self, "_plan_tasks", [])
+        _rt = getattr(self, "rt", None)
+        _think = getattr(_rt, "think_level", "off")
+        if _think not in ("off", "minimal", "low", "medium", "high"):
+            _think = "off"
         return {
             "type":         "status",
             "agent_emoji":  getattr(self.config, "agent_emoji", "🤖"),
@@ -78,6 +82,13 @@ class WebUIMixin:
             "compact_hint":   compact_hint,
             "tokens_in":    self._turn_inp,
             "tokens_out":   self._turn_out,
+            # mem/rag — mismos datos que la línea 2 del status del TUI (paridad).
+            "mem_hits":     getattr(getattr(self, "memory", None), "last_hits", 0) or 0,
+            "rag_hits":     getattr(getattr(self, "_workspace_rag", None), "last_hits", 0) or 0,
+            "rag_available": getattr(getattr(self, "_workspace_rag", None), "last_available", 0) or 0,
+            # think/reasoning — paridad con "think:med.+r" del toolbar TUI (WebUI badge + Vim header)
+            "think_level":  _think,
+            "reasoning":    bool(getattr(_rt, "reasoning", False) is True),
             "task_total":   len(tasks),
             "task_done":    sum(1 for t in tasks if t.get("status") == "done"),
             "task_active":  next((t.get("text","")[:60] for t in tasks if t.get("status") == "active"), ""),

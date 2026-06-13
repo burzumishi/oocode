@@ -15,7 +15,7 @@ DEFAULT_KB: dict[str, dict] = {
     },
     "cycle_perms": {
         "key":  "s-tab",
-        "desc": "Cicla modo permisos: ask → on → full → ask  (como Shift+Tab en Claude Code)",
+        "desc": "Cicla modo permisos: ask → on → full → ask",
     },
     "clear_screen": {
         "key":  "c-l",

@@ -24,11 +24,21 @@ _IGNORE_DIRS = {
     "dist", "build", ".mypy_cache", ".ruff_cache", "target", ".oocode",
     ".pytest_cache", ".tox", "coverage", ".coverage", "htmlcov",
     "logs", "tmp", "temp", ".DS_Store",
+    # Artefactos de build/herramientas (autotools, cmake, IDE, vendored) — no son
+    # fuente útil para el RAG y churnean en cada build, disparando re-embeds inútiles.
+    ".deps", ".libs", "autom4te.cache", "CMakeFiles", "cmake-build-debug",
+    "cmake-build-release", "_build", "out", "bin", "obj", "vendor", "third_party",
+    ".idea", ".vscode", ".gradle", ".cache", ".next", ".nuxt", ".svelte-kit",
+    ".eggs", "site-packages", ".terraform", ".serverless", "Debug", "Release",
 }
 _IGNORE_FILES = {
     "*.pyc", "*.pyo", "*.pyd", "*.so", "*.dll", "*.exe",
     "*.lock", "package-lock.json", "yarn.lock", "Pipfile.lock", "poetry.lock",
     "*.min.js", "*.min.css", "*.map", "*.egg-info",
+    # Ficheros generados con extensión de fuente (se regeneran en cada build → churn).
+    "config.h", "*_pb2.py", "*_pb2_grpc.py", "*.pb.go", "*.pb.cc", "*.pb.h",
+    "moc_*.cpp", "qrc_*.cpp", "ui_*.h", "*.generated.*", "*.g.dart", "*.freezed.dart",
+    "*.designer.cs", "*.min.*",
 }
 _MAX_FILE_CHARS    = 6000   # fallback si se crea WorkspaceRAG sin config
 _CHUNK_CHARS       = 512

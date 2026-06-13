@@ -94,9 +94,9 @@ La configuración de OOCode reside en `~/.oocode/oocode.json`. Se genera automá
 
   "context": {
     "minKeep":             6,
-    "compactThreshold":    0.85,
+    "compactThreshold":    0.80,
     "maxSummaryChars":     2100,
-    "maxToolResultTokens": 2048,
+    "maxToolResultTokens": 800,
     "autoContinueMax":     8,
     "highWater":           0.70,
     "toolMaxChars":        3000
@@ -173,7 +173,11 @@ La configuración de OOCode reside en `~/.oocode/oocode.json`. Se genera automá
   "mcp": {
     "oocodeAssistant":    { "enabled": true  },
     "systemAssistant":    { "enabled": true  },
-    "homeOfficeAssistant":{ "enabled": false },
+    "wordAssistant":      { "enabled": false },
+    "excelAssistant":     { "enabled": false },
+    "pptxAssistant":      { "enabled": false },
+    "mailAssistant":      { "enabled": false },
+    "cmdbAssistant":      { "enabled": false },
     "securityAssistant":  { "enabled": false },
     "iotAssistant":       { "enabled": false },
     "requestTimeout": 30.0,
@@ -370,12 +374,21 @@ Modo de permiso por herramienta. Los permisos disponibles dependen de los plugin
 | Campo | Defecto | Descripción |
 |-------|---------|-------------|
 | `minKeep` | 6 | Mensajes mínimos a conservar tras compactar |
-| `compactThreshold` | 0.85 | Fracción del límite que dispara compactación automática |
+| `compactThreshold` | 0.80 | Fracción del límite que dispara compactación automática |
 | `maxSummaryChars` | 2100 | Chars máximos del resumen acumulado |
-| `maxToolResultTokens` | 2048 | Tokens máximos de un resultado de herramienta en el contexto |
+| `maxToolResultTokens` | 800 | Tokens máximos de un resultado de herramienta en el contexto |
 | `autoContinueMax` | 8 | Auto-continuaciones máximas (0 = desactivado) |
-| `highWater` | 0.70 | Fracción del contexto a partir de la cual se truncan resultados de herramientas |
+| `highWater` | 0.70 | Fracción a partir de la cual se dispara la pre-compactación en background al volver a idle |
 | `toolMaxChars` | 3000 | Chars máximos de un resultado de herramienta en la ventana de contexto compactada |
+| `compactTarget` | 0.50 | Fracción **objetivo tras compactar**: la 2ª pasada trunca resultados de herramientas largos (salvo los 2 más recientes) hasta bajar de aquí, dejando headroom antes de `compactThreshold`. Súbela si prefieres conservar más contexto reciente; bájala para compactaciones más agresivas |
+| `ctxMode` | `"mini"` | Modo de contexto del workspace al arrancar (`mini`\|`full`); equivale a `/ctx` |
+| `planApproval` | `false` | Plan-mode al arrancar: si `true`, el agente pide tu aprobación antes de ejecutar cada plan (equivale a `/plan on`) |
+
+> **Si tras compactar el contexto se queda alto (50–70%) con ficheros grandes:** es el síntoma de
+> que la 2ª pasada no reducía lo suficiente. Desde v0.4.5 `compactTarget` (0.50) fuerza el truncado
+> de los resultados de herramientas grandes conservados hasta bajar de ese objetivo. Combínalo con
+> un `maxToolResultTokens` moderado (~8000) y un `minKeep` contenido (~9) para que las lecturas no
+> inflen el contexto de trabajo entre compactaciones (los ejemplos de `doc/examples/` ya usan estos valores).
 
 ### `embeddings`
 
@@ -406,6 +419,9 @@ Configura la memoria semántica. Requiere un modelo de embeddings en Ollama.
 | `chunkOverlap` | 64 | Solapamiento entre chunks consecutivos |
 | `maxFiles` | 2000 | Número máximo de ficheros indexados en el workspace |
 | `minSlotChars` | 200 | Chars mínimos de un chunk para ser indexado |
+| `indexInterval` | 300 | Segundos mínimos entre re-indexaciones (incremental, en background) |
+
+**Indexación del proyecto.** El RAG indexa el **directorio del proyecto** (no el workspace de identidad del agente) para que el agente recupere código relevante de forma semántica. Indexa solo ficheros con extensión de código y re-embebe en background, como máximo cada `indexInterval` segundos, **solo los ficheros cuyo `mtime` cambió** (incremental). El índice se **persiste** en `~/.oocode/search_index/` — la indexación inicial de un proyecto grande es un coste único; las siguientes son pequeñas. El estado se ve en la barra como `rag:idx(N)`. **Ignora artefactos de build/generados** (v0.4.8): `.git`, `node_modules`, `build`/`dist`/`target`, autotools (`.deps`/`.libs`/`autom4te.cache`), CMake, IDE (`.idea`/`.vscode`), `vendor`, y ficheros generados con extensión de fuente (`config.h`, `*_pb2.py`, `moc_*.cpp`, `ui_*.h`…) — para no malgastar embeds re-indexándolos en cada compilación. Si en un proyecto muy grande no necesitas recuperación semántica, sube `indexInterval`, baja `maxFiles`, o pon `enabled: false` (la memoria semántica `mem_save`/recuerdo es independiente).
 
 ### `tools`
 
@@ -459,7 +475,11 @@ tokens_disponibles = contextWindow − maxTokens − systemOverhead
 |-------|-------------|
 | `oocodeAssistant.enabled` | Activar servidor oocode-assistant (activo por defecto) |
 | `systemAssistant.enabled` | Activar servidor system-assistant (activo por defecto) |
-| `homeOfficeAssistant.enabled` | Activar servidor home-office-assistant |
+| `wordAssistant.enabled` | Activar servidor word-assistant (Word/PDF + núcleo O365) |
+| `excelAssistant.enabled` | Activar servidor excel-assistant (hojas .xlsx/CSV) |
+| `pptxAssistant.enabled` | Activar servidor pptx-assistant (presentaciones .pptx) |
+| `mailAssistant.enabled` | Activar servidor mail-assistant (email/calendario/notas) |
+| `cmdbAssistant.enabled` | Activar servidor cmdb-assistant (inventario IT) |
 | `securityAssistant.enabled` | Activar servidor security-assistant |
 | `iotAssistant.enabled` | Activar servidor iot-assistant |
 | `requestTimeout` | Timeout en segundos para llamadas MCP (defecto: 30.0) |
@@ -538,6 +558,11 @@ Los hooks se activan/desactivan con `/hooks builtin <nombre>` en el REPL. Ver `d
 ---
 
 ## Configuración por hardware
+
+> **Ejemplos listos para copiar:** en [`doc/examples/`](examples/) hay tres perfiles
+> mínimos (`oocode.4b-q4_0.json`, `oocode.4b-q8_0.json`, `oocode.9b-q8_0.json`) para ~8/12/16 GB
+> de VRAM, con un [README](examples/README.md) que explica la diferencia entre cuantizaciones
+> `q4_0`/`q8_0` (se elige al hacer `ollama pull`, no en `oocode.json`).
 
 ### 16 GB VRAM — qwen3.5:9b con 131K contexto (recomendado)
 

@@ -1,5 +1,5 @@
 " OOCode autoload — wrapper completo del TUI (streaming SSE, tools, plan)
-" Versión: 3.1.0
+" Versión: 3.2.0
 
 " ── Estado interno ────────────────────────────────────────────────────────────
 let s:panel_bufname  = '__OOCode__'
@@ -33,6 +33,13 @@ let s:agent_model    = '—'
 let s:ctx_pct        = 0
 let s:task_done      = 0
 let s:task_total     = 0
+let s:tokens_in      = 0
+let s:tokens_out     = 0
+let s:mem_hits       = 0
+let s:rag_hits       = 0
+let s:rag_available  = 0
+let s:think_level    = 'off'
+let s:reasoning      = 0
 
 " Detección del servidor
 let s:server_alive    = -1   " -1=desconocido  0=inactivo  1=activo
@@ -50,6 +57,11 @@ let s:session_ready   = 0
 
 " Estado de subagente activo (para prefijar líneas con │, paridad TUI/WebUI)
 let s:sub_depth       = 0
+
+" Prompts interactivos pendientes (ask_user / permisos), servidos vía timer
+" porque input()/inputlist() no se pueden llamar desde el callback del SSE.
+let s:pending_questions = []
+let s:pending_perm      = {}
 
 " Watchdog del turno: timer id que cierra el turno si el SSE enmudece
 let s:turn_watchdog   = -1
@@ -318,8 +330,21 @@ function! s:panel_update_header() abort
     let l:task_str = s:task_total > 0
                   \ ? '  ✔ ' . s:task_done . '/' . s:task_total
                   \ : ''
-    let l:hdr = printf('# %s %s  │  %s  │  %s%s',
-        \ s:agent_emoji, s:agent_name, s:agent_model, l:ctx_str, l:task_str)
+    " tokens · mem · rag — paridad con la línea 2 del status del TUI
+    let l:tok_str = (s:tokens_in > 0 || s:tokens_out > 0)
+                 \ ? '  ·  ' . s:tokens_in . '↑ ' . s:tokens_out . '↓'
+                 \ : ''
+    let l:mem_str = s:mem_hits > 0 ? '  ·  ⬡ ' . s:mem_hits . ' mem' : ''
+    let l:rag_str = s:rag_hits > 0
+                 \ ? '  ·  ◈ ' . (s:rag_available > s:rag_hits ? s:rag_hits . '/' . s:rag_available : s:rag_hits) . ' rag'
+                 \ : ''
+    " think:med.+r — paridad con el bloque think del toolbar TUI
+    let l:think_str = s:think_level !=# 'off'
+                   \ ? '  ·  think:' . strpart(s:think_level, 0, 3) . (s:reasoning ? '.+r' : '')
+                   \ : ''
+    let l:hdr = printf('# %s %s  │  %s  │  %s%s%s%s%s%s',
+        \ s:agent_emoji, s:agent_name, s:agent_model, l:ctx_str,
+        \ l:think_str, l:tok_str, l:mem_str, l:rag_str, l:task_str)
     call s:panel_setline(1, l:hdr)
 endfunction
 
@@ -529,6 +554,105 @@ function! s:panel_on_error(msg) abort
     call s:panel_end_turn()
 endfunction
 
+" ── ask_user — paridad TUI/WebUI ──────────────────────────────────────────────
+" El servidor emite 'question' y BLOQUEA el turno hasta POST /api/chat/answer.
+" Sin esto, cualquier ask_user del agente cuelga el turno hasta el timeout (900s).
+" El prompt interactivo se difiere con timer_start(0): input()/inputlist() no se
+" pueden invocar desde el callback del job SSE (textlock).
+function! s:panel_on_question(questions) abort
+    call s:panel_hide_thinking()
+    let s:pending_questions = a:questions
+    call s:panel_append(['', '  ❓ OOCode necesita tu decisión:'])
+    call timer_start(0, {-> s:prompt_questions()})
+endfunction
+
+function! s:prompt_questions() abort
+    let l:qs = get(s:, 'pending_questions', [])
+    let s:pending_questions = []
+    if empty(l:qs) | return | endif
+    let l:answers = []
+    for l:q in l:qs
+        let l:header  = get(l:q, 'header', '')
+        let l:qtext   = get(l:q, 'question', '')
+        let l:multi   = get(l:q, 'multiSelect', 0)
+        let l:options = get(l:q, 'options', [])
+        call s:panel_append('  ┌ ' . (empty(l:header) ? '' : '['.l:header.'] ') . l:qtext)
+        " Construir lista de opciones para inputlist (1-based) + opción de texto libre.
+        let l:menu = [(empty(l:qtext) ? 'Elige:' : l:qtext) . (l:multi ? '  (varias: 1,3)' : '')]
+        let l:i = 1
+        for l:opt in l:options
+            let l:lbl = type(l:opt) == v:t_dict ? get(l:opt, 'label', string(l:opt)) : string(l:opt)
+            let l:dsc = type(l:opt) == v:t_dict ? get(l:opt, 'description', '') : ''
+            call s:panel_append('  │ ' . l:i . '. ' . l:lbl . (empty(l:dsc) ? '' : '  — ' . l:dsc))
+            call add(l:menu, printf('%d. %s', l:i, l:lbl))
+            let l:i += 1
+        endfor
+        call add(l:menu, printf('%d. (otro: escribir respuesta)', l:i))
+        " Prompt al usuario.
+        let l:sel = []
+        let l:free = ''
+        if l:multi
+            call inputsave()
+            let l:raw = input('  → opciones (ej. 1,3) o texto libre: ')
+            call inputrestore()
+            if l:raw =~# '^\s*\d\+\(\s*,\s*\d\+\)*\s*$'
+                for l:n in split(l:raw, ',')
+                    call add(l:sel, str2nr(trim(l:n)) - 1)
+                endfor
+            else
+                let l:free = l:raw
+            endif
+        else
+            call inputsave()
+            let l:choice = inputlist(l:menu)
+            call inputrestore()
+            if l:choice >= 1 && l:choice <= len(l:options)
+                call add(l:sel, l:choice - 1)
+            elseif l:choice == l:i
+                call inputsave()
+                let l:free = input('  → tu respuesta: ')
+                call inputrestore()
+            endif
+        endif
+        call add(l:answers, {'selection': l:sel, 'free_text': l:free})
+    endfor
+    call s:panel_append(['  └ enviando respuesta…', ''])
+    call s:post('/api/chat/answer', {'answers': l:answers})
+endfunction
+
+" Bloque resumen de respuestas (paridad con _render_ask_answers TUI/WebUI).
+function! s:panel_on_ask_answers(pairs) abort
+    if empty(a:pairs) | return | endif
+    call s:panel_append('  ● Respondiste a OOCode:')
+    for l:p in a:pairs
+        call s:panel_append('  ⎿ · ' . get(l:p, 'q', '') . ' → ' . get(l:p, 'a', ''))
+    endfor
+    call s:panel_append('')
+endfunction
+
+" ── Confirmación de permisos — paridad GAP 4 ──────────────────────────────────
+" Solo se emite si webui.permissionPrompt=ON y hay cliente SSE (Vim cuenta). El
+" turno bloquea hasta POST /api/chat/permission (180s → denegado por seguridad).
+function! s:panel_on_permission(tool, description) abort
+    let s:pending_perm = {'tool': a:tool, 'description': a:description}
+    call timer_start(0, {-> s:prompt_permission()})
+endfunction
+
+function! s:prompt_permission() abort
+    let l:p = get(s:, 'pending_perm', {})
+    let s:pending_perm = {}
+    if empty(l:p) | return | endif
+    call s:panel_append('  🔐 Permiso: ' . get(l:p, 'tool', '?')
+        \ . (empty(get(l:p, 'description', '')) ? '' : ' — ' . l:p['description']))
+    call inputsave()
+    let l:c = inputlist(['Autorizar ' . get(l:p, 'tool', '?') . '?',
+        \ '1. Sí (una vez)', '2. No', '3. Siempre'])
+    call inputrestore()
+    let l:choice = l:c == 1 ? 's' : (l:c == 3 ? 'siempre' : 'n')
+    call s:panel_append('  ⎿ ' . (l:choice ==# 'n' ? 'denegado' : 'autorizado (' . l:choice . ')'))
+    call s:post('/api/chat/permission', {'choice': l:choice})
+endfunction
+
 function! s:handle_sse_event(ev) abort
     let l:type = get(a:ev, 'type', '')
     let s:last_event_ts = localtime()
@@ -605,6 +729,33 @@ function! s:handle_sse_event(ev) abort
             call s:panel_setline(s:think_lnum, '  ● ' . l:label)
         endif
 
+    elseif l:type ==# 'question'
+        " ask_user: el turno bloquea hasta /api/chat/answer → prompt obligatorio.
+        call s:panel_on_question(get(a:ev, 'questions', []))
+
+    elseif l:type ==# 'ask_answers'
+        call s:panel_on_ask_answers(get(a:ev, 'pairs', []))
+
+    elseif l:type ==# 'permission'
+        " Confirmación de permiso (webui.permissionPrompt ON) → bloquea el turno.
+        call s:panel_on_permission(get(a:ev, 'tool', '?'), get(a:ev, 'description', ''))
+
+    elseif l:type ==# 'queued'
+        " Mensaje encolado mientras el agente trabaja (cola FIFO de entrada).
+        call s:panel_append('  ⏳ en cola: ' . get(a:ev, 'text', ''))
+
+    elseif l:type ==# 'slash_result'
+        " Resultado de un slash command ejecutado server-side.
+        let l:r = get(a:ev, 'result', get(a:ev, 'text', ''))
+        if !empty(l:r) | call s:panel_append(split(l:r, "\n", 1)) | endif
+
+    elseif l:type ==# 'reasoning'
+        " Razonamiento del modelo (think_level != off): bloque tenue con el porqué.
+        call s:panel_hide_thinking()
+        for l:rl in split(get(a:ev, 'text', ''), "\n", 1)
+            call s:panel_append('  💭 ' . l:rl)
+        endfor
+
     elseif l:type ==# 'embed_flash'
         " Operación de memoria/RAG en curso — indicador discreto, sin romper el flujo.
 
@@ -640,6 +791,13 @@ function! s:update_agent_status(ev) abort
     if has_key(a:ev, 'context_pct') | let s:ctx_pct     = get(a:ev, 'context_pct', 0) | endif
     if has_key(a:ev, 'task_done')   | let s:task_done   = get(a:ev, 'task_done',  0) | endif
     if has_key(a:ev, 'task_total')  | let s:task_total  = get(a:ev, 'task_total', 0) | endif
+    if has_key(a:ev, 'tokens_in')   | let s:tokens_in   = get(a:ev, 'tokens_in',  0) | endif
+    if has_key(a:ev, 'tokens_out')  | let s:tokens_out  = get(a:ev, 'tokens_out', 0) | endif
+    if has_key(a:ev, 'mem_hits')    | let s:mem_hits    = get(a:ev, 'mem_hits',   0) | endif
+    if has_key(a:ev, 'rag_hits')    | let s:rag_hits    = get(a:ev, 'rag_hits',   0) | endif
+    if has_key(a:ev, 'rag_available') | let s:rag_available = get(a:ev, 'rag_available', 0) | endif
+    if has_key(a:ev, 'think_level')  | let s:think_level  = get(a:ev, 'think_level', 'off') | endif
+    if has_key(a:ev, 'reasoning')    | let s:reasoning    = get(a:ev, 'reasoning',   0) | endif
 endfunction
 
 " ── SSE Streaming job ─────────────────────────────────────────────────────────
@@ -762,26 +920,41 @@ function! s:has_async() abort
 endfunction
 
 " ── Contexto del fichero activo ───────────────────────────────────────────────
-" Devuelve una línea de contexto con el fichero abierto y la línea del cursor.
-" Si no hay fichero real (buffer sin nombre, panel OOCode, etc.) devuelve ''.
+" Devuelve una línea de contexto que REFERENCIA lo que el usuario está viendo en
+" Vim (ruta absoluta del fichero + cursor, o el directorio si es un explorador),
+" más el directorio de trabajo. El agente la usa para saber a qué se refiere el
+" usuario ("revisa esta función") y leerlo con read_file. Siempre rutas ABSOLUTAS
+" para que el agente las abra aunque su project_dir difiera del cwd de Vim.
 function! s:file_hint() abort
+    let l:cwd = getcwd()
+
+    " Explorador de directorios (netrw) o buffer de directorio: referenciar el dir.
+    if &filetype ==# 'netrw' || (isdirectory(expand('%:p')) && !empty(expand('%:p')))
+        let l:dir = get(b:, 'netrw_curdir', expand('%:p'))
+        if empty(l:dir) | let l:dir = l:cwd | endif
+        return printf('[Contexto Vim — el usuario está navegando el directorio: %s]', l:dir)
+    endif
+
     let l:file = expand('%:p')
-    " Ignorar buffers sin fichero real y el propio panel OOCode
+    " Buffer sin fichero real o el propio panel OOCode → al menos referenciar el cwd.
     if empty(l:file) || bufname('%') ==# s:panel_bufname
-        return ''
+        return printf('[Contexto Vim — directorio de trabajo: %s]', l:cwd)
     endif
-    " Ignorar buffers especiales (terminal, quickfix, help…)
+    " Buffers especiales (terminal, quickfix, help…): solo el cwd.
     if &buftype !=# '' && &buftype !=# 'nofile'
-        return ''
+        return printf('[Contexto Vim — directorio de trabajo: %s]', l:cwd)
     endif
+
     let l:lnum = line('.')
     let l:col  = col('.')
     let l:ft   = empty(&filetype) ? '' : &filetype
-    let l:hint = printf('[Vim: fichero=%s  L%d:%d', l:file, l:lnum, l:col)
+    " Rango de selección visual reciente (si lo hay) para acotar la referencia.
+    let l:hint = printf('[Contexto Vim — el usuario está viendo el fichero: %s (línea L%d:%d',
+        \ l:file, l:lnum, l:col)
     if !empty(l:ft)
-        let l:hint .= '  ft=' . l:ft
+        let l:hint .= ', ft=' . l:ft
     endif
-    let l:hint .= ']'
+    let l:hint .= printf('). Directorio de trabajo: %s]', l:cwd)
     return l:hint
 endfunction
 

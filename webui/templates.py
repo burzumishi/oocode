@@ -106,10 +106,12 @@ ul.tag-list li { background:var(--bg-tertiary); padding:4px 12px; border-radius:
 .tui-sb-sep { color:#1e2d45; margin:0 8px; }
 .tui-sb-agent { color:#00e5ff; font-weight:bold; }
 .tui-sb-model { color:#89b4fa; }
+.tui-sb-tokens { color:#5566aa; font-size:.72rem; }
 .tui-sb-ctx { color:#a6e3a1; }
 .tui-sb-ctx.warn { color:#f9e2af; }
 .tui-sb-ctx.crit { color:#f38ba8; animation:ctxCritBlink .8s ease-in-out infinite; }
 @keyframes ctxCritBlink { 0%,100%{opacity:1} 50%{opacity:.5} }
+.tui-sb-cnt { color:#6688aa; font-size:.72rem; }
 .tui-sb-tasks { color:#bb66ff; }
 .tui-sb-right { margin-left:auto; display:flex; align-items:center; gap:6px; color:#334455; }
 .tui-ctx-bar { display:inline-block; width:160px; height:6px; background:#0d1a2a; border:1px solid #1a2e48; border-radius:3px; overflow:hidden; vertical-align:middle; margin:0 5px; flex-shrink:0; }
@@ -121,6 +123,7 @@ ul.tag-list li { background:var(--bg-tertiary); padding:4px 12px; border-radius:
 .tui-sb-badge.mem-active  { color:#a6e3a1; border-color:#306030; }
 .tui-sb-badge.rag-active  { color:#bb66ff; border-color:#603090; }
 .tui-sb-badge.vision-active { color:#f9e2af; border-color:#806020; }
+.tui-sb-badge.think-active { color:#00e5ff; border-color:#006080; }
 .tui-sb-badge.elev-on     { color:#f9e2af; border-color:#80600a; background:rgba(80,60,10,.3); }
 .tui-sb-badge.elev-full   { color:#f38ba8; border-color:#803050; background:rgba(80,20,30,.3); animation:elevPulse 1.5s ease-in-out infinite; }
 .tui-sb-badge.elev-off    { color:#445566; border-color:#1a2a3a; opacity:.6; }
@@ -132,6 +135,25 @@ ul.tag-list li { background:var(--bg-tertiary); padding:4px 12px; border-radius:
 .tui-msg { margin-bottom:10px; animation:slideIn .18s ease; }
 .tui-msg-user .tui-msg-hdr { color:#89b4fa; font-size:.78rem; margin-bottom:4px; }
 .tui-msg-user .tui-msg-body { background:#0f1929; border-left:2px solid #89b4fa; padding:8px 12px; border-radius:0 6px 6px 0; white-space:pre-wrap; font-size:.88rem; }
+.tui-queued-badge { color:#f9c74f; font-size:.72rem; margin-left:6px; opacity:.9; }
+.tui-question-card .tui-msg-hdr { color:#f9c74f; font-size:.78rem; margin-bottom:4px; }
+.tui-question-body { background:#1a1606; border-left:2px solid #f9c74f; padding:10px 12px; border-radius:0 6px 6px 0; }
+.tui-question-q { color:#ffe9a6; font-size:.92rem; font-weight:600; margin-bottom:4px; }
+.tui-question-hint { color:#8a7d52; font-size:.72rem; margin-bottom:8px; }
+.tui-question-opts { display:flex; flex-direction:column; gap:6px; }
+.tui-question-opt { text-align:left; background:#0f1929; color:#cdd6f4; border:1px solid #2a3550; border-radius:6px; padding:7px 10px; cursor:pointer; font-size:.86rem; transition:all .12s; }
+.tui-question-opt:hover:not(:disabled) { border-color:#f9c74f; background:#16223a; }
+.tui-question-opt.sel { border-color:#f9c74f; background:#2a2410; color:#ffe9a6; }
+.tui-question-opt[data-badge]:not([data-badge=""])::before { content:attr(data-badge) "  "; color:#f9c74f; font-weight:700; }
+.tui-question-other { margin-top:8px; }
+.tui-question-free { width:100%; background:#0f1929; color:#cdd6f4; border:1px solid #2a3550; border-radius:6px; padding:7px 10px; font-size:.84rem; }
+.tui-question-send { margin-top:8px; background:#f9c74f; color:#1a1606; border:none; border-radius:6px; padding:7px 14px; cursor:pointer; font-weight:600; font-size:.84rem; }
+.tui-question-card.answered { opacity:.6; }
+.tui-question-sec { margin-bottom:12px; padding-bottom:10px; border-bottom:1px solid #2a3550; }
+.tui-question-sec:last-of-type { border-bottom:none; }
+.tui-question-opt b { font-weight:600; }
+.tui-msg-slash-result .tui-msg-hdr { color:#66ccff; font-size:.78rem; margin-bottom:4px; }
+.tui-msg-slash-result .tui-msg-body { background:#0a1622; border-left:2px solid #66ccff; padding:8px 12px; border-radius:0 6px 6px 0; white-space:pre-wrap; font-size:.85rem; }
 /* Agente: ● text inline — estilo TUI */
 .tui-msg-agent { display:flex; align-items:flex-start; gap:.6ch; padding:3px 0; }
 .tui-dot { color:#00e5ff; flex-shrink:0; line-height:1.65; font-size:.9rem; user-select:none; }
@@ -141,6 +163,8 @@ ul.tag-list li { background:var(--bg-tertiary); padding:4px 12px; border-radius:
 /* ── Filas de tools: estilo pipa TUI ── */
 .tui-tool { display:flex; align-items:flex-start; padding:1px 0; font-size:.82rem; font-family:'JetBrains Mono','Fira Code',monospace; }
 .tui-tool-pipe { color:#1a2d3a; flex-shrink:0; white-space:pre; user-select:none; }
+.tui-reasoning-inline { color:#5a6a7a; font-style:italic; opacity:.85; line-height:1.35; }
+.tui-tool-reasoning { align-items:flex-start; }
 .tui-tool-icon { flex-shrink:0; }
 .tui-tool-icon.running { color:#00aacc; }
 .tui-tool-icon.ok  { color:#3a7a4a; }
@@ -169,21 +193,24 @@ ul.tag-list li { background:var(--bg-tertiary); padding:4px 12px; border-radius:
 .tui-plan-icon { color:#bb66ff; }
 .tui-plan-icon.done { color:#3a8a5a; }
 .tui-plan-stats { color:#445566; font-weight:normal; font-size:.8rem; }
-.tui-plan-summary { color:#4a5566; font-size:.79rem; padding-left:2ch; }
+.tui-plan-summary { color:#ff4455; font-weight:600; font-size:.79rem; padding-left:2ch; }
 .tui-plan-tasks { margin-top:2px; display:flex; flex-direction:column; gap:1px; }
 .tui-plan-task { display:flex; align-items:flex-start; gap:.5ch; font-size:.82rem; }
-.tui-plan-task.pending { color:#334455; padding-left:2ch; }
-.tui-plan-task.active  { color:#cc99ff; padding-left:0; }
-.tui-plan-task.done    { color:#2a7a4a; padding-left:2ch; }
+/* Paridad con el status bar del TUI (v0.4.5): completada verde tachado,
+   activa ◼ verde + texto blanco negrita, pendiente atenuada. */
+.tui-plan-task.pending { color:#8899bb; padding-left:2ch; }
+.tui-plan-task.active  { color:#ffffff; font-weight:600; padding-left:2ch; }
+.tui-plan-task.done    { color:#00cc66; text-decoration:line-through; padding-left:2ch; }
 .tui-task-sym { flex-shrink:0; }
-.tui-plan-task.active .tui-task-sym  { color:#bb66ff; }
-.tui-plan-task.done .tui-task-sym    { color:#3a8a5a; }
-.tui-plan-task.pending .tui-task-sym { color:#334455; }
+.tui-plan-task.active .tui-task-sym  { color:#00cc66; text-decoration:none; }
+.tui-plan-task.done .tui-task-sym    { color:#00cc66; }
+.tui-plan-task.pending .tui-task-sym { color:#8899bb; }
 .tui-plan-extra { color:#263040; font-size:.78rem; padding-left:2ch; }
 /* ── Pensando: línea encima del prompt con barras verticales ondulantes ── */
 .tui-thinking-area { display:flex; align-items:center; gap:.6ch; padding:4px 12px; background:#080814; border-top:1px solid #0d1225; font-family:'JetBrains Mono','Fira Code',monospace; font-size:.84rem; flex-shrink:0; }
 .tui-thinking-dot  { color:#00e5ff; animation:agentDotPulse .9s ease-in-out infinite; flex-shrink:0; }
 .tui-thinking-word { color:#00b8cc; white-space:nowrap; }
+.tui-thinking-elapsed { color:#44556a; font-size:.74rem; white-space:nowrap; margin-left:.4ch; }
 .tui-wave-bars { display:flex; align-items:flex-end; gap:2px; height:13px; margin-left:.3ch; flex-shrink:0; }
 .tui-wave-bar  { width:3px; background:#006680; border-radius:1px; animation:waveBarAnim 1.1s ease-in-out infinite; }
 .tui-wave-bar:nth-child(1) { animation-delay:0.00s; }

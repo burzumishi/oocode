@@ -124,6 +124,96 @@ def test_thinking_bar_not_hijacked_by_tool_title():
     assert "appendToolStart(ev.tool" in h
 
 
+# ── Indicadores think/mem/rag junto a MCP/LSP (paridad toolbar TUI línea 1) ──
+
+def test_capability_badges_present():
+    """think/mem:N/rag:Nf/Mc del toolbar TUI tienen equivalente en el WebUI (badges)."""
+    h = _chat_src()
+    for bid in ('id="sb-think"', 'id="sb-memcap"', 'id="sb-ragcap"'):
+        assert bid in h, bid
+    # Se rellenan desde el evento /api/chat/status con el mismo formato del TUI
+    assert "'think:' + lvl" in h
+    assert "'⬢ mem:' + n" in h
+    assert "'✦ rag:' + f + 'f/' + c + 'c'" in h
+
+
+def test_status_endpoint_emits_capability_fields():
+    """/api/chat/status devuelve think_level/reasoning/mem_count/rag_files/rag_chunks."""
+    from webui import api_chat
+    import inspect
+    src = inspect.getsource(api_chat)
+    for key in ('"think_level":', '"reasoning":', '"mem_count":',
+                '"rag_files":', '"rag_chunks":'):
+        assert key in src, key
+
+
+def test_webui_status_event_carries_think_for_vim():
+    """El status SSE (_webui_status) lleva think_level/reasoning (Vim header + WebUI badge)."""
+    from webui import loop_webui
+    import inspect
+    src = inspect.getsource(loop_webui.WebUIMixin._webui_status)
+    assert '"think_level":' in src
+    assert '"reasoning":' in src
+    # whitelist defensiva (evita valores raros en el header)
+    assert '"minimal", "low", "medium", "high"' in src
+
+
+# ── Auto-split de bloques de tools por fichero (paridad TUI) ──────────────────
+
+def test_tool_start_emits_modify_and_target():
+    """El tool_start del WebUI propaga is_modify/write_target para el auto-split."""
+    from agent import loop
+    import inspect
+    src = inspect.getsource(loop)
+    assert '"is_modify": _wt_modify' in src
+    assert '"write_target": _wt_base' in src
+
+
+def test_webui_reasoning_nests_or_flushes_by_step():
+    """appendReasoning del WebUI: con newStep=false (default) mete el 💭 DENTRO del
+    bloque abierto (│ 💭); sin bloque va al nivel superior. Paridad con el TUI: razonar
+    NO cierra el bloque (el split por fichero lo dirige tool_start is_modify/write_target)."""
+    h = _chat_src()
+    assert "function appendReasoning(text, newStep)" in h
+    assert "appendReasoning(ev.text || '', !!ev.new_step)" in h
+    # rama "dentro del bloque" gateada por !newStep
+    assert "if (!newStep && _toolBlockInner" in h
+    assert "tui-tool-reasoning" in h
+    # el servidor emite new_step en el evento reasoning
+    from agent import loop
+    import inspect
+    src = inspect.getsource(loop)
+    assert '"new_step": bool(getattr(self, "_reasoning_new_step"' in src
+
+
+def test_reasoning_does_not_drive_block_flush():
+    """REGRESIÓN (2026-06-11 noche): run() NO decide flush del bloque al RAZONAR
+    (ni incondicional ni por cambio de fichero) — eso troceaba los bloques del TUI y
+    suprimía ●. El flag new_step del WebUI (2026-06-12) se fija con la frontera del
+    TEXTO nuevo no-duplicado (`_new_step`, misma condición que el flush del ●), nunca
+    con una decisión por fichero en el momento de razonar. El split por fichero lo
+    sigue haciendo el auto-split de las write tools."""
+    from agent import loop
+    import inspect
+    src = inspect.getsource(loop.AgentLoop.run)
+    assert "self._reasoning_new_step = _file_changed" not in src
+    assert "_continue_same_file" not in src
+    assert "self._reasoning_new_step = _new_step" in src
+
+
+def test_webui_tool_block_splits_per_file():
+    """appendToolStart cierra el bloque al cambiar de fichero (no acumula +50 tools)."""
+    h = _chat_src()
+    # Recibe los flags y los usa para el split
+    assert "function appendToolStart(tool, ctx, isModify, writeTarget)" in h
+    assert "appendToolStart(ev.tool, ev.context || '', !!ev.is_modify, ev.write_target || '')" in h
+    # La condición de split: write a fichero DISTINTO con bloque con contenido
+    assert "writeTarget !== _blockWriteTarget" in h
+    assert "_finishToolBlock();" in h
+    # El estado del fichero del bloque se resetea al crear/cerrar bloque
+    assert h.count("_blockWriteTarget = '';") >= 2
+
+
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-v"]))

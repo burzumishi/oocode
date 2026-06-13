@@ -1,4 +1,4 @@
-# OOCode v0.4.3 — Asistente de programación local multi-backend
+# OOCode v0.5.0 — Asistente de programación local multi-backend
 
 Asistente de programación para la terminal con soporte de múltiples backends LLM: **[Ollama](https://ollama.com)** (100% local), servidores **OpenAI-compatible** (llama.cpp, LM Studio, vLLM) y **Anthropic** (Claude cloud). Sin restricciones de uso, sin enviar código a terceros salvo que elijas un backend externo.
 
@@ -23,9 +23,9 @@ Asistente de programación para la terminal con soporte de múltiples backends L
 - **TUI avanzada** — live block con preview de herramientas, auto-header para ediciones, spinner pulsante, display compacto de resultados, task progress panel con planes multi-tarea
 - **WebUI Flask** *(beta)* — interfaz web con salida idéntica al TUI (●/│/◐/⎿/◈), planes, bloques colapsables, status bar bajo el prompt (paridad TUI), indicador "Pensando" de estado, subagentes en bloques de conversación, configuración visual completa, evento `inference_done`
 - **Tool calling nativo** — el modelo llama a herramientas reales: bash, ficheros, web, git, docker…
-- **157+ tools MCP** — 8 servidores MCP bundled: oocode-assistant (53), devops-assistant (66), database-assistant (20), system-assistant, home-office, security, IoT, **http-client (17)**
+- **157+ tools MCP** — 12 servidores MCP bundled: oocode-assistant (53), devops-assistant (66), database-assistant (20), system-assistant, word (29), excel (16), pptx (7), mail (11), cmdb (3), security, IoT, **http-client (17)**
 - **HTTP Client MCP** — 17 tools para desarrollo de APIs: http_request, response_diff, openapi_validate, curl_import, websocket_send, sse_listen, mock_server, graphql_query, jwt_decode, http_batch
-- **5 agentes especializados** — main, coding, home_office, reasoning, webcrawler; cada uno con workspace propio y personalizable sin tocar código (sección `## Notas` de `TOOLS.md`/`AGENTS.md`)
+- **5 agentes especializados** — main, coding, office, reasoning, webcrawler; cada uno con workspace propio y personalizable sin tocar código (sección `## Notas` de `TOOLS.md`/`AGENTS.md`)
 - **Delegación consciente de agentes** — el LLM conoce el rol de cada agente disponible y delega la tarea en el más afín (p.ej. búsqueda web → `webcrawler`), ahorrando contexto y herramientas
 - **Multi-servidor Ollama** — distribuye subagentes y embeddings entre varios servidores en round-robin
 - **LSP integration** — 30+ lenguajes con auto-arranque de servidores por extensión de fichero
@@ -82,7 +82,7 @@ Como es una instalación editable, `git pull` actualiza OOCode inmediatamente si
 
 ### Dependencias opcionales (Office)
 
-Para el servidor MCP home-office-assistant:
+Para los servidores MCP word/excel/pptx-assistant:
 
 ```bash
 pip install python-docx python-pptx openpyxl pillow docxtpl
@@ -207,7 +207,7 @@ Se genera automáticamente al arrancar por primera vez. Edita con `/config edit`
     "list": [
       { "id": "main",       "name": "OOCode",        "emoji": "🤖", "model": "qwen3.5:9b" },
       { "id": "coding",     "name": "OOCode Coder",  "emoji": "💻", "model": null },
-      { "id": "home_office","name": "OOCode Office", "emoji": "📋", "model": null },
+      { "id": "office",     "name": "OOCode Office", "emoji": "📋", "model": null },
       { "id": "reasoning",  "name": "OOCode Reason", "emoji": "🧠", "model": null },
       { "id": "webcrawler", "name": "WebCrawler",    "emoji": "🕷️", "model": null }
     ]
@@ -216,7 +216,11 @@ Se genera automáticamente al arrancar por primera vez. Edita con `/config edit`
   "mcp": {
     "oocodeAssistant":    { "enabled": true  },
     "systemAssistant":    { "enabled": true  },
-    "homeOfficeAssistant":{ "enabled": false },
+    "wordAssistant":      { "enabled": false },
+    "excelAssistant":     { "enabled": false },
+    "pptxAssistant":      { "enabled": false },
+    "mailAssistant":      { "enabled": false },
+    "cmdbAssistant":      { "enabled": false },
     "securityAssistant":  { "enabled": false },
     "iotAssistant":       { "enabled": false }
   },
@@ -250,7 +254,7 @@ Se genera automáticamente al arrancar por primera vez. Edita con `/config edit`
 |--------|-------|-------------|-----------|
 | `main` | 🤖 | Asistente general, coordina otros agentes | `~/.oocode/workspace/main` |
 | `coding` | 💻 | IT, programación, refactorización, LSP | `~/.oocode/workspace/coding` |
-| `home_office` | 📋 | Documentación corporativa O365 (Word/Excel/PPT) | `~/.oocode/workspace/home_office` |
+| `office` | 📋 | Documentación corporativa O365 (Word/Excel/PPT) | `~/.oocode/workspace/office` |
 | `reasoning` | 🧠 | Razonamiento, coordinación de equipos de agentes | `~/.oocode/workspace/reasoning` |
 | `webcrawler` | 🕷️ | Búsqueda web con SearXNG, generación de informes | `~/.oocode/workspace/webcrawler` |
 
@@ -312,14 +316,14 @@ OOCode muestra lo que está haciendo mientras trabaja, con un live block que apa
 ```
   ● Voy a revisar el código y corregir los errores de compilación.
 
-  ● Updating act_comm.c:
+  ● Updating handlers.c:
   |  ◐ Bash:
   |     $ grep -rn "gethostname" src/
   ⎿ Used 2 tools (ctrl+o to expand)
 
-  ● Updating comm.c, imc.c:
+  ● Updating handlers.c, utils.c:
   |  ◐ Update:
-  |     comm.c
+  |     handlers.c
   ⎿ Updated 2 files (ctrl+o to expand)
 ```
 
@@ -338,7 +342,7 @@ OOCode muestra lo que está haciendo mientras trabaja, con un live block que apa
 
 ---
 
-## MCP Servers (8 bundled)
+## MCP Servers (12 bundled)
 
 | Servidor | Flag en oocode.json | Tools | Por defecto |
 |----------|---------------------|-------|-------------|
@@ -346,7 +350,11 @@ OOCode muestra lo que está haciendo mientras trabaja, con un live block que apa
 | `devops-assistant` | `devopsAssistant.enabled` | 66 tools: git (16), docker/compose (23), build/debug (11), archive (3), fs-mutations (13) | activo |
 | `system-assistant` | `systemAssistant.enabled` | systemctl, journalctl, red, disco, paquetes, procesos | activo |
 | `database-assistant` | `databaseAssistant.enabled` | 20 tools: SQLite CRUD, pg/mysql opcionales, csv_to_sqlite, db_stats, sql_format | desactivado |
-| `home-office-assistant` | `homeOfficeAssistant.enabled` | 66 tools O365 nativo: doc_create, insert_chart (OOXML), xlsx_create_report, pptx_create, email_send, cal_add | desactivado |
+| `word-assistant` | `wordAssistant.enabled` | 29 tools: doc_create (genera docx/xlsx/pptx), insert_chart (OOXML), doc_fill_template, estilos, conversión, OCR, PDF, proyecto | desactivado |
+| `excel-assistant` | `excelAssistant.enabled` | 16 tools: xlsx_read/write, xlsx_create_report, xlsx_insert_chart, formato condicional, validación, csv_analyze | desactivado |
+| `pptx-assistant` | `pptxAssistant.enabled` | 7 tools: pptx_create, pptx_add_slide, pptx_insert_chart, pptx_read, pptx_add_notes, pptx_set_background | desactivado |
+| `mail-assistant` | `mailAssistant.enabled` | 11 tools: email_list/read/send/search (IMAP/SMTP), cal_list/add/search (.ics), notes, contact_search | desactivado |
+| `cmdb-assistant` | `cmdbAssistant.enabled` | 3 tools: cmdb_search, cmdb_update, asset_register_add (CSV/XLSX/JSON) | desactivado |
 | `security-assistant` | `securityAssistant.enabled` | 24 tools: nmap_scan, web_scan, ssl_check, hash_crack, xss_test, ctf_decode | desactivado |
 | `iot-assistant` | `iotAssistant.enabled` | 25 tools: TAPO, Blink, Alexa, Tuya, Home Assistant, MQTT, ESPHome | desactivado |
 | `http-client-assistant` | `httpClientAssistant.enabled` | 17 tools: http_request/get, response_diff, openapi_validate, curl_import, websocket_send, sse_listen, mock_server, graphql_query, jwt_decode, http_batch, http_history | desactivado |
@@ -502,13 +510,17 @@ oocode/
 │   ├── hooks.py           # 18 hooks built-in
 │   └── ...
 │
-├── mcp_servers/           # Servidores MCP bundled (8)
+├── mcp_servers/           # Servidores MCP bundled (10)
 │   ├── oocode_assistant.py    # 53 tools: code analysis, edit, utilities
 │   ├── devops_assistant.py    # 66 tools: git, docker/compose, build, debug, fs
 │   ├── database_assistant.py  # 20 tools: SQLite, PostgreSQL/MySQL opcionales
 │   ├── system_assistant.py    # sistema, servicios, paquetes, red
 │   ├── http_client_assistant.py  # 17 tools: HTTP/APIs, WebSocket, mock server
-│   ├── home_office_assistant.py
+│   ├── word_assistant.py      # 29 tools: Word/PDF + doc_create + núcleo O365
+│   ├── excel_assistant.py     # 16 tools: hojas .xlsx + CSV
+│   ├── pptx_assistant.py      # 7 tools: presentaciones .pptx
+│   ├── mail_assistant.py      # 11 tools: email/calendario/notas/contactos
+│   ├── cmdb_assistant.py      # 3 tools: inventario IT (CMDB/asset register)
 │   ├── security_assistant.py
 │   └── iot_assistant.py
 │
@@ -557,7 +569,7 @@ oocode/
 | `doc/19_webui.md` | WebUI Flask *(beta)*: setup, API REST, SSE, eventos, subagentes |
 | `doc/20_office_styles.md` | Estilos O365 en documentos Word/Excel/PPT |
 | `doc/21_extensions.md` | Extensiones VIM y VSCode |
-| `doc/22_mcp_servers.md` | 5 MCP servers bundled + catálogo de servidores externos |
+| `doc/22_mcp_servers.md` | 10 MCP servers bundled + catálogo de servidores externos |
 | `doc/23_hooks.md` | Los 18 hooks built-in: configuración y custom hooks |
 | `doc/24_tui_display.md` | TUI live block: preview de herramientas, auto-split bullet, static ANSI cache |
 | `doc/25_api_backends.md` | Multi-backend LLM: Ollama, OpenAI-compatible, Anthropic; configuración y ejemplos |
@@ -565,6 +577,20 @@ oocode/
 ---
 
 ## Changelog
+
+**v0.5.0** (2026-06-12) — **Estructura de conversación por pasos estilo Claude Code.** Cambia **cómo se agrupan los bloques**: con el pensamiento activo, el modelo razona antes de cada acción pero reemitía el mismo preámbulo (o ninguno), así que **todos los pasos se fundían en un solo `●` con "Used N tools"** — el usuario veía 9 herramientas juntas sin saber qué tarea era cada una. Ahora un **razonamiento (💭) distinto abre su propio bloque**: se cierra el anterior, el 💭 sale entre bloques y se abre un `●` etiquetado por la acción, dando la estructura `💭 razonamiento → ● acción → herramientas → ⎿ resumen` por cada paso, como en Claude Code. Está acotado para no trocear de más (exige 💭 nuevo + herramientas + bloque ya con trabajo; los modelos sin razonamiento mantienen la agrupación previa). Además, el `●` ahora muestra el **fichero** que se edita (`Editing (db.c)…`) en vez del nombre interno de la herramienta (`Editing Update`), incluso si el modelo usa un alias de ruta (`edit_file(file=…)`). Verificado que `/think`/`/reasoning` se aplican desde la configuración por modelo y que las personas de los agentes empujan a narrar paso a paso. 3980 tests.
+
+**v0.4.9** (2026-06-12) — **Narración real estilo Claude Code.** El agente ahora **comunica con texto de verdad**, no solo razonando. Con el pensamiento activo, los modelos de razonamiento tendían a poner toda la narración en el canal interno `<think>` y a emitir muy poco texto: el agente narraba una vez y encadenaba decenas de herramientas en silencio, incluidos los **giros** del diagnóstico. Ahora el razonamiento (💭) es un canal **auxiliar** que ya **no sustituye** al texto visible — la guía de pensamiento y el recordatorio interno empujan a escribir una frase normal antes de cada acción, y un giro o descubrimiento abre su propio mensaje. Además se **audita el conteo de tokens** (es correcto: la barra de contexto no crece con `/think` porque el razonamiento es efímero y no se reenvía — lo que llena el contexto son los resultados de herramientas) y la **compactación** (segura: nunca corta a mitad de edición y conserva la tarea activa). Limpieza de referencias de prueba en código y documentación. *Con modelos pequeños (9B) hay un techo de comportamiento; bajar `/think` da más texto visible.* 3976 tests.
+
+**v0.4.8** (2026-06-11) — **Razonamiento visible + edición robusta multi-lenguaje.** El **razonamiento del modelo** (canal `<think>`) ahora se **muestra** como narración atenuada (💭) en Markdown alineado — antes se descartaba, así que las herramientas se ejecutaban sin explicar el "porqué". Coste cero si no activas el pensamiento (`/think low`, o `thinking.think_level` en `models.configs`, cuya config por modelo ahora se aplica aunque el nombre lleve prefijo de registry o `:latest`). Los **bloques de herramientas se agrupan por fichero**: leer + razonar + editar el mismo fichero quedan en un bloque (con el razonamiento intermedio dentro, `│ 💭`), y al cambiar de fichero se abre uno nuevo — en vez de englobar decenas de herramientas de varios ficheros en un "Used N tools" que soltaba todos los diffs de golpe. El **mensaje de `task_done`** (resumen de tarea) ahora se muestra. **`ask_user` se respeta SIEMPRE**: es una pregunta genuina del agente y `/elevated` (que solo afecta a permisos de herramientas) ya no la silencia; igual para la aprobación de plan (`/plan on`), que además muestra el plan formateado con un formulario claro. El agente narra de forma **cálida y continua**, explicando qué hace y **por qué decide** lo que decide. **Edición más robusta**: `edit_file`/`edit_files` toleran diferencias de whitespace (espacios/tabs/indentación/CRLF) en **cualquier lenguaje** — la causa nº1 de fallos de edición —, y `read_file(skip_comment_banner=true)` colapsa cabeceras de licencia largas conservando los números de línea. Los **subagentes** ya no saludan ("¡Hola!") y empiezan directos. El **RAG** del proyecto ignora más artefactos de build (menos re-embeds). Además: separadores `---` ya no salen como `● ---`, auditoría de datos personales, plantilla `USER.md` saneada y nuevo `.gitignore`. 4718 tests.
+
+**v0.4.7** (2026-06-10) — **Edición fiable + paridad del plugin Vim.** Corregida la **causa raíz** del problema por el que las herramientas de edición "nunca acertaban y revertían": la caché de lecturas (`read_file`, `grep_code`…) solo se vaciaba una vez por turno, así que tras un `edit_file` exitoso un `read_file` del mismo fichero devolvía el contenido **pre-edición** cacheado → el agente reintentaba el mismo cambio y obtenía "PRE-EDIT FALLIDO" (ya estaba aplicado) → bucle de reintento. Ahora las lecturas afectadas se **invalidan automáticamente** tras cada mutación (dirigida por ruta para edits, vaciado completo para `bash`/`python_exec`/git/docker que pueden tocar ficheros arbitrarios); `smart_replace` y las git mutadoras dejan de cachearse. El **plugin de Vim (v3.2)** alcanza **paridad de interacción** con TUI/WebUI: el panel maneja `ask_user` (preguntas con opciones → `inputlist`/texto libre), confirmación de permisos, cola de entrada y resultados de slash (antes `ask_user` colgaba el turno); y cada `:OOCode` antepone la **ruta absoluta del fichero/directorio abierto** + cursor + directorio de trabajo, para que el agente sepa a qué te refieres. Además, limpieza de referencias de marca de terceros en prompts, ayuda y comentarios. 4684 tests.
+
+**v0.4.6** (2026-06-10) — **Interacción con el usuario + robustez.** Nueva tool **`ask_user`**: el agente plantea preguntas estructuradas (una o varias, con opciones, multiselección y texto libre) y espera tu respuesta — en TUI (formulario con chips y navegación ←/→) y WebUI (tarjeta con Submit) — en vez de adivinar o soltar listas pasivas de "próximos pasos". Nuevo **plan-mode** (`/plan on`, config `context.planApproval`): el agente presenta el plan y espera tu aprobación (Aprobar/Editar/Cancelar) antes de ejecutarlo. **Confirmación de permisos en la WebUI** opt-in (`webui.permissionPrompt`) con guarda de cliente conectado (no rompe el uso headless). Ahora puedes **escribir mientras el agente trabaja**: los slash pasan al momento, los mensajes se encolan (FIFO) y se procesan al terminar. Además: edición guiada hacia `smart_replace`/`regex_replace` ante fallos de matcheo, retry XML con `/no_think`, contadores de tokens con el límite efectivo del modelo (e imágenes contadas), `●` que etiqueta la herramienta en turnos sin texto, higiene de esquemas de tools, y limpieza de claves huérfanas en `oocode.json`. 4679 tests.
+
+**v0.4.5** (2026-06-09) — **Rediseño del prompt multitarea del TUI.** Mientras el agente trabaja en un plan de varias tareas, la barra de estado muestra ahora la **frase principal del plan en rojo** (su resumen), seguida de la misma palabra de "pensamiento" animada y colores del modo normal (`Cavilando… · 3m 19s · tokens`). La lista de tareas usa un estilo de bloques: **completadas en verde tachado**, la **tarea en curso con `◼` verde y el texto en blanco negrita**, y las pendientes atenuadas, con el contador `+N pending, M completed`. Se unificó la **alineación** de los tres prompts del status window (normal, multitarea y compactación) en un patrón común de columnas, y se confirmó que ningún spinner queda fijo durante la ejecución. Además, limpieza de referencias obsoletas en el workspace del agente `home_office` tras el split de MCP de 0.4.4 (servidor y tools que ya no existen) y nuevas configuraciones de ejemplo en `doc/examples/` para tres perfiles de VRAM (4b q4_0, 4b q8_0, 9b q8_0). 4576 tests.
+
+**v0.4.4** (2026-06-09) — **División del MCP home-office en cinco servidores.** El antiguo `home_office_assistant.py` (9854 líneas, 66 tools) había crecido demasiado y mezclaba dominios. Se dividió primero por dominio en **`mail-assistant`** (11 tools — email IMAP/SMTP, calendario `.ics`, notas, contactos), **`cmdb-assistant`** (3 tools — inventario IT) y un `office`; y este último, por exceso de tamaño, se subdividió por formato en **`word-assistant`** (29 tools — Word/PDF, `doc_create` que genera docx/xlsx/pptx, gráficas OOXML, plantillas, conversión, OCR, proyecto), **`excel-assistant`** (16 tools — hojas `.xlsx`/CSV) y **`pptx-assistant`** (7 tools — presentaciones). Total bundled: 12 servidores. Cada uno se activa por separado (`/mcp enable word-assistant`, etc.) y arranca al inicio. Config: word lee `~/.oocode/office.json`, mail `mail.json`, cmdb `cmdb.json`, todos con **fallback al legacy `~/.oocode/home_office.json`**; quien tuviera `mcp.homeOfficeAssistant.enabled=true` ve los cinco activados en la primera carga (migración transparente, cadena de flags en `config/model.py`). Sin pérdida de funcionalidad: 66 tools, 19 prompts y 13 resources se conservan. 4574 tests.
 
 **v0.4.3** (2026-06-04) — Robustez de subagentes, contexto y personalización de agentes. **Contenido web/PDF ya no se confunde con el usuario:** al descargar un documento (web_fetch/PDF), el resultado se etiqueta como salida de herramienta para que el modelo no responda como si la conversación empezara de cero; un hint reactivo lo reorienta si recae. **Compactación a mitad de turno:** el "último mensaje del agente" que se re-muestra tras compactar ahora es el más reciente real (antes, con auto-continue, repetía un mensaje obsoleto de la 1.ª compactación). **Delegación consciente de agentes:** el LLM ve el rol de cada agente disponible (leído de su `IDENTITY.md`) en los schemas de orquestación y en el system prompt, así delega en el más afín (p.ej. web → `webcrawler`) en vez de hacerlo todo él. **Capa de personalización por-agente:** cada agente carga la sección `## Notas` de su `TOOLS.md`/`AGENTS.md` (usos de herramientas y delegación) — personalizable sin tocar código ni `SYSTEM_RULES`, y coste cero hasta que escribes en ella. **bash de subagentes en el proyecto correcto:** los subagentes ejecutan las tools en el `project_dir` del padre, no en su carpeta de identidad (`~/.oocode/workspace/<id>` con `~` sin expandir hacía fallar `bash`). **Alineación del TUI:** el `●` de texto de los subagentes ya se alinea bajo su columna `│`. *(También en 0.4.3:)* timeout de subagentes por inactividad/paso (no tiempo total); el TUI no pierde el último mensaje al compactar; VIM/Neovim 3.1 con streaming real; render de orquestación; `/kill` instantáneo que mata turno, subagentes y equipos. 4509 tests.
 

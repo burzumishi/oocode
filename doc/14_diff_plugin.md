@@ -4,7 +4,7 @@ Los diffs visuales, el índice de símbolos ctags y el linting automático son h
 
 ## Diff visual — hook `diff_after_write`
 
-Activo por defecto. Después de cada `edit_file`, `write_file` o `edit_files` — incluyendo las variantes MCP (`mcp_oocode_assistant_write_file`, etc.) — el hook `diff_after_write` renderiza el diff con colores al estilo Claude Code directamente en el terminal.
+Activo por defecto. Después de cada `edit_file`, `write_file` o `edit_files` — incluyendo las variantes MCP (`mcp_oocode_assistant_write_file`, etc.) — el hook `diff_after_write` renderiza el diff con colores directamente en el terminal.
 
 **Implementación:** `tools/diff_renderer.py` + `tools/hooks.py:_builtin_diff_after_write`
 

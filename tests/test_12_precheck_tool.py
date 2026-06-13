@@ -513,6 +513,47 @@ class TestBashAntipatternsNew:
         assert "lint_file" in warn or "lint_project" in warn
 
 
+class TestBashAntipatternsPipeAware:
+    """Los filtros de texto (grep/head/tail/wc/awk) consumiendo un PIPE son
+    legítimos: operan sobre la salida de otro comando, no sobre un fichero —
+    grep_code/read_file no pueden sustituirlos ahí. Avisar igualmente era un
+    falso positivo que ensuciaba el resultado de cada comando de compilación."""
+
+    def test_piped_grep_no_warning(self):
+        from tools.bash import _check_antipatterns
+        assert _check_antipatterns('sh autogen.sh 2>&1 | grep -E "error|Error"') == ""
+
+    def test_piped_tail_no_warning(self):
+        from tools.bash import _check_antipatterns
+        assert _check_antipatterns("make -j4 2>&1 | tail -30") == ""
+
+    def test_piped_head_and_grep_chain_no_warning(self):
+        from tools.bash import _check_antipatterns
+        assert _check_antipatterns('make 2>&1 | grep -E "err" | head -20') == ""
+
+    def test_piped_wc_no_warning(self):
+        from tools.bash import _check_antipatterns
+        assert _check_antipatterns("ls src | wc -l") == ""
+
+    def test_direct_grep_still_warns(self):
+        from tools.bash import _check_antipatterns
+        assert "grep_code" in _check_antipatterns('grep -E "foo" src/main.c')
+
+    def test_direct_tail_still_warns(self):
+        from tools.bash import _check_antipatterns
+        assert "read_file" in _check_antipatterns("tail -50 src/main.c")
+
+    def test_sed_i_in_pipe_still_prohibited(self):
+        """sed -i muta ficheros esté donde esté: el pipe no lo exime."""
+        from tools.bash import _check_antipatterns
+        assert "PROHIBIDO" in _check_antipatterns("cat x.c | sed -i 's/a/b/' f.c")
+
+    def test_mixed_pipe_then_direct_warns(self):
+        """Si además del filtro de pipe hay un uso directo sobre fichero, avisa."""
+        from tools.bash import _check_antipatterns
+        assert "grep_code" in _check_antipatterns('make | grep -E err; grep -E foo file.c')
+
+
 # ── _detect_tasks ────────────────────────────────────────────────────────────
 
 class TestDetectTasks:
@@ -631,6 +672,58 @@ class TestOtherToolsPassThrough:
         )
         assert result is not None
         assert "read_file" in result or "leído" in result
+
+
+class TestPrecheckTolerantEdit:
+    """El precheck de edit_file usa el MISMO matcher tolerante que la tool
+    (find_unique_span): un old_string con espacios donde el fichero tiene tabs
+    (invisible en el output numerado de read_file) DEBE pasar el precheck — antes
+    el `not in` exacto bloqueaba la llamada y la tolerancia de v0.4.8 nunca corría
+    (causa real de la mayoría de PRE-EDIT FALLIDO en ficheros C con tabs)."""
+
+    def _file(self, tmp_path, content):
+        f = tmp_path / "update.c"
+        f.write_text(content)
+        return str(f)
+
+    def test_tabs_vs_spaces_passes_precheck(self, loop, tmp_path):
+        p = self._file(tmp_path, "void f (void)\n{\n\t  do_hint (d);\n\treturn;\n}\n")
+        loop._turn_read_paths.add(p)
+        # El modelo escribe espacios; el fichero tiene tabs de indentación
+        res = loop._precheck_tool_call("edit_file", {
+            "path": p,
+            "old_string": "    do_hint (d);\n  return;",
+            "new_string": "    do_hint (d, 1);\n  return;",
+        })
+        assert res is None, f"el match tolerante único debe pasar el precheck: {res}"
+
+    def test_ambiguous_returns_actionable_message(self, loop, tmp_path):
+        # Fichero con tabs (el exacto no casa) y DOS zonas idénticas al strip
+        p = self._file(tmp_path, "\tx = 1;\n}\n\tx = 1;\n}\n")
+        loop._turn_read_paths.add(p)
+        res = loop._precheck_tool_call("edit_file", {
+            "path": p, "old_string": "  x = 1;\n}", "new_string": "  x = 2;\n}",
+        })
+        assert res is not None and "AMBIGUO" in res
+        assert "contexto" in res
+
+    def test_truly_missing_suggests_similar_lines(self, loop, tmp_path):
+        p = self._file(tmp_path, "int valor_total = 10;\nint otra_cosa = 2;\n")
+        loop._turn_read_paths.add(p)
+        res = loop._precheck_tool_call("edit_file", {
+            "path": p, "old_string": "int valor_totals = 99;", "new_string": "x",
+        })
+        assert res is not None and "PRE-EDIT FALLIDO" in res
+        # Sugerencia por similitud real (no substring): encuentra valor_total
+        assert "valor_total" in res
+
+    def test_exact_match_still_passes(self, loop, tmp_path):
+        p = self._file(tmp_path, "a\nb\nc\n")
+        loop._turn_read_paths.add(p)
+        res = loop._precheck_tool_call("edit_file", {
+            "path": p, "old_string": "b\n", "new_string": "B\n",
+        })
+        assert res is None
 
 
 class TestIsCompletionReport:

@@ -2,7 +2,7 @@
 
 ## Contexto de conversación
 
-El contexto es el historial de mensajes que se envía al LLM en cada turno. Está limitado por la ventana de contexto del modelo (`context.maxTokens`).
+El contexto es el historial de mensajes que se envía al LLM en cada turno. Está limitado por la ventana de contexto del modelo, configurada por-modelo en `models.configs.<modelo>.contextWindow` (no existe ninguna clave `context.maxTokens`: el valor se deriva de la config del modelo activo vía `effective_context_window`).
 
 ### Estructura de un mensaje
 
@@ -17,7 +17,7 @@ El sistema prompt (rol `system`) se reconstruye en cada turno y contiene:
 - Contexto del workspace (OOCODE.md, memoria diaria)
 - Memorias semánticas relevantes
 - Inyecciones de plugins activos
-- Instrucciones de razonamiento (`/think`)
+- Instrucciones de razonamiento (`/think`). Con el pensamiento activado, el razonamiento del modelo (`<think>`) se **muestra como narración** atenuada (💭) en la conversación (v0.4.8); con `off` (default) no se emite nada y es coste cero.
 
 ### Estimación de tokens
 
@@ -33,12 +33,12 @@ OOCode estima los tokens por tipo de mensaje para mayor precisión, sin depender
 
 ## Compactación automática
 
-Cuando el contexto supera `compactThreshold` × `maxTokens` (defecto: **80%**), se activa la compactación automática:
+Cuando el contexto supera `compactThreshold` × ventana de contexto del modelo (`contextWindow`, defecto: **80%**), se activa la compactación automática:
 
 1. Se conservan los últimos `minKeep` mensajes (defecto: 6)
 2. **min_keep adaptativo (A):** si hay un plan activo, `minKeep` se eleva automáticamente para incluir todos los mensajes desde que se activó la tarea actual (+2 de margen), garantizando que el LLM nunca pierde visibilidad del trabajo en curso
 3. El punto de corte se alinea hacia atrás en hasta **12 mensajes** para coincidir con una frontera `user` (evita partir pares tool-call/result)
-4. **Segunda pasada con ventana de recencia (B):** si el contexto sigue por encima del 70% (`highWater`) tras el corte, trunca los tool results largos conservando los 4 más recientes intactos
+4. **Segunda pasada hacia el objetivo (B, v0.4.5):** tras el corte, si el contexto sigue por encima de `compactTarget` (defecto **0.50**), trunca los tool results largos conservados — primero todos salvo los **2 más recientes**; si aún sigue por encima del objetivo (p. ej. esas 2 son ficheros enormes), trunca también todas salvo la última. Esto evita que con ficheros grandes recientes el contexto se quede al 50–70% justo tras compactar (cerca de volver a compactar). *(Antes se gateaba en `highWater` (0.70) y protegía las 4 más recientes, lo que dejaba poco headroom con modelos de contexto grande.)*
 5. El primer mensaje del usuario de los eliminados se ancla en el resumen como `**Tarea original:** …`
 6. **Serialización por turnos (F):** los mensajes eliminados se serializan en bloques `[Turno N] Usuario: … Asistente: … → [tools] ↳ tool: preview` antes de pasarse al LLM — mejor estructura causa-efecto para el resumen
 7. El resumen se guarda en `context.summary` y se inyecta como **mensaje `system` separado (D)** — mejor salience en Qwen/DeepSeek que concatenado en las SYSTEM_RULES

@@ -1,0 +1,43 @@
+{
+  "api": {
+    "type": "ollama",
+    "host": "http://localhost:11434"
+  },
+  "agents": {
+    "defaults": {
+      "model": "qwen3.5:4b"
+    }
+  },
+  "models": {
+    "systemOverhead": 4000,
+    "configs": {
+      "qwen3.5:4b": {
+        "contextWindow": 131072,
+        "maxTokens": 16384,
+        "timeoutSeconds": 600,
+        "params": {
+          "num_ctx": 131072,
+          "num_predict": 16384,
+          "temperature": 0.5,
+          "top_k": 20,
+          "top_p": 0.95
+        },
+        "input": ["text", "image"],
+        "thinking": {
+          "think_level": "off",
+          "reasoning": false
+        }
+      }
+    }
+  },
+  "context": {
+    "minKeep": 9,
+    "maxToolResultTokens": 8000,
+    "autoContinueMax": 16,
+    "compactThreshold": 0.82,
+    "compactTarget": 0.50
+  },
+  "fallback": {
+    "enabled": false
+  }
+}

@@ -28,6 +28,13 @@ Cambia el modo de contexto del workspace inyectado en el system prompt:
 
 `OOCODE.md` (instrucciones del proyecto) se carga aparte y siempre. Ver doc 16.
 
+### `/plan [on|off]`
+Plan-mode. Con `on`, antes de ejecutar un plan el agente lo **presenta y espera tu aprobación** (Aprobar y ejecutar / Editar el plan / Cancelar) — usa la tool `ask_user` por debajo. Sin args muestra el estado. Default `off` (config `context.planApproval`). Funciona en TUI y WebUI.
+
+- **Aprobar** → ejecuta el plan tal cual.
+- **Editar** → no lo crea; escribe los cambios y el agente replantea.
+- **Cancelar** → no lo crea; el agente te pregunta cómo proceder.
+
 ### `/compact [fast]`
 Compacta el historial cuando supera el umbral de contexto:
 - Sin `fast`: usa el LLM para generar un resumen de los mensajes eliminados

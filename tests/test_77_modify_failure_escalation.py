@@ -110,6 +110,76 @@ def test_cross_tool_loop_escalates(tmp_path):
     assert "STOP" in m3
 
 
+# ── Fix 2026-06: steer hacia tools robustas + detección de fallos de smart_replace/edit_files ──
+
+def test_third_failure_suggests_ask_user(tmp_path):
+    """GAP 3: en la parada en seco (3.er fallo), la guía sugiere ask_user para que el
+    usuario decida, en vez de solo 'explica el bloqueo'."""
+    f = tmp_path / "x.c"; f.write_text("int x;\n")
+    loop = _bare_loop()
+    for _ in range(2):
+        loop._modify_failure_guidance(str(f))
+    msg = loop._modify_failure_guidance(str(f))   # 3.º
+    assert "STOP" in msg
+    assert "ask_user" in msg
+
+
+def test_first_failure_suggests_robust_tools(tmp_path):
+    """1.er fallo: la guía debe empujar a smart_replace/regex_replace (toleran espacios) y
+    a context_before_edit, no solo a reintentar edit_file exacto."""
+    f = tmp_path / "db.c"; f.write_text("int x;\n")
+    loop = _bare_loop()
+    msg = loop._modify_failure_guidance(str(f))
+    assert "smart_replace" in msg
+    assert "regex_replace" in msg
+    assert "context_before_edit" in msg
+    assert "NO reintentes el mismo edit_file" in msg
+
+
+def test_second_failure_suggests_alternatives_when_no_snippet():
+    """2.º fallo sin snippet (fichero inexistente) → sugiere context_before_edit/smart_replace."""
+    loop = _bare_loop()
+    p = "/nonexistent/path/foo.c"
+    loop._modify_failure_guidance(p)        # 1.º
+    msg = loop._modify_failure_guidance(p)  # 2.º
+    assert "context_before_edit" in msg or "smart_replace" in msg
+
+
+def _postproc_loop():
+    """Loop mínimo para ejercitar _postprocess_tool_result en las ramas de edición."""
+    from agent.loop import AgentLoop
+    loop = AgentLoop.__new__(AgentLoop)
+    loop._failed_modify_by_path = {}
+    loop._failed_edit_streak = 0
+    loop._failed_edit_patterns = []
+    loop._empty_search_streak = 0
+    loop._empty_search_patterns = []
+    loop._last_tool_calls = []
+    return loop
+
+
+def test_smart_replace_no_match_triggers_guidance(tmp_path):
+    f = tmp_path / "act.c"; f.write_text("void f(void) {}\n")
+    loop = _postproc_loop()
+    res = f"⚠ smart_replace: patrón 'xyz' NO encontrado en '{f.name}' (1 líneas)."
+    out = loop._postprocess_tool_result("smart_replace", {"path": str(f), "pattern": "xyz"}, res)
+    assert "fallo al modificar" in out
+    assert "smart_replace" in out      # la guía propone alternativas robustas
+    assert loop._failed_modify_by_path[str(f)] == 1
+
+
+def test_edit_files_validation_failure_triggers_guidance(tmp_path):
+    f = tmp_path / "Makefile.am"; f.write_text("bin_PROGRAMS = myapp\n")
+    loop = _postproc_loop()
+    res = (f"Validación fallida — no se escribió ningún fichero:\n"
+           f"Edición 1 ({f}): cadena no encontrada.")
+    out = loop._postprocess_tool_result(
+        "edit_files", {"edits": [{"path": str(f), "old_string": "zzz"}]}, res)
+    assert "ATÓMICO" in out                       # explica por qué falló todo el lote
+    assert "UNA EN UNA" in out or "smart_replace" in out
+    assert loop._failed_modify_by_path[str(f)] == 1
+
+
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-v"]))

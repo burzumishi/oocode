@@ -169,6 +169,45 @@ class TestAgentsDescrInSchema:
         assert runner._agents_descr() is first  # mismo objeto cacheado
 
 
+class TestSubagentSystemPrompt:
+    """El subagente recibe SYSTEM_RULES completo (mismas correcciones que el principal)
+    + una sección que le dice que NO salude (es un trabajador interno)."""
+
+    def _prompt_loop(self, is_subagent):
+        loop = _make_loop()
+        loop.is_subagent = is_subagent
+        loop._sys_prompt_cache = None
+        loop._turn_mem_snippet = ""
+        loop._turn_rag_snippet = ""
+        loop._workspace_rag = None
+        loop._extra_rules = ""
+        loop._plan_tasks = []
+        loop.plugins = None
+        loop.ws = MagicMock()
+        loop.ws.load_mini_context.return_value = ""
+        loop.ws.load_full_context.return_value = ""
+        loop.rt.ctx_mode = "mini"
+        loop.rt.extra_dirs = []
+        loop.rt.think_injection.return_value = ""
+        loop.config.agents = []
+        return loop
+
+    def test_subagent_gets_no_greeting_section(self):
+        prompt = self._prompt_loop(is_subagent=True)._system_prompt()
+        assert "SUBAGENTE" in prompt
+        assert "NO saludes" in prompt
+
+    def test_main_agent_has_no_subagent_section(self):
+        prompt = self._prompt_loop(is_subagent=False)._system_prompt()
+        assert "Eres un SUBAGENTE" not in prompt
+
+    def test_subagent_still_gets_full_system_rules(self):
+        """El subagente NO pierde las reglas/correcciones del principal (Comunicación,
+        edición segura, etc.) — recibe el mismo SYSTEM_RULES."""
+        prompt = self._prompt_loop(is_subagent=True)._system_prompt()
+        assert "Comunicación" in prompt and "Edición segura" in prompt
+
+
 class TestAgentsSectionInSystemPrompt:
     def test_section_built_with_multiple_agents(self, tmp_path):
         """La sección 'Agentes disponibles para delegar' lista id+rol con >1 agente."""

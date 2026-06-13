@@ -53,6 +53,7 @@ def _ensure_session_entry(sid: str, agent_id: str) -> "queue.Queue":
             "queue":       q,
             "thread":      None,
             "history":     [],
+            "pending_queue": [],   # FIFO de entradas recibidas con el agente ocupado
             "lock":        threading.Lock(),
             "created_at":  time.time(),
             "last_active": time.time(),
@@ -168,7 +169,8 @@ def _create_loop_for_webui(agent_id: str, out_queue: queue.Queue):
     session_mgr.start(cfg.model or "", project_dir)
 
     from agent.runtime import RuntimeSettings
-    runtime = RuntimeSettings(ctx_mode=getattr(cfg, "ctx_mode", "mini"))
+    runtime = RuntimeSettings(ctx_mode=getattr(cfg, "ctx_mode", "mini"),
+                              plan_approval=bool(getattr(cfg, "plan_approval", False)))
 
     loop = AgentLoop(
         config=cfg,
@@ -182,6 +184,29 @@ def _create_loop_for_webui(agent_id: str, out_queue: queue.Queue):
         capture_output=False,
     )
     loop._webui_queue = out_queue
+    # GAP 4 — confirmación de permisos en el navegador (opt-in + guarda de cliente).
+    # Nº de streams SSE conectados (lo actualiza api_chat_stream). El _ask_fn solo pregunta
+    # si webui.permissionPrompt está ON y hay navegador conectado; si no, auto-aprueba
+    # (preserva el comportamiento headless de VIM/send_sync/pestaña cerrada — no se cuelga).
+    loop._webui_sse_clients = 0
+    loop._webui_perm_event = None
+    loop._webui_perm_answer = None
+
+    def _webui_ask_fn(tool: str, description: str) -> str:
+        if not getattr(loop.config, "webui_permission_prompt", False):
+            return "s"   # config off → comportamiento actual: auto-aprobar
+        if getattr(loop, "_webui_sse_clients", 0) <= 0:
+            return "s"   # sin navegador conectado → auto-aprobar (headless seguro)
+        import threading as _th
+        ev = _th.Event()
+        loop._webui_perm_event = ev
+        loop._webui_perm_answer = None
+        loop._webui_emit({"type": "permission", "tool": tool, "description": description})
+        if not ev.wait(timeout=180) or loop._kill_requested:
+            return "n"   # timeout o /kill → denegar por seguridad (igual que el TUI)
+        return loop._webui_perm_answer or "n"
+
+    permissions._ask_fn = _webui_ask_fn
     # Usar _status_cb para SSE en lugar del Rich Live REPL (requiere TTY interactiva)
     loop._status_cb = lambda _status: None
     # Propagar cola al SubAgentRunner para que los subagentes emitan al SSE del browser

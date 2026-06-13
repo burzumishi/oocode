@@ -54,7 +54,8 @@ class TestDefaultConfig(unittest.TestCase):
     def test_mcp_section_keys(self):
         mcp = self._dc()["mcp"]
         for key in ("servers", "requestTimeout", "oocodeAssistant",
-                    "systemAssistant", "homeOfficeAssistant",
+                    "systemAssistant", "wordAssistant", "excelAssistant",
+                    "pptxAssistant", "mailAssistant", "cmdbAssistant",
                     "securityAssistant", "iotAssistant"):
             self.assertIn(key, mcp, f"mcp.{key} missing")
 
@@ -120,7 +121,11 @@ class TestOOConfigDefaults(unittest.TestCase):
         cfg = self._cfg()
         self.assertTrue(cfg.mcp_oocode_assistant_enabled)
         self.assertTrue(cfg.mcp_system_assistant_enabled)
-        self.assertFalse(cfg.mcp_home_office_assistant_enabled)
+        self.assertFalse(cfg.mcp_word_assistant_enabled)
+        self.assertFalse(cfg.mcp_excel_assistant_enabled)
+        self.assertFalse(cfg.mcp_pptx_assistant_enabled)
+        self.assertFalse(cfg.mcp_mail_assistant_enabled)
+        self.assertFalse(cfg.mcp_cmdb_assistant_enabled)
         self.assertFalse(cfg.mcp_security_assistant_enabled)
         self.assertFalse(cfg.mcp_iot_assistant_enabled)
 
@@ -243,6 +248,46 @@ class TestOOConfigLoad(unittest.TestCase):
         cfg = self._load_from(model_cfg)
         self.assertIn("mymodel:7b", cfg.model_configs)
         self.assertEqual(cfg.model_configs["mymodel:7b"]["contextWindow"], 32768)
+
+
+class TestModelKeyResolver(unittest.TestCase):
+    """El match de models.configs ignora prefijo de registry y ':latest' para que
+    p.ej. 'batiai/qwen3.5-9b:latest' use una entrada 'qwen3.5-9b'."""
+
+    def _cfg(self, configs):
+        from config import OOConfig
+        cfg = OOConfig()
+        cfg.model_configs = configs
+        return cfg
+
+    def test_exact_match_preferred(self):
+        cfg = self._cfg({"batiai/qwen3.5-9b:latest": {"contextWindow": 1}, "qwen3.5-9b": {"contextWindow": 2}})
+        self.assertEqual(cfg._resolve_model_key("batiai/qwen3.5-9b:latest"), "batiai/qwen3.5-9b:latest")
+
+    def test_registry_prefix_and_latest_stripped(self):
+        cfg = self._cfg({"qwen3.5-9b": {"thinking": {"think_level": "low", "reasoning": True}}})
+        self.assertEqual(cfg._resolve_model_key("batiai/qwen3.5-9b:latest"), "qwen3.5-9b")
+        self.assertEqual(cfg.get_model_thinking("batiai/qwen3.5-9b:latest"), ("low", True))
+
+    def test_active_model_config_resolves(self):
+        cfg = self._cfg({"qwen3.5-9b": {"contextWindow": 131072}})
+        cfg.model = "batiai/qwen3.5-9b:latest"
+        self.assertEqual(cfg.active_model_config.get("contextWindow"), 131072)
+
+    def test_no_match_returns_off(self):
+        cfg = self._cfg({"qwen3.5:9b": {"thinking": {"think_level": "high"}}})
+        # ':9b' es tag de tamaño (no se normaliza) → 'qwen3.5-9b' NO casa con 'qwen3.5:9b'
+        self.assertEqual(cfg.get_model_thinking("batiai/qwen3.5-9b:latest"), ("off", False))
+
+    def test_save_thinking_uses_resolved_key(self):
+        from unittest.mock import patch
+        from config import OOConfig
+        cfg = self._cfg({"qwen3.5-9b": {"contextWindow": 100}})
+        with patch.object(OOConfig, "save", lambda self: None):
+            cfg.save_model_thinking("batiai/qwen3.5-9b:latest", "medium", True)
+        # No crea entrada duplicada; actualiza la existente
+        self.assertNotIn("batiai/qwen3.5-9b:latest", cfg.model_configs)
+        self.assertEqual(cfg.model_configs["qwen3.5-9b"]["thinking"]["think_level"], "medium")
 
 
 class TestEffectiveMaxContextTokens(unittest.TestCase):

@@ -84,6 +84,7 @@ def _make_mock_session(sid: str, history=None) -> dict:
         "queue":       queue.Queue(maxsize=500),
         "thread":      None,
         "history":     history or [],
+        "pending_queue": [],
         "lock":        threading.Lock(),
         "created_at":  time.time(),
         "last_active": time.time(),
@@ -99,6 +100,17 @@ class TestConfigHelpers:
     def test_load_config_missing_returns_defaults(self):
         cfg = load_config()
         assert isinstance(cfg, dict)
+
+    def test_permission_prompt_default_off(self, tmp_path, monkeypatch):
+        # El DEFAULT es off, y una config recién cargada SIN fichero del usuario
+        # debe reflejarlo. (Antes este test cargaba ~/.oocode/oocode.json real, así
+        # que fallaba si el usuario había activado webui.permissionPrompt.)
+        from config import DEFAULT_CONFIG, OOConfig
+        assert DEFAULT_CONFIG["webui"].get("permissionPrompt") is False
+        monkeypatch.setattr("config.CONFIG_DIR", tmp_path)
+        monkeypatch.setattr("config.CONFIG_FILE", tmp_path / "oocode.json")
+        monkeypatch.setattr("config.MEMORY_DIR", tmp_path / "memory")
+        assert OOConfig.load().webui_permission_prompt is False
 
     def test_save_and_reload_config(self):
         original = {"model": "test-model", "ollama_host": "http://localhost:11434"}
@@ -740,7 +752,9 @@ class TestApiChatSend:
                         content_type="application/json")
         assert r.status_code == 503
 
-    def test_send_busy_returns_409(self, client):
+    def test_send_busy_message_is_queued(self, client):
+        """Con el agente ocupado, un mensaje normal NO se rechaza (antes 409): se ENCOLA
+        FIFO y se procesa al terminar el turno (paridad con el TUI)."""
         with client.session_transaction() as sc:
             sc["webui_sid"] = "busy-sid"
         sess = _make_mock_session("busy-sid")
@@ -752,7 +766,136 @@ class TestApiChatSend:
         r = client.post("/api/chat/send",
                         data=json.dumps({"message": "hello", "agent_id": "main"}),
                         content_type="application/json")
-        assert r.status_code == 409
+        assert r.status_code == 200
+        d = r.get_json()
+        assert d.get("queued") is True
+        assert sess["pending_queue"] == [
+            {"message": "hello", "images": [], "is_slash": False}
+        ]
+
+    def test_send_busy_mutator_slash_is_queued(self, client):
+        """Slash MUTADOR (/compact) con el agente ocupado → se encola, no se ejecuta."""
+        with client.session_transaction() as sc:
+            sc["webui_sid"] = "busy-sid2"
+        sess = _make_mock_session("busy-sid2")
+        mock_thread = MagicMock()
+        mock_thread.is_alive.return_value = True
+        sess["thread"] = mock_thread
+        with _SESSIONS_LOCK:
+            _WEBUI_SESSIONS["busy-sid2"] = sess
+        r = client.post("/api/chat/send",
+                        data=json.dumps({"message": "/compact", "agent_id": "main"}),
+                        content_type="application/json")
+        assert r.status_code == 200
+        assert r.get_json().get("queued") is True
+        assert sess["pending_queue"][0]["message"] == "/compact"
+        assert sess["pending_queue"][0]["is_slash"] is True
+
+    def test_drain_processes_message_and_slash_fifo(self):
+        """_drain_webui_queue ejecuta la cola FIFO tras el turno: el mensaje vía
+        run_for_webui, el slash mutador vía _handle_webui_slash(force=True)."""
+        from webui.api_chat import _drain_webui_queue
+        sess = _make_mock_session("drain-sid")
+        sess["pending_queue"] = [
+            {"message": "sigue la tarea", "images": [], "is_slash": False},
+            {"message": "/compact", "images": [], "is_slash": True},
+        ]
+        _drain_webui_queue(sess)
+        # El mensaje se ejecutó como turno
+        sess["loop"].run_for_webui.assert_called_once_with("sigue la tarea", images=None)
+        # El slash mutador se ejecutó (force=True → compactó el contexto)
+        sess["loop"].context.compact.assert_called_once()
+        assert sess["pending_queue"] == []
+
+    def test_kill_discards_pending_queue(self, client):
+        """/api/chat/kill vacía la cola de entradas pendientes (paridad con /kill TUI)."""
+        with client.session_transaction() as sc:
+            sc["webui_sid"] = "kill-q-sid"
+        sess = _make_mock_session("kill-q-sid")
+        sess["pending_queue"] = [{"message": "x", "images": [], "is_slash": False}]
+        sess["loop"].request_kill.return_value = {"subagents": 0}
+        sess["loop"].kill_all_extras.return_value = {"jobs": 0, "wip": 0}
+        with _SESSIONS_LOCK:
+            _WEBUI_SESSIONS["kill-q-sid"] = sess
+        r = client.post("/api/chat/kill")
+        assert r.status_code == 200
+        assert r.get_json().get("queued_discarded") == 1
+        assert sess["pending_queue"] == []
+
+    def test_permission_endpoint_sets_event(self, client):
+        """/api/chat/permission deja la elección en loop._webui_perm_answer y dispara el
+        evento donde espera el _ask_fn (GAP 4)."""
+        import threading as _th
+        with client.session_transaction() as sc:
+            sc["webui_sid"] = "perm-sid"
+        sess = _make_mock_session("perm-sid")
+        ev = _th.Event()
+        sess["loop"]._webui_perm_event = ev
+        sess["loop"]._webui_perm_answer = None
+        with _SESSIONS_LOCK:
+            _WEBUI_SESSIONS["perm-sid"] = sess
+        r = client.post("/api/chat/permission",
+                        data=json.dumps({"choice": "siempre"}),
+                        content_type="application/json")
+        assert r.status_code == 200 and r.get_json().get("ok") is True
+        assert ev.is_set() and sess["loop"]._webui_perm_answer == "siempre"
+
+    def test_permission_endpoint_normalizes_bad_choice(self, client):
+        with client.session_transaction() as sc:
+            sc["webui_sid"] = "perm-sid2"
+        sess = _make_mock_session("perm-sid2")
+        import threading as _th
+        sess["loop"]._webui_perm_event = _th.Event()
+        with _SESSIONS_LOCK:
+            _WEBUI_SESSIONS["perm-sid2"] = sess
+        client.post("/api/chat/permission", data=json.dumps({"choice": "lol"}),
+                    content_type="application/json")
+        assert sess["loop"]._webui_perm_answer == "n"   # default seguro
+
+    def test_plan_slash_toggles_plan_approval(self, client):
+        """El slash /plan en WebUI activa/desactiva rt.plan_approval (paridad con TUI)."""
+        from webui.api_chat import _handle_webui_slash
+        sess = _make_mock_session("plan-sid")
+        sess["loop"].rt = MagicMock(); sess["loop"].rt.plan_approval = False
+        r1 = _handle_webui_slash("/plan on", sess)
+        assert sess["loop"].rt.plan_approval is True and "ON" in r1
+        r2 = _handle_webui_slash("/plan off", sess)
+        assert sess["loop"].rt.plan_approval is False and "OFF" in r2
+
+    def test_answer_sets_question_event_multi(self, client):
+        """/api/chat/answer deja la LISTA de respuestas en loop._webui_question_answer y
+        dispara el evento donde espera _ask_user_webui (multi-pregunta)."""
+        import threading as _th
+        with client.session_transaction() as sc:
+            sc["webui_sid"] = "ans-sid"
+        sess = _make_mock_session("ans-sid")
+        ev = _th.Event()
+        sess["loop"]._webui_question_event = ev
+        sess["loop"]._webui_question_answer = None
+        with _SESSIONS_LOCK:
+            _WEBUI_SESSIONS["ans-sid"] = sess
+        r = client.post("/api/chat/answer",
+                        data=json.dumps({"answers": [
+                            {"selection": [1], "free_text": ""},
+                            {"selection": [], "free_text": "ojo"}]}),
+                        content_type="application/json")
+        assert r.status_code == 200 and r.get_json().get("ok") is True
+        assert ev.is_set()
+        assert sess["loop"]._webui_question_answer == [
+            {"selection": [1], "free_text": ""}, {"selection": [], "free_text": "ojo"}]
+
+    def test_answer_backcompat_single(self, client):
+        """Retrocompat: /api/chat/answer acepta {selection, free_text} suelto → lista de 1."""
+        with client.session_transaction() as sc:
+            sc["webui_sid"] = "ans-sid-bc"
+        sess = _make_mock_session("ans-sid-bc")
+        import threading as _th
+        sess["loop"]._webui_question_event = _th.Event()
+        with _SESSIONS_LOCK:
+            _WEBUI_SESSIONS["ans-sid-bc"] = sess
+        client.post("/api/chat/answer", data=json.dumps({"selection": [0], "free_text": ""}),
+                    content_type="application/json")
+        assert sess["loop"]._webui_question_answer == [{"selection": [0], "free_text": ""}]
 
     def test_send_slash_command_new(self, client):
         with client.session_transaction() as sc:

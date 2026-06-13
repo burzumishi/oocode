@@ -88,7 +88,11 @@ def api_config_get():
         "mcp_system_assistant_enabled":     cfg.mcp_system_assistant_enabled,
         "mcp_devops_assistant_enabled":     cfg.mcp_devops_assistant_enabled,
         "mcp_database_assistant_enabled":   cfg.mcp_database_assistant_enabled,
-        "mcp_home_office_assistant_enabled": cfg.mcp_home_office_assistant_enabled,
+        "mcp_word_assistant_enabled":       cfg.mcp_word_assistant_enabled,
+        "mcp_excel_assistant_enabled":      cfg.mcp_excel_assistant_enabled,
+        "mcp_pptx_assistant_enabled":       cfg.mcp_pptx_assistant_enabled,
+        "mcp_mail_assistant_enabled":       cfg.mcp_mail_assistant_enabled,
+        "mcp_cmdb_assistant_enabled":       cfg.mcp_cmdb_assistant_enabled,
         "mcp_security_assistant_enabled":   cfg.mcp_security_assistant_enabled,
         "mcp_iot_assistant_enabled":        cfg.mcp_iot_assistant_enabled,
         "mcp_http_client_assistant_enabled": cfg.mcp_http_client_assistant_enabled,
@@ -255,7 +259,11 @@ def api_config_save():
     _bool("mcp_system_assistant_enabled",     "mcp_system_assistant_enabled")
     _bool("mcp_devops_assistant_enabled",     "mcp_devops_assistant_enabled")
     _bool("mcp_database_assistant_enabled",   "mcp_database_assistant_enabled")
-    _bool("mcp_home_office_assistant_enabled", "mcp_home_office_assistant_enabled")
+    _bool("mcp_word_assistant_enabled",       "mcp_word_assistant_enabled")
+    _bool("mcp_excel_assistant_enabled",      "mcp_excel_assistant_enabled")
+    _bool("mcp_pptx_assistant_enabled",       "mcp_pptx_assistant_enabled")
+    _bool("mcp_mail_assistant_enabled",       "mcp_mail_assistant_enabled")
+    _bool("mcp_cmdb_assistant_enabled",       "mcp_cmdb_assistant_enabled")
     _bool("mcp_security_assistant_enabled",   "mcp_security_assistant_enabled")
     _bool("mcp_iot_assistant_enabled",        "mcp_iot_assistant_enabled")
     _bool("mcp_http_client_assistant_enabled", "mcp_http_client_assistant_enabled")

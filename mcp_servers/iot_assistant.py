@@ -1502,7 +1502,7 @@ _TOOLS = [
                 "name":   {"type": "string",  "description": "Nombre del dispositivo"},
                 "action": {"type": "string",  "description": "on / off / toggle / set"},
                 "dp":     {"type": "integer", "description": "Data Point (1=on/off por defecto)"},
-                "value":  {"description":    "Valor para action=set (boolean, int o string)"},
+                "value":  {"type": ["boolean", "integer", "string"], "description":    "Valor para action=set (boolean, int o string)"},
             },
             "required": ["name", "action"],
         },
@@ -1564,7 +1564,7 @@ _TOOLS = [
             "type": "object",
             "properties": {
                 "topic":   {"type": "string",  "description": "Topic MQTT (ej. zigbee2mqtt/luz_salon/set)"},
-                "payload": {"description":     "Contenido del mensaje (string o objeto JSON)"},
+                "payload": {"type": ["string", "object"], "description":     "Contenido del mensaje (string o objeto JSON)"},
                 "qos":     {"type": "integer", "description": "QoS 0/1/2 (default 0)"},
                 "retain":  {"type": "boolean", "description": "Marcar como retenido (default false)"},
             },

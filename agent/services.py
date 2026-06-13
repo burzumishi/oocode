@@ -19,7 +19,7 @@ from agent.embeddings import EmbeddingClient
 from agent.memory import MemorySystem
 
 
-# Los 8 servidores MCP bundled: (atributo del flag en config, nombre, fichero).
+# Los 12 servidores MCP bundled: (atributo del flag en config, nombre, fichero).
 # Orden = orden de arranque. ÚNICA fuente de verdad — la usan el bootstrap del TUI
 # (oocode.py) y el del WebUI (webui/sessions.py). Antes cada ruta duplicaba la lista
 # y derivaron: el WebUI se quedó sin devops/database/http-client (devops-assistant
@@ -29,7 +29,11 @@ _BUNDLED_MCP = (
     ("mcp_system_assistant_enabled",      "system-assistant",        "system_assistant.py"),
     ("mcp_devops_assistant_enabled",      "devops-assistant",        "devops_assistant.py"),
     ("mcp_database_assistant_enabled",    "database-assistant",      "database_assistant.py"),
-    ("mcp_home_office_assistant_enabled", "home-office-assistant",   "home_office_assistant.py"),
+    ("mcp_word_assistant_enabled",        "word-assistant",          "word_assistant.py"),
+    ("mcp_excel_assistant_enabled",       "excel-assistant",         "excel_assistant.py"),
+    ("mcp_pptx_assistant_enabled",        "pptx-assistant",          "pptx_assistant.py"),
+    ("mcp_mail_assistant_enabled",        "mail-assistant",          "mail_assistant.py"),
+    ("mcp_cmdb_assistant_enabled",        "cmdb-assistant",          "cmdb_assistant.py"),
     ("mcp_security_assistant_enabled",    "security-assistant",      "security_assistant.py"),
     ("mcp_iot_assistant_enabled",         "iot-assistant",           "iot_assistant.py"),
     ("mcp_http_client_assistant_enabled", "http-client-assistant",   "http_client_assistant.py"),
@@ -71,6 +75,7 @@ def build_workspace_manager(config) -> WorkspaceManager:
         permissions=config.permissions,
         max_memory_lines=config.ws_max_memory_lines,
         max_daily_chars=config.ws_max_daily_chars,
+        memory_full_max_chars=config.ws_memory_full_max_chars,
     )
 
 

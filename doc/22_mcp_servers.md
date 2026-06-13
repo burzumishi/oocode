@@ -1,6 +1,6 @@
 # 22 — Servidores MCP
 
-OOCode incluye 7 servidores MCP bundled que se ejecutan como procesos independientes y se comunican via stdio con JSON-RPC 2.0 (protocolo MCP 2024-11-05).
+OOCode incluye 12 servidores MCP bundled que se ejecutan como procesos independientes y se comunican via stdio con JSON-RPC 2.0 (protocolo MCP 2024-11-05).
 
 | Servidor | Tools | Por defecto |
 |----------|-------|-------------|
@@ -8,9 +8,14 @@ OOCode incluye 7 servidores MCP bundled que se ejecutan como procesos independie
 | `devops-assistant` | 66 | activo |
 | `system-assistant` | ~40 | activo |
 | `database-assistant` | 20 | desactivado |
-| `home-office-assistant` | 66 | desactivado |
+| `word-assistant` | 29 | desactivado |
+| `excel-assistant` | 16 | desactivado |
+| `pptx-assistant` | 7 | desactivado |
+| `mail-assistant` | 11 | desactivado |
+| `cmdb-assistant` | 3 | desactivado |
 | `security-assistant` | 24 | desactivado |
 | `iot-assistant` | 25 | desactivado |
+| `http-client-assistant` | 17 | desactivado |
 
 ## Activación
 
@@ -23,9 +28,14 @@ Cada servidor se activa con su flag en `~/.oocode/oocode.json`:
     "devopsAssistant":    { "enabled": true  },
     "systemAssistant":    { "enabled": true  },
     "databaseAssistant":  { "enabled": false },
-    "homeOfficeAssistant":{ "enabled": false },
+    "wordAssistant":      { "enabled": false },
+    "excelAssistant":     { "enabled": false },
+    "pptxAssistant":      { "enabled": false },
+    "mailAssistant":      { "enabled": false },
+    "cmdbAssistant":      { "enabled": false },
     "securityAssistant":  { "enabled": false },
     "iotAssistant":       { "enabled": false },
+    "httpClientAssistant":{ "enabled": false },
     "requestTimeout": 30.0
   }
 }
@@ -343,17 +353,25 @@ El servidor expone recursos estáticos como referencia contextual para el LLM.
 
 ---
 
-## 5. home-office-assistant
+## 5. word-assistant
 
-**Fichero:** `mcp_servers/home_office_assistant.py`  
-**Flag:** `homeOfficeAssistant.enabled` (desactivado por defecto)  
-**Descripción:** 66 herramientas para documentación corporativa O365 **nativa**, email, calendario, notas, OCR, CMDB. Genera solo contenido O365 nativo (sin conversión markdown→documento ni gráficas PNG matplotlib).
+**Fichero:** `mcp_servers/word_assistant.py`  
+**Flag:** `wordAssistant.enabled` (desactivado por defecto)  
+**Descripción:** 29 herramientas para documentos Word (.docx) O365 **nativos** + núcleo
+ofimático transversal: la tool unificada `doc_create` (genera .docx/.xlsx/.pptx según
+extensión), gráficas OOXML, plantillas docxtpl, OCR, PDF, conversión y gestión de proyecto.
+Genera solo contenido O365 nativo (sin conversión markdown→documento ni gráficas PNG).
+
+> **Nota (v0.4.4):** `word-assistant`, `excel-assistant` (5b) y `pptx-assistant` (5c)
+> nacen de la subdivisión por formato del antiguo `office-assistant`, que a su vez salió de
+> dividir `home-office-assistant` junto a `mail-assistant` (5d) y `cmdb-assistant` (5e).
+> word lee `~/.oocode/office.json` con fallback al legacy `~/.oocode/home_office.json`.
 
 **Requisito:** `pip install python-docx python-pptx openpyxl pillow docxtpl`
 
 ### Tools (categorías)
 
-**Documentos Word:**
+**Documentos Word + núcleo:**
 
 | Tool | Descripción |
 |------|-------------|
@@ -375,65 +393,12 @@ El servidor expone recursos estáticos como referencia contextual para el LLM.
 | `doc_project_save` | Guardar documento con gestión de versiones |
 | `doc_create_rfc` | Crear RFC técnico con estructura estándar |
 
-**Excel / CSV:**
-
-| Tool | Descripción |
-|------|-------------|
-| `xlsx_read` | Leer hoja de cálculo |
-| `xlsx_write` | Escribir datos en Excel |
-| `xlsx_insert_chart` | Insertar gráfico en Excel |
-| `xlsx_apply_conditional_format` | Formato condicional |
-| `csv_analyze` | Analizar fichero CSV |
-
-**Presentaciones PowerPoint:**
-
-| Tool | Descripción |
-|------|-------------|
-| `pptx_create` | Crear presentación PPTX |
-| `pptx_add_slide` | Añadir diapositiva |
-| `pptx_insert_chart` | Insertar gráfico en diapositiva |
-| `pptx_read` | Leer contenido de presentación |
-
-**Email:**
-
-| Tool | Descripción |
-|------|-------------|
-| `email_list` | Listar emails de la bandeja de entrada |
-| `email_read` | Leer un email |
-| `email_send` | Enviar email |
-| `email_search` | Buscar emails |
-
-**Calendario:**
-
-| Tool | Descripción |
-|------|-------------|
-| `cal_list` | Listar eventos del calendario |
-| `cal_add` | Añadir evento |
-| `cal_search` | Buscar eventos |
-
-**Notas:**
-
-| Tool | Descripción |
-|------|-------------|
-| `notes_list` | Listar notas |
-| `notes_search` | Buscar notas |
-| `notes_save` | Guardar nota |
-
 **OCR y procesamiento:**
 
 | Tool | Descripción |
 |------|-------------|
 | `image_to_text` | OCR: extraer texto de imagen |
 | `pdf_extract_text` | Extraer texto de PDF |
-
-**Contactos y CMDB:**
-
-| Tool | Descripción |
-|------|-------------|
-| `contact_search` | Buscar contacto |
-| `cmdb_search` | Buscar en CMDB (Configuration Management DB) |
-| `cmdb_update` | Actualizar registro CMDB |
-| `asset_register_add` | Añadir activo al registro |
 
 **Gestión de proyectos:**
 
@@ -442,14 +407,19 @@ El servidor expone recursos estáticos como referencia contextual para el LLM.
 | `project_context_read` | Leer contexto del proyecto Office |
 | `project_init_office` | Inicializar proyecto Office (estructura de carpetas) |
 
-### Prompts (4)
+### Prompts (13)
 
-| Nombre | Descripción |
-|--------|-------------|
-| `executive_summary` | Resumen ejecutivo de proyecto |
-| `business_case` | Business case con ROI y análisis |
-| `weekly_status` | Informe de estado semanal |
-| `meeting_minutes` | Acta de reunión |
+Incluye `executive_summary`, `business_case`, `project_status_report`, `weekly_report`,
+`datacenter_migration_report`, `rfc_change_request`, `server_migration_plan`,
+`it_incident_report`, `infrastructure_change_plan`, `summarize_document`,
+`create_technical_doc`, `generate_report_with_charts`, `create_word_document`.
+(Los prompts de Excel/PPT viven en sus respectivos servidores.)
+
+### Resources
+
+`office://templates_available`, `office://rfc_pending`, `office://project_context`,
+`office://style_gallery`, `office://style_presets`, `office://theme_colors`,
+`office://font_combinations`, `office://chart_types`.
 
 ### Content blocks para doc_create
 
@@ -475,6 +445,135 @@ Los documentos Word se crean con `content_blocks`, una lista de bloques estructu
   ]
 }
 ```
+
+---
+
+## 5b. excel-assistant
+
+**Fichero:** `mcp_servers/excel_assistant.py`  
+**Flag:** `excelAssistant.enabled` (desactivado por defecto)  
+**Descripción:** 16 herramientas para hojas de cálculo `.xlsx` nativas (openpyxl) y CSV.
+
+**Requisito:** `pip install openpyxl`
+
+### Tools
+
+| Tool | Descripción |
+|------|-------------|
+| `xlsx_read` | Leer celdas/rango de un .xlsx o CSV |
+| `xlsx_write` | Escribir una celda |
+| `xlsx_fill_range` | Escribir múltiples celdas a la vez |
+| `xlsx_append_row` | Añadir fila al final de una hoja |
+| `xlsx_create_report` | Crear informe Excel formateado con estilos |
+| `xlsx_create_table` | Crear tabla nativa con estilo O365 |
+| `xlsx_insert_chart` | Insertar gráfico (bar/line/pie/area/scatter) |
+| `xlsx_apply_conditional_format` | Formato condicional (color scale/data bar/icon set…) |
+| `apply_cell_formatting` | Formato avanzado de celdas (font/fill/border) |
+| `xlsx_freeze_panes` | Congelar filas/columnas |
+| `xlsx_set_column_width` | Ajustar ancho de columnas (auto) |
+| `xlsx_merge_cells` | Combinar celdas |
+| `xlsx_add_sheet` | Añadir hoja |
+| `xlsx_protect_sheet` | Proteger hoja con contraseña |
+| `xlsx_add_data_validation` | Validación de datos (lista/fecha/número) |
+| `csv_analyze` | Análisis de CSV: cabeceras, filas, estadísticas |
+
+### Prompts (3)
+
+`create_excel_report`, `create_dashboard`, `data_visualization`.
+
+---
+
+## 5c. pptx-assistant
+
+**Fichero:** `mcp_servers/pptx_assistant.py`  
+**Flag:** `pptxAssistant.enabled` (desactivado por defecto)  
+**Descripción:** 7 herramientas para presentaciones PowerPoint `.pptx` nativas (python-pptx).
+
+**Requisito:** `pip install python-pptx`
+
+### Tools
+
+| Tool | Descripción |
+|------|-------------|
+| `pptx_create` | Crear presentación PPTX (con slides) |
+| `pptx_create_from_template` | Crear desde plantilla .pptx/.potx |
+| `pptx_add_slide` | Añadir diapositiva |
+| `pptx_insert_chart` | Insertar gráfico en diapositiva |
+| `pptx_read` | Leer contenido de la presentación |
+| `pptx_add_notes` | Añadir notas del orador |
+| `pptx_set_background` | Fondo/tema de diapositiva |
+
+### Prompts (1)
+
+`create_presentation`.
+
+---
+
+## 5d. mail-assistant
+
+**Fichero:** `mcp_servers/mail_assistant.py`  
+**Flag:** `mailAssistant.enabled` (desactivado por defecto)  
+**Descripción:** 11 herramientas de comunicación y agenda (PIM): email IMAP/SMTP, calendario `.ics` local, notas markdown y contactos vCard.
+
+**Config:** `~/.oocode/mail.json` (fallback legacy `~/.oocode/home_office.json`):
+
+```json
+{
+  "email": {"imap_host": "imap.gmail.com", "imap_port": 993,
+            "smtp_host": "smtp.gmail.com", "smtp_port": 587,
+            "user": "tu@email.com", "password": "contraseña-de-aplicación"},
+  "notes_dir": "~/Documents/notes",
+  "calendar_file": "~/Documents/calendar.ics",
+  "contacts_dir": "~/Documents/contacts"
+}
+```
+
+### Tools
+
+| Tool | Descripción |
+|------|-------------|
+| `email_list` | Listar emails de la bandeja de entrada (IMAP) |
+| `email_read` | Leer un email por UID/índice |
+| `email_send` | Enviar email (SMTP) |
+| `email_search` | Buscar emails (IMAP SEARCH) |
+| `cal_list` | Listar eventos del calendario |
+| `cal_add` | Añadir evento VEVENT |
+| `cal_search` | Buscar eventos por texto o rango |
+| `notes_list` | Listar notas markdown |
+| `notes_search` | Buscar texto en notas (ripgrep/grep) |
+| `notes_save` | Guardar/actualizar nota con front matter |
+| `contact_search` | Buscar en ficheros vCard (.vcf) |
+
+### Prompts (2)
+
+| Nombre | Descripción |
+|--------|-------------|
+| `draft_email` | Borrador de email profesional con tono configurable |
+| `meeting_notes` | Acta de reunión estructurada (genera .docx vía office) |
+
+### Resources
+
+`mail://emails_recent`, `mail://calendar_today`, `mail://notes_recent`, `mail://tasks_today`.
+
+---
+
+## 5e. cmdb-assistant
+
+**Fichero:** `mcp_servers/cmdb_assistant.py`  
+**Flag:** `cmdbAssistant.enabled` (desactivado por defecto)  
+**Descripción:** 3 herramientas de inventario IT / CMDB sobre CSV/XLSX/JSON. La CMDB se autodetecta en el cwd (`cmdb.csv`, `inventario.csv`, `servers.csv`…) o en `~/Documents/`.
+
+### Tools
+
+| Tool | Descripción |
+|------|-------------|
+| `cmdb_search` | Buscar en CMDB (CSV/XLSX/JSON); `*` lista todo |
+| `cmdb_update` | Actualizar registro CMDB (CSV) por campo clave |
+| `asset_register_add` | Añadir activo al registro CSV (lo crea si no existe) |
+
+### Resources
+
+`cmdb://server_inventory` — listado completo de activos de la CMDB del proyecto.
 
 ---
 

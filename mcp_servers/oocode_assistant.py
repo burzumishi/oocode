@@ -163,6 +163,17 @@ def _mcp_max_output(default: int = 4000) -> int:
     return default
 
 
+def _arg_file_path(args: dict) -> str:
+    """Ruta del fichero tolerante al nombre de parámetro. El LLM confunde el nombre
+    entre tools (edit_file usa `path`; smart_replace/regex_replace usan `file`), así
+    que aceptamos cualquiera de la familia — evita fallos silenciosos por `file` vacío."""
+    for k in ("file", "path", "file_path", "filepath", "fpath", "filename"):
+        v = args.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
 _MAX_OUTPUT = _mcp_max_output()
 import subprocess
 import tempfile as _tempfile
@@ -1892,6 +1903,14 @@ def _tool_process_list(args: dict) -> str:
 # ── Ctags tools ───────────────────────────────────────────────────────────────
 
 _CTAGS_FILE = ".oocode_tags"
+# Directorios pesados que disparan el coste del build recursivo (y el timeout
+# del cliente MCP). Se excluyen del índice de proyecto.
+_CTAGS_EXCLUDE_DIRS = [
+    ".git", ".hg", ".svn", "node_modules", "__pycache__",
+    ".venv", "venv", "env", ".env", ".tox", ".mypy_cache",
+    ".pytest_cache", "dist", "build", ".next", "target",
+    "vendor", ".idea", ".vscode",
+]
 _CTAGS_KINDS: dict[str, str] = {
     "c": "clase", "f": "función", "m": "método", "v": "variable",
     "i": "interfaz", "s": "struct", "e": "enum", "t": "tipo",
@@ -1899,20 +1918,53 @@ _CTAGS_KINDS: dict[str, str] = {
 }
 
 
+_CTAGS_BIN_CACHE: "Optional[str]" = None
+
+
 def _ctags_bin() -> str:
+    """Ruta a un binario **Universal Ctags** (las opciones --extras /
+    --output-format=u-ctags son exclusivas de Universal; Exuberant Ctags falla).
+
+    Prefiere los nombres explícitos de Universal (`ctags-universal` en Debian,
+    `universal-ctags` en otras distros). Si solo existe `ctags`, comprueba por
+    `--version` que sea Universal (en muchos sistemas `ctags` es Exuberant).
+    Devuelve "" si no hay Universal Ctags disponible. Resultado cacheado.
+    """
+    global _CTAGS_BIN_CACHE
+    if _CTAGS_BIN_CACHE is not None:
+        return _CTAGS_BIN_CACHE
     import shutil as _sh
-    return _sh.which("ctags") or _sh.which("universal-ctags") or "ctags"
+    for name in ("ctags-universal", "universal-ctags"):
+        path = _sh.which(name)
+        if path:
+            _CTAGS_BIN_CACHE = path
+            return path
+    path = _sh.which("ctags")
+    if path:
+        try:
+            out = subprocess.run([path, "--version"], stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, text=True,
+                                 timeout=5).stdout
+            if "Universal Ctags" in out:
+                _CTAGS_BIN_CACHE = path
+                return path
+        except Exception:
+            pass
+    _CTAGS_BIN_CACHE = ""
+    return ""
 
 
 def _ctags_build_index(root: str) -> str:
-    import shutil as _sh
-    if not (_sh.which("ctags") or _sh.which("universal-ctags")):
-        return "ctags no instalado (apt install universal-ctags)"
+    ctags = _ctags_bin()
+    if not ctags:
+        return "Universal Ctags no instalado (apt install universal-ctags)"
     tags = Path(root) / _CTAGS_FILE
+    excludes = [f"--exclude={d}" for d in _CTAGS_EXCLUDE_DIRS]
     try:
         proc = subprocess.Popen(
-            [_ctags_bin(), "-R", "--fields=+n", "--extras=+q",
-             "--tag-relative=yes", "--output-format=u-ctags", "-f", str(tags), "."],
+            [ctags, "-R", "--fields=+n", "--extras=+q",
+             "--tag-relative=yes", "--output-format=u-ctags",
+             *excludes, "-f", str(tags), "."],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
@@ -1936,28 +1988,51 @@ def _ctags_build_index(root: str) -> str:
         return str(e)
 
 
+def _ctags_parse_lines(lines: list[str]) -> list[dict]:
+    """Parsea líneas u-ctags (de fichero o de stdout) a dicts de símbolo."""
+    results = []
+    for line in lines:
+        if line.startswith("!"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        name, fpath, kind, lno = parts[0], parts[1], "", "?"
+        for field in parts[3:]:
+            if field.startswith("line:"):
+                lno = field[5:]
+            elif len(field) == 1 and field.isalpha():
+                kind = field
+        results.append({"name": name, "path": fpath, "line": lno, "kind": kind})
+    return results
+
+
 def _ctags_read_tags(root: str) -> list[dict]:
     tags_path = Path(root) / _CTAGS_FILE
     if not tags_path.exists():
         return []
-    results = []
     try:
-        for line in tags_path.read_text(errors="replace").splitlines():
-            if line.startswith("!"):
-                continue
-            parts = line.split("\t")
-            if len(parts) < 3:
-                continue
-            name, fpath, kind, lno = parts[0], parts[1], "", "?"
-            for field in parts[3:]:
-                if field.startswith("line:"):
-                    lno = field[5:]
-                elif len(field) == 1 and field.isalpha():
-                    kind = field
-            results.append({"name": name, "path": fpath, "line": lno, "kind": kind})
+        return _ctags_parse_lines(tags_path.read_text(errors="replace").splitlines())
     except Exception:
-        pass
-    return results
+        return []
+
+
+def _ctags_symbols_for_file(filepath: str) -> list[dict]:
+    """Indexa un único fichero (ctags a stdout) — instantáneo, sin build de árbol."""
+    ctags = _ctags_bin()
+    if not ctags:
+        return []
+    p = Path(filepath)
+    try:
+        proc = subprocess.run(
+            [ctags, "--fields=+n", "--extras=+q",
+             "--output-format=u-ctags", "-f", "-", p.name],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+            text=True, cwd=str(p.parent.resolve()), timeout=10,
+        )
+    except Exception:
+        return []
+    return _ctags_parse_lines(proc.stdout.splitlines())
 
 
 def _tool_build_symbol_index(args: dict) -> str:
@@ -2015,11 +2090,15 @@ def _tool_list_symbols(args: dict) -> str:
     if not p.exists():
         return f"Error: fichero no encontrado: {path}"
     root = str(p.parent.resolve())
-    tags = _ctags_read_tags(root)
-    if not tags:
-        _ctags_build_index(root)
-        tags = _ctags_read_tags(root)
     rel = p.name
+    # Reusa el índice de proyecto si ya existe (lectura instantánea); si no,
+    # indexa SOLO este fichero en vez de disparar un ctags -R del árbol entero
+    # (que excedería el timeout del cliente MCP y bloquearía llamadas en serie).
+    tags = _ctags_read_tags(root)
+    if tags:
+        tags = [t for t in tags if Path(t["path"]).name == rel]
+    else:
+        tags = _ctags_symbols_for_file(path)
     kind_filter = set(k.strip()[:1] for k in kinds.split(",") if k.strip()) if kinds else set()
     symbols = sorted(
         [t for t in tags if Path(t["path"]).name == rel
@@ -2685,7 +2764,7 @@ def _tool_patch_apply(args: dict) -> str:
 
 def _tool_regex_replace(args: dict) -> str:
     """Reemplaza un patrón regex en un fichero con re.sub(). Muestra diff."""
-    file_path   = args.get("file", "").strip()
+    file_path   = _arg_file_path(args)
     pattern     = args.get("pattern", "")
     replacement = args.get("replacement", "")
     flags_str   = args.get("flags", "")
@@ -2702,8 +2781,9 @@ def _tool_regex_replace(args: dict) -> str:
     if not path.is_file():
         return f"Error: '{file_path}' no es un fichero."
 
-    # Parsear flags
-    flags = 0
+    # Parsear flags — MULTILINE SIEMPRE activo (`^`/`$` casan por LÍNEA, como en un
+    # editor; sin esto `^patrón$` solo casaba al inicio/fin del fichero entero).
+    flags = re.MULTILINE
     for f in flags_str.upper().replace("|", ",").split(","):
         f = f.strip()
         if f in ("MULTILINE", "M"):
@@ -2718,6 +2798,7 @@ def _tool_regex_replace(args: dict) -> str:
     except Exception as e:
         return f"Error leyendo '{file_path}': {e}"
 
+    ws_note = ""
     try:
         if count:
             new_content, n = re.subn(pattern, replacement, original, count=count, flags=flags)
@@ -2727,7 +2808,22 @@ def _tool_regex_replace(args: dict) -> str:
         return f"Error en regex '{pattern}': {e}"
 
     if n == 0:
-        return f"No se encontraron coincidencias de '{pattern}' en '{path.name}'."
+        # Tolerancia a tabs (el modelo no ve tabs en el output numerado de read_file)
+        _retry = _ws_tolerant_retry(pattern, original, flags)
+        if _retry is not None:
+            _comp, _m, ws_note = _retry
+            new_content, n = _comp.subn(replacement, original, count=count or 0)
+
+    if n == 0:
+        related = _nearest_pattern_context(pattern, original)
+        related_block = f"\n{related}" if related else ""
+        return (
+            f"No se encontraron coincidencias de '{pattern}' en '{path.name}'."
+            f"{related_block}\n"
+            "💡 Usa context_before_edit(pattern=...) para ver la zona exacta, o "
+            "smart_replace (verifica el patrón antes de aplicar). NO repitas la misma "
+            "llamada sin cambiar el patrón."
+        )
 
     # Diff compacto para mostrar los cambios
     diff_lines = list(difflib.unified_diff(
@@ -2754,7 +2850,7 @@ def _tool_regex_replace(args: dict) -> str:
         return f"Error escribiendo '{file_path}': {e}"
 
     bak_note = f"  (backup: {path.with_suffix(path.suffix + '.bak')})" if backup else ""
-    return f"OK — {n} reemplazos en '{path.name}'{bak_note}\n\n{diff_str}"
+    return f"OK — {n} reemplazos en '{path.name}'{bak_note}{ws_note}\n\n{diff_str}"
 
 
 def _tool_tree(args: dict) -> str:
@@ -3071,13 +3167,65 @@ def _tool_bulk_replace(args: dict) -> str:
 
 # ── Tools compuestas — razonamiento + edición segura ─────────────────────────
 
+def _nearest_pattern_context(pattern: str, original: str, max_hits: int = 5) -> str:
+    """Líneas del fichero más relevantes para un patrón regex que NO casó.
+
+    Localiza el fragmento LITERAL más largo del patrón (quitando metacaracteres y
+    desescapando) y muestra las líneas que lo contienen con su número; si ninguna lo
+    contiene, cae a similitud difflib. Mucho más útil que volcar las primeras 40
+    líneas del fichero (inútil en ficheros grandes: el patrón suele referirse a una
+    zona profunda)."""
+    parts = re.split(r"(?<!\\)[.*+?\[\](){}|^$]+|\\[AbBdDsSwWZ]", pattern)
+    frags = sorted((p.replace("\\", "").strip() for p in parts), key=len, reverse=True)
+    frags = [f for f in frags if len(f) >= 4]
+    lines = original.splitlines()
+    hits: list[tuple[int, str]] = []
+    for frag in frags[:3]:
+        _low = frag.lower()
+        hits = [(i, l) for i, l in enumerate(lines) if _low in l.lower()]
+        if hits:
+            break
+    if not hits and frags:
+        import difflib as _dl
+        _norm_map: dict[str, int] = {}
+        for _i, _l in enumerate(lines):
+            _norm_map.setdefault(" ".join(_l.split()), _i)
+        _cands = _dl.get_close_matches(
+            " ".join(frags[0].split()), list(_norm_map), n=3, cutoff=0.5)
+        hits = [(_norm_map[c], lines[_norm_map[c]]) for c in _cands]
+    if not hits:
+        return ""
+    shown = "\n".join(f"{i + 1:5d}: {l[:120]}" for i, l in hits[:max_hits])
+    more = f"\n  ... ({len(hits) - max_hits} líneas más contienen el fragmento)" \
+        if len(hits) > max_hits else ""
+    return f"Líneas del fichero relacionadas con el patrón:\n{shown}{more}"
+
+
+def _ws_tolerant_retry(pattern: str, original: str, flags: int):
+    """Si el patrón no casó y contiene espacios literales, reintenta tolerando
+    tabs: cada run de espacios pasa a `[ \\t]+` (el modelo no puede ver tabs en el
+    output numerado de read_file). Devuelve (compiled, matches, nota) o None."""
+    if " " not in pattern or "\\s" in pattern or "\t" in pattern or "[ " in pattern:
+        return None
+    try:
+        ws_pat = re.sub(r" +", r"[ \t]+", pattern)
+        comp = re.compile(ws_pat, flags)
+        m = list(comp.finditer(original))
+        if m:
+            return comp, m, " (espacios del patrón tolerados como [ \\t]+ — la zona usa tabs)"
+    except re.error:
+        pass
+    return None
+
+
 def _tool_smart_replace(args: dict) -> str:
     """Verifica que el patrón existe antes de reemplazar; muestra contexto si no lo encuentra.
 
-    Flujo: grep → si 0 coincidencias muestra primeras líneas del fichero para corregir
-    el patrón; si hay coincidencias aplica el reemplazo y muestra el diff.
+    Flujo: grep → si 0 coincidencias muestra las líneas relacionadas con el patrón
+    para corregirlo; si hay coincidencias aplica el reemplazo y muestra el diff.
+    `re.MULTILINE` activo por defecto (`^`/`$` casan por LÍNEA, como en un editor).
     """
-    file_path   = args.get("file", "").strip()
+    file_path   = _arg_file_path(args)
     pattern     = args.get("pattern", "")
     replacement = args.get("replacement", "")
     flags_str   = args.get("flags", "")
@@ -3093,8 +3241,10 @@ def _tool_smart_replace(args: dict) -> str:
     if not path.is_file():
         return f"Error: '{file_path}' no es un fichero."
 
-    # Parse flags
-    flags = 0
+    # Parse flags — MULTILINE SIEMPRE activo: en edición de ficheros `^`/`$` deben
+    # casar por línea (sin esto, `^patrón$` solo casaba al inicio/fin del FICHERO
+    # entero y el modelo recibía "NO encontrado" sistemáticamente).
+    flags = re.MULTILINE
     for f in flags_str.upper().replace("|", ",").split(","):
         f = f.strip()
         if f in ("MULTILINE", "M"):    flags |= re.MULTILINE
@@ -3115,21 +3265,28 @@ def _tool_smart_replace(args: dict) -> str:
         )
 
     matches = list(compiled.finditer(original))
+    ws_note = ""
+    if not matches:
+        # Tolerancia a tabs: el modelo escribe espacios porque no puede VER los tabs
+        # en el output numerado de read_file.
+        _retry = _ws_tolerant_retry(pattern, original, flags)
+        if _retry is not None:
+            compiled, matches, ws_note = _retry
 
     if not matches:
-        # Mostrar contexto del fichero para corregir el patrón
-        lines = original.splitlines()
-        total = len(lines)
-        preview_n = min(40, total)
-        preview = "\n".join(f"{i+1:5d}: {lines[i]}" for i in range(preview_n))
-        suffix = f"\n... ({total - preview_n} líneas más)" if total > preview_n else ""
+        # Contexto ÚTIL: líneas relacionadas con el patrón (fragmento literal más
+        # largo), no las primeras 40 líneas del fichero.
+        total = len(original.splitlines())
+        related = _nearest_pattern_context(pattern, original)
+        related_block = f"\n{related}\n" if related else ""
         return (
-            f"⚠ smart_replace: patrón '{pattern}' NO encontrado en '{path.name}' ({total} líneas).\n\n"
-            f"Primeras {preview_n} líneas del fichero:\n{preview}{suffix}\n\n"
+            f"⚠ smart_replace: patrón '{pattern}' NO encontrado en '{path.name}' ({total} líneas).\n"
+            f"{related_block}\n"
             "💡 Próximo paso recomendado:\n"
-            "  • Localiza el texto exacto a cambiar en las líneas de arriba\n"
-            "  • Usa edit_file(old_string='texto exacto copiado', new_string='...')\n"
-            "  • O ajusta el patrón regex y vuelve a llamar smart_replace"
+            "  • Compara el patrón con las líneas de arriba (espacios, escapes, mayúsculas)\n"
+            "  • Usa context_before_edit(pattern=...) para ver la zona exacta con números de línea\n"
+            "  • O usa edit_file(old_string='texto exacto copiado', new_string='...')\n"
+            "  • NO repitas la misma llamada sin cambiar el patrón"
         )
 
     # Aplicar reemplazo
@@ -3146,7 +3303,7 @@ def _tool_smart_replace(args: dict) -> str:
         diff_str = "".join(diff_lines[:120])
         if len(diff_lines) > 120:
             diff_str += f"\n... ({len(diff_lines) - 120} líneas de diff más)"
-        return f"[dry-run] smart_replace: {n} coincidencias en '{path.name}':\n\n{diff_str}"
+        return f"[dry-run] smart_replace: {n} coincidencias en '{path.name}'{ws_note}:\n\n{diff_str}"
 
     try:
         path.write_text(new_content, encoding="utf-8")
@@ -3164,7 +3321,7 @@ def _tool_smart_replace(args: dict) -> str:
     if len(diff_lines) > 100:
         diff_str += f"\n... ({len(diff_lines) - 100} líneas más)"
 
-    return f"✓ smart_replace: {n} reemplazos aplicados en '{path.name}'.\n\n{diff_str}"
+    return f"✓ smart_replace: {n} reemplazos aplicados en '{path.name}'{ws_note}.\n\n{diff_str}"
 
 
 def _tool_context_before_edit(args: dict) -> str:
@@ -3173,7 +3330,7 @@ def _tool_context_before_edit(args: dict) -> str:
     Úsalo ANTES de edit_file o regex_replace para ver el texto exacto que rodea
     el área a editar — evita errores de old_string no coincidente.
     """
-    file_path = args.get("file", "").strip()
+    file_path = _arg_file_path(args)
     pattern   = args.get("pattern", "")
     context_n = int(args.get("context_lines", 8))
     max_hits  = int(args.get("max_hits", 5))
@@ -3245,7 +3402,7 @@ def _tool_pre_edit_check(args: dict) -> str:
 
     Combina en una sola llamada: file_stat + resumen de secciones + contexto del patrón.
     """
-    file_path = args.get("file", "").strip()
+    file_path = _arg_file_path(args)
     focus     = args.get("focus", "").strip()   # palabra clave o línea de interés
     offset    = int(args.get("offset", 0))
     limit     = int(args.get("limit", 60))
@@ -5365,7 +5522,7 @@ def _get_prompt(name: str, arguments: dict) -> list[dict]:
             "- Análisis/Exploración (explore o agente reasoning)\n"
             "- Implementación/Código (agente coding)\n"
             "- Tests/Validación (agente coding con foco en tests)\n"
-            "- Documentación/Informes (agente home_office)\n"
+            "- Documentación/Informes (agente de ofimática)\n"
             "- Revisión/Integración (agente principal)\n\n"
             "### PASO 2 — Asignación de agentes\n"
             "Para cada dominio selecciona el agente más adecuado y define:\n"
@@ -5410,7 +5567,7 @@ def _tool_render_markdown(args: dict) -> str:
     output = args.get("output", "").strip()
 
     if not text:
-        file_path = args.get("file", "").strip()
+        file_path = _arg_file_path(args)
         if file_path:
             p = Path(file_path)
             if not p.exists():
@@ -5447,7 +5604,7 @@ def _tool_xml_format(args: dict) -> str:
     import xml.dom.minidom as _minidom
 
     text      = args.get("text", "").strip()
-    file_path = args.get("file", "").strip()
+    file_path = _arg_file_path(args)
     indent    = int(args.get("indent", 2))
     output    = args.get("output", "").strip()
 
@@ -5485,7 +5642,7 @@ def _tool_xml_validate(args: dict) -> str:
     """Valida XML contra un esquema XSD o comprueba que sea XML bien formado."""
     import xml.etree.ElementTree as _ET
 
-    file_path  = args.get("file", "").strip()
+    file_path  = _arg_file_path(args)
     text       = args.get("text", "").strip()
     schema_xsd = args.get("schema", "").strip()
 
@@ -6224,7 +6381,7 @@ _TOOLS = [
                 "replacement": {"type": "string",  "description": "Texto de reemplazo (puede usar grupos \\1, \\2)"},
                 "glob":        {"type": "string",  "description": "Patrón glob para seleccionar ficheros (default: '**/*'). Ej: '**/*.c', 'src/**/*.py'"},
                 "extensions":  {"type": "string",  "description": "Filtro adicional por extensiones separadas por coma. Ej: 'c,h' para C, 'py' para Python"},
-                "flags":       {"type": "string",  "description": "Flags: MULTILINE (M), IGNORECASE (I), DOTALL (S)"},
+                "flags":       {"type": "string",  "description": "Flags extra: IGNORECASE (I), DOTALL (S). MULTILINE ya está SIEMPRE activo (^/$ casan por línea)"},
                 "dry_run":     {"type": "boolean", "description": "Solo mostrar qué ficheros se modificarían, sin cambiar nada (default: false)"},
                 "max_files":   {"type": "integer", "description": "Máximo de ficheros a procesar (default: 50, max: 200)"},
             },
@@ -6268,7 +6425,7 @@ _TOOLS = [
                 "file":          {"type": "string",  "description": "Ruta absoluta del fichero a modificar"},
                 "pattern":       {"type": "string",  "description": "Patrón regex Python"},
                 "replacement":   {"type": "string",  "description": "Texto de reemplazo (soporta grupos \\1, \\2)"},
-                "flags":         {"type": "string",  "description": "Flags: MULTILINE, IGNORECASE, DOTALL (separadas por coma)"},
+                "flags":         {"type": "string",  "description": "Flags extra: IGNORECASE, DOTALL (separadas por coma). MULTILINE ya está SIEMPRE activo (^/$ casan por línea)"},
                 "dry_run":       {"type": "boolean", "description": "Solo mostrar diff sin guardar (default: false)"},
                 "context_lines": {"type": "integer", "description": "Líneas de contexto en el diff (default: 3)"},
             },

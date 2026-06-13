@@ -93,70 +93,67 @@ class TestSafeSplitLookback:
 # B — 2ª pasada con ventana de recencia (últimas 4 protegidas)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestSecondPassRecencyWindow:
-    def _make_ctx_with_tools(self, n_tools: int, tool_content_len: int = 5000) -> ConversationContext:
-        """Crea contexto con n tool results largos y high_water ya superado."""
-        # max_tokens pequeño para que token_estimate() > high_water tras compact()
+class TestSecondPassCompactTarget:
+    """2ª pasada de truncado guiada por compact_target (objetivo post-compactación).
+
+    Antes se gateaba en high_water (0.70) y protegía las últimas 4 tool results, así
+    que con ficheros grandes recientes el contexto se quedaba al 50-70% tras compactar.
+    Ahora trunca hasta bajar de compact_target, protegiendo solo las 2 más recientes
+    (y, si aún sigue alto, solo la última).
+    """
+    def _make_ctx_with_tools(self, n_tools: int, tool_content_len: int = 5000,
+                             compact_target: float = 0.01,
+                             max_tokens: int = 200) -> ConversationContext:
+        # Estructura: user, assistant, <n_tools tool results>, assistant. min_keep
+        # conserva todo salvo el primer 'user' (el corte aterriza en el assistant, así
+        # las tools NO quedan huérfanas), dejándolas para la 2ª pasada de truncado.
         ctx = ConversationContext(
-            max_tokens=200,
-            min_keep=1,
-            high_water=0.01,   # prácticamente siempre activa la 2ª pasada
+            max_tokens=max_tokens,
+            min_keep=n_tools + 2,
+            compact_target=compact_target,
             tool_max_chars=500,
         )
         ctx.add("user", "haz algo")
+        ctx.add("assistant", "empiezo")
         for i in range(n_tools):
             _add_tool_result(ctx, f"tool{i}", "x" * tool_content_len)
         ctx.add("assistant", "ok")
         return ctx
 
-    def test_last_4_tools_are_not_truncated(self):
-        """Las últimas 4 tool results no se truncan en la 2ª pasada."""
-        ctx = self._make_ctx_with_tools(n_tools=8, tool_content_len=5000)
-        original_contents = {
-            i: msg["content"]
-            for i, msg in enumerate(ctx.messages)
-            if msg.get("role") == "tool"
-        }
+    def test_most_recent_tool_never_truncated(self):
+        """La tool result más reciente NUNCA se trunca, ni con target muy bajo."""
+        ctx = self._make_ctx_with_tools(n_tools=8, compact_target=0.01)
         ctx.compact()
+        tool_msgs = [m for m in ctx.messages if m.get("role") == "tool"]
+        assert tool_msgs, "Compact eliminó todas las tools"
+        assert "truncados tras compactación" not in tool_msgs[-1]["content"]
 
-        tool_msgs = [(i, msg) for i, msg in enumerate(ctx.messages) if msg.get("role") == "tool"]
-        # Después de compact() los índices pueden haber cambiado; identificar por orden
-        # Las últimas 4 deben estar íntegras (no truncadas)
-        last_4 = tool_msgs[-4:]
-        for _, msg in last_4:
-            assert "truncados tras compactación" not in msg["content"], \
-                "Una tool result reciente fue truncada — debe estar protegida"
-
-    def test_older_tools_may_be_truncated(self):
-        """Las tool results más antiguas (más allá de las últimas 4) sí se pueden truncar."""
-        ctx = self._make_ctx_with_tools(n_tools=8, tool_content_len=5000)
+    def test_older_tools_truncated_over_target(self):
+        """Por encima del objetivo, las tool results antiguas se truncan."""
+        ctx = self._make_ctx_with_tools(n_tools=8, compact_target=0.01)
         ctx.compact()
+        tool_msgs = [m for m in ctx.messages if m.get("role") == "tool"]
+        assert any("truncados tras compactación" in m["content"] for m in tool_msgs[:-1]), \
+            "Ningún tool result antiguo fue truncado — la 2ª pasada no funcionó"
 
-        tool_msgs = [msg for msg in ctx.messages if msg.get("role") == "tool"]
-        if len(tool_msgs) <= 4:
-            pytest.skip("Compact eliminó demasiados mensajes para este test")
-
-        older = tool_msgs[:-4]
-        # Al menos uno de los mensajes antiguos debe haber sido truncado
-        truncated = any("truncados tras compactación" in m["content"] for m in older)
-        assert truncated, "Ningún tool result antiguo fue truncado — la 2ª pasada no funcionó"
-
-    def test_fewer_than_4_tools_all_protected(self):
-        """Si hay 3 o menos tool results, ninguno se trunca."""
-        ctx = self._make_ctx_with_tools(n_tools=3, tool_content_len=5000)
+    def test_last_2_protected_when_target_met_after_first_sweep(self):
+        """Si tras truncar las antiguas ya bajamos del objetivo, las 2 últimas quedan intactas."""
+        ctx = self._make_ctx_with_tools(n_tools=8, tool_content_len=5000,
+                                        compact_target=0.5, max_tokens=20000)
         ctx.compact()
+        tool_msgs = [m for m in ctx.messages if m.get("role") == "tool"]
+        if len(tool_msgs) < 2:
+            pytest.skip("Compact dejó <2 tools")
+        for m in tool_msgs[-2:]:
+            assert "truncados tras compactación" not in m["content"], \
+                "Con el objetivo ya alcanzado, las 2 últimas deben protegerse"
 
-        for msg in ctx.messages:
-            if msg.get("role") == "tool":
-                assert "truncados tras compactación" not in msg["content"], \
-                    "Con ≤4 tool results, ninguna debe truncarse"
-
-    def test_no_second_pass_when_under_high_water(self):
-        """Si el contexto cae por debajo de high_water, no se trunca nada."""
+    def test_no_second_pass_under_target(self):
+        """Si el contexto ya está por debajo del objetivo, no se trunca nada."""
         ctx = ConversationContext(
-            max_tokens=100_000,  # muy grande
+            max_tokens=100_000,
             min_keep=1,
-            high_water=0.99,     # casi nunca activa
+            compact_target=0.99,   # casi nunca se activa
             tool_max_chars=500,
         )
         ctx.add("user", "tarea")
@@ -166,6 +163,23 @@ class TestSecondPassRecencyWindow:
         for msg in ctx.messages:
             if msg.get("role") == "tool":
                 assert "truncados tras compactación" not in msg["content"]
+
+    def test_large_files_scenario_drops_below_target(self):
+        """Escenario reportado: muchas lecturas grandes se quedaban al 50-70% tras compactar.
+
+        Con el objetivo (0.5) el contexto baja por debajo del objetivo tras compactar.
+        """
+        ctx = ConversationContext(max_tokens=10000, min_keep=4,
+                                  compact_target=0.5, tool_max_chars=500)
+        ctx.add("user", "analiza el proyecto")
+        for i in range(10):
+            ctx.add("assistant", f"leyendo fichero {i}")
+            _add_tool_result(ctx, "read_file", "L" * 8000)   # ~2666 tok c/u
+        ctx.add("user", "sigue")
+        ctx.compact()
+        target_tok = int(ctx.max_tokens * ctx.compact_target)
+        assert ctx.token_estimate() <= target_tok, \
+            f"Tras compactar {ctx.token_estimate()} tok > objetivo {target_tok}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -831,3 +845,223 @@ class TestPrecompactIdle:
         loop._do_compact.assert_not_called()
         done_ev.set()
         loop._precompact_thread.join(timeout=1.0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# J — _compact_running encola el siguiente turno (no arranca concurrente)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCompactRunningGate:
+    """_do_compact debe activar _compact_running al INICIO (no solo dentro de
+    _do_compact_locked) para que un turno enviado durante la compactación se encole
+    en run() en vez de arrancar concurrente y corromper ctx.messages."""
+
+    def _make_loop(self):
+        from unittest.mock import MagicMock
+        import threading as _th
+        from agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._compact_running = _th.Event()
+        loop.config           = MagicMock(snapshots_save_on_compact=False)
+        loop._rebuild_client_if_needed = MagicMock()
+        loop._save_session_snapshot    = MagicMock()
+        return loop
+
+    def test_compact_running_set_during_impl(self):
+        """_compact_running está activo MIENTRAS corre _do_compact_impl."""
+        from unittest.mock import MagicMock
+        loop = self._make_loop()
+        seen = {}
+
+        def _impl(with_summary=True):
+            seen["set_during"] = loop._compact_running.is_set()
+            return 3
+
+        loop._do_compact_impl = _impl
+        # También debe estar activo antes de _rebuild_client_if_needed (cierra la carrera)
+        loop._rebuild_client_if_needed = MagicMock(
+            side_effect=lambda: seen.__setitem__("set_before_rebuild",
+                                                 loop._compact_running.is_set()))
+
+        n = loop._do_compact(with_summary=True)
+        assert n == 3
+        assert seen["set_before_rebuild"] is True
+        assert seen["set_during"] is True
+        # Y se limpia al terminar
+        assert loop._compact_running.is_set() is False
+
+    def test_compact_running_cleared_on_exception(self):
+        """Si la compactación falla, _compact_running se limpia igualmente (finally)."""
+        loop = self._make_loop()
+
+        def _boom(with_summary=True):
+            raise RuntimeError("fallo de resumen")
+
+        loop._do_compact_impl = _boom
+        with pytest.raises(RuntimeError):
+            loop._do_compact(with_summary=True)
+        # finally garantiza el clear — un turno encolado no se cuelga para siempre
+        assert loop._compact_running.is_set() is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# K — Sugerencia contextual del siguiente mensaje (_suggest_followup)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestSuggestFollowup:
+    """_suggest_followup hace una llamada LLM corta (cliente PROPIO) y devuelve 1
+    frase con el siguiente mensaje probable del usuario, o "" si no aplica."""
+
+    def _make_loop(self, last_response="", suggestions=True,
+                   capture_output=False, is_subagent=False):
+        from unittest.mock import MagicMock
+        from agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.capture_output = capture_output
+        loop.is_subagent    = is_subagent
+        loop._last_response = last_response
+        loop.config         = MagicMock(suggestions_enabled=suggestions)
+        loop._build_options = MagicMock(return_value={})
+        loop._active_model  = MagicMock(return_value="test-model")
+        return loop
+
+    def _patch_client(self, monkeypatch, reply):
+        from unittest.mock import MagicMock
+        captured = {}
+        fake_resp = MagicMock(text=reply)
+
+        def _fake_chat_sync(**kwargs):
+            captured.update(kwargs)
+            return fake_resp
+
+        fake_client = MagicMock()
+        fake_client.chat_sync.side_effect = _fake_chat_sync
+        monkeypatch.setattr("api.build_client", lambda cfg: fake_client)
+        return captured
+
+    def test_returns_phrase(self, monkeypatch):
+        loop = self._make_loop(last_response="He aplicado el refactor. ¿Ejecuto los tests?")
+        cap = self._patch_client(monkeypatch, "sí, ejecuta los tests")
+        assert loop._suggest_followup() == "sí, ejecuta los tests"
+        # Acota la salida con num_predict (válido en los 3 backends)
+        assert cap["model_params"].get("num_predict") == 24
+
+    def test_strips_quotes_and_first_line(self, monkeypatch):
+        loop = self._make_loop(last_response="x" * 40)
+        self._patch_client(monkeypatch, '«continúa con el plan»\notra línea')
+        assert loop._suggest_followup() == "continúa con el plan"
+
+    def test_none_reply_yields_empty(self, monkeypatch):
+        loop = self._make_loop(last_response="x" * 40)
+        self._patch_client(monkeypatch, "NONE")
+        assert loop._suggest_followup() == ""
+
+    def test_too_long_reply_rejected(self, monkeypatch):
+        loop = self._make_loop(last_response="x" * 40)
+        self._patch_client(monkeypatch, "y" * 120)
+        assert loop._suggest_followup() == ""
+
+    def test_short_last_response_skips(self, monkeypatch):
+        loop = self._make_loop(last_response="ok")
+        called = self._patch_client(monkeypatch, "algo")
+        assert loop._suggest_followup() == ""
+        assert called == {}   # ni siquiera construye cliente / llama
+
+    def test_disabled_by_config(self, monkeypatch):
+        loop = self._make_loop(last_response="x" * 40, suggestions=False)
+        called = self._patch_client(monkeypatch, "algo")
+        assert loop._suggest_followup() == ""
+        assert called == {}
+
+    def test_subagent_skips(self, monkeypatch):
+        loop = self._make_loop(last_response="x" * 40, is_subagent=True)
+        self._patch_client(monkeypatch, "algo")
+        assert loop._suggest_followup() == ""
+
+    def test_llm_exception_is_safe(self, monkeypatch):
+        from unittest.mock import MagicMock
+        loop = self._make_loop(last_response="x" * 40)
+        fake_client = MagicMock()
+        fake_client.chat_sync.side_effect = RuntimeError("backend caído")
+        monkeypatch.setattr("api.build_client", lambda cfg: fake_client)
+        assert loop._suggest_followup() == ""
+
+
+# ── Conteo de tokens: imágenes + display con límite efectivo (2026-06) ──────────
+
+class TestTokenCountingImages:
+    def test_msg_tokens_counts_images(self):
+        from agent.context import _msg_tokens, _TOKENS_PER_IMAGE
+        base = _msg_tokens({"role": "user", "content": "describe esto"})
+        with_imgs = _msg_tokens({"role": "user", "content": "describe esto",
+                                 "images": ["b64a", "b64b"]})
+        assert with_imgs == base + 2 * _TOKENS_PER_IMAGE
+
+    def test_token_estimate_includes_images(self):
+        from agent.context import ConversationContext, _TOKENS_PER_IMAGE
+        ctx = ConversationContext(max_tokens=100000)
+        ctx.add("user", "hola", images=["img1"])
+        assert ctx.token_estimate() >= _TOKENS_PER_IMAGE
+
+    def test_msg_tokens_counts_tool_calls(self):
+        from agent.context import _msg_tokens
+        m = {"role": "assistant", "content": "",
+             "tool_calls": [{"function": {"name": "bash", "arguments": {"command": "ls -la /tmp"}}}]}
+        # content vacío pero los tool_calls SÍ cuentan
+        assert _msg_tokens(m) > 0
+
+    def test_msg_tokens_ignores_thinking(self):
+        from agent.context import _msg_tokens
+        # El razonamiento es efímero: NO se almacena en ctx.messages ni lo reenvía
+        # ningún backend, así que NO debe sumar a la estimación de contexto.
+        base = _msg_tokens({"role": "assistant", "content": "hola"})
+        with_think = _msg_tokens({"role": "assistant", "content": "hola",
+                                  "thinking": "razono mucho " * 50})
+        assert with_think == base
+
+
+class TestCtxStatusUsesEffectiveMax:
+    """print_ctx_status / print_status deben mostrar el límite EFECTIVO del modelo
+    (context.max_tokens = effective_max_context_tokens), no el fallback 8000."""
+
+    def _render(self, fn, *args):
+        import io
+        from rich.console import Console
+        from unittest.mock import patch
+        buf = io.StringIO()
+        rec = Console(file=buf, width=200, no_color=True)
+        with patch("ui.renderer.console", rec):
+            fn(*args)
+        return buf.getvalue()
+
+    def test_print_ctx_status_shows_effective_not_8000(self):
+        from agent.context import ConversationContext
+        from ui.renderer import print_ctx_status
+        from unittest.mock import MagicMock
+        ctx = ConversationContext(max_tokens=127456)
+        ctx.add("user", "hola mundo " * 50)
+        cfg = MagicMock(); cfg.max_context_tokens = 8000  # el fallback NO debe usarse
+        rt = MagicMock(); rt.ctx_mode = "full"
+        out = self._render(print_ctx_status, ctx, cfg, rt)
+        assert "127" in out          # _fmt_tokens(127456) → 127K/127.5K
+        assert "8000" not in out and "8,000" not in out
+
+    def test_print_status_uses_token_estimate_not_crude(self):
+        from agent.context import ConversationContext
+        from ui.renderer import print_status
+        from unittest.mock import MagicMock
+        ctx = ConversationContext(max_tokens=200000)
+        ctx.add("user", "x" * 4000)
+        cfg = MagicMock(); cfg.max_context_tokens = 8000
+        cfg.model = "m"; cfg.agent_emoji = "🤖"; cfg.agent_name = "A"; cfg.agent_id = "main"
+        cfg.api_type = "ollama"; cfg.ollama_host = "h"
+        sess = MagicMock(); sess.stats.return_value = {"input_tokens": 0, "output_tokens": 0,
+                                                       "started_at": 0, "compactions": 0,
+                                                       "session_id": "abcd1234"}
+        rt = MagicMock()
+        out = self._render(print_status, cfg, sess, rt, ctx)
+        # El límite mostrado es el efectivo (200K), no 8000
+        assert "200" in out
+        assert "8000" not in out and "8,000" not in out

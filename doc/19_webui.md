@@ -39,6 +39,10 @@ python oocode.py --webserver stop
 - **Indicador "Pensando"** encima del prompt: palabras inventadas ciclantes (`Cavilando…`, `Tokenizando…`…) y frases de preflight. Es **estado puro**: NO muestra títulos de herramientas — el detalle de cada tool aparece en su bloque dentro de la conversación (corrección 2026-06-04)
 - **Status bar reubicada bajo el prompt (paridad TUI)** — orden de arriba abajo: indicador "Pensando" → prompt → team-bar → **status bar** (agente · modelo · barra de contexto `▱▱▱▱▱▱▱▱▱▱` · tareas · badges MCP/LSP/MEM/RAG/EMBED/VIS/ELEV · tokens) → filas de detalle MCP/LSP. Igual que el toolbar del TUI (línea principal arriba, detalle MCP/LSP debajo). Es una barra única (antes había una superior duplicada; se eliminó en v0.4.2)
 - **Team-bar de una sola línea (cabecera de equipo)** — cuando hay subagentes activos, muestra una cabecera compacta: `📋 Agente principal 💬 💻 Subagente · N subagente(s)` (con `✓` delante de los terminados). El **detalle largo** de cada subagente (su tarea, plan, texto y herramientas) vive en su **bloque dentro de la conversación**, no en la barra de status. Auto-descubre también los subagentes de `team`/`fanout`. La tarea encomendada se siembra al principio del bloque del subagente al arrancar (`subagent_start`)
+- **Preguntas del agente (`ask_user`)** — cuando el agente necesita una decisión, muestra una **tarjeta de preguntas** (una o varias, con opciones, multiselección y texto libre) y espera tu respuesta; al enviar, un bloque `● User answered OOCode's questions` recoge lo elegido antes de continuar
+- **Aprobación de planes (plan-mode)** — con `/plan on`, el plan se presenta como una pregunta (Aprobar/Editar/Cancelar) antes de ejecutarse
+- **Confirmación de permisos** (opt-in, `webui.permissionPrompt`) — las herramientas que requieren permiso muestran una tarjeta Sí/No/Siempre; solo si hay navegador conectado (si no, auto-aprueba para no colgar el uso headless)
+- **Cola de entrada** — puedes escribir mientras el agente trabaja: los slash de display pasan al momento; los mensajes y slash mutadores se encolan y se procesan al terminar el turno
 - Planes multi-tarea con estado `✔/◼/◻` actualizables en tiempo real
 - Markdown-to-HTML con resaltado de código
 - Archivos adjuntos (imágenes y ficheros de texto)
@@ -80,6 +84,8 @@ Todos los endpoints devuelven JSON salvo los SSE:
 | `/api/chat/history` | GET | Historial de mensajes de la conversación de la sesión |
 | `/api/chat/input_history` | GET | Historial de input del prompt (flecha arriba), **compartido con el TUI** (`~/.oocode/history`) |
 | `/api/chat/load_session` | POST | Restaura una sesión pasada (contexto + conversación), reusando `AgentLoop.restore_session` |
+| `/api/chat/answer` | POST | Respuestas del usuario a un `ask_user` (evento SSE `question`): `{"answers":[{"selection":[idx],"free_text":"…"}]}` — desbloquea el turno |
+| `/api/chat/permission` | POST | Respuesta a un prompt de permiso (evento SSE `permission`): `{"choice":"s"\|"n"\|"siempre"}` (requiere `webui.permissionPrompt`) |
 | `/api/chat/clear` | POST | Limpiar historial de la sesión |
 
 #### Ejemplo: enviar mensaje síncrono
@@ -170,14 +176,19 @@ El output de los subagentes fluye al WebUI via SSE en tiempo real, de la misma f
 
 ## Configuración del WebUI
 
-El puerto y host son configurables en `oocode.json`:
+El bloque `webui` de `oocode.json`:
 
 ```json
 {
-  "webui_host": "0.0.0.0",
-  "webui_port": 4000
+  "webui": {
+    "host": "0.0.0.0",
+    "port": 4000,
+    "permissionPrompt": false
+  }
 }
 ```
+
+- `permissionPrompt` (default `false`): si `true`, las herramientas que requieren permiso preguntan en el navegador (Sí/No/Siempre) **solo cuando hay un cliente SSE conectado**; sin navegador (VIM/`send_sync`/pestaña cerrada) auto-aprueba para no colgar el turno.
 
 O con override de CLI:
 ```bash

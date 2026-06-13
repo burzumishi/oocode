@@ -217,6 +217,8 @@ Los embeddings del sub-agente usan `ollama_embed_host` si está configurado, o `
 
 Los sub-agentes se ejecutan **de forma síncrona** cuando los lanza el LLM (via `spawn_subagent` tool): el padre espera a que el sub-agente termine y recibe el resultado como string. Los sub-agentes lanzados con `/spawn` se ejecutan en un thread de background.
 
+**Sin saludos (v0.4.8):** un sub-agente es un **trabajador interno** que reporta al agente principal, no a la persona. Su system prompt incluye una instrucción que lo deja claro: nada de saludos ni presentaciones ("¡Hola!"), no se dirige al usuario por su nombre, empieza directo por el trabajo y los resultados, y no puede preguntar (`ask_user` no está disponible en sub-agentes → decide la opción más razonable y continúa). Por lo demás, el sub-agente recibe **el mismo conjunto de reglas y salvaguardas** que el agente principal (read-before-edit, edición tolerante a whitespace, escalada de fallos…).
+
 El output del sub-agente **aparece en tiempo real** con el prefijo `│` coloreado:
 
 ```

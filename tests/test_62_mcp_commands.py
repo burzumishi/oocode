@@ -584,7 +584,11 @@ class TestCmdMcpDispatch(unittest.TestCase):
         mock_cfg.mcp_system_assistant_enabled = True
         mock_cfg.mcp_devops_assistant_enabled = True
         mock_cfg.mcp_database_assistant_enabled = False
-        mock_cfg.mcp_home_office_assistant_enabled = False
+        mock_cfg.mcp_word_assistant_enabled = False
+        mock_cfg.mcp_excel_assistant_enabled = False
+        mock_cfg.mcp_pptx_assistant_enabled = False
+        mock_cfg.mcp_mail_assistant_enabled = False
+        mock_cfg.mcp_cmdb_assistant_enabled = False
         mock_cfg.mcp_security_assistant_enabled = False
         mock_cfg.mcp_iot_assistant_enabled = False
         mock_cfg.mcp_http_client_assistant_enabled = False

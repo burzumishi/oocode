@@ -302,10 +302,10 @@ class TestTemplateFill:
     def test_template_with_newlines(self):
         result = _tool_template_fill({
             "template": "Project: {{project}}\nAuthor: {{author}}",
-            "variables": {"project": "oocode", "author": "Antonio"},
+            "variables": {"project": "oocode", "author": "Alex"},
         })
         assert "oocode" in result
-        assert "Antonio" in result
+        assert "Alex" in result
 
 
 # ── search_todos ──────────────────────────────────────────────────────────────

@@ -206,7 +206,7 @@ El agente `reasoning` analiza y el agente `coding` implementa:
 
 ```bash
 /spawn webcrawler "investiga las mejores librerías Python para procesamiento de PDFs"
-/spawn coding "integra la librería recomendada en mcp_servers/home_office_assistant.py"
+/spawn coding "integra la librería recomendada en mcp_servers/word_assistant.py"
 ```
 
 ### Patrón 4: Equipo completo con lead agent

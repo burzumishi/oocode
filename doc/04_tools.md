@@ -31,6 +31,7 @@ Lee un fichero con números de línea. Soporta lectura parcial.
 | `path` | string | Ruta del fichero (absoluta o relativa al workspace) |
 | `offset` | integer | Línea desde la que empezar (defecto: 1) |
 | `limit` | integer | Número de líneas a leer (defecto: 150, configurable) |
+| `skip_comment_banner` | boolean | (v0.4.8) Si `true`, colapsa una cabecera de comentario/licencia larga al inicio (logos, listas de autores) en un marcador, **conservando los números de línea** — útil para no gastar contexto en banners. Opt-in (defecto `false`). |
 
 **Ejemplo de uso del modelo:**
 ```json
@@ -38,6 +39,8 @@ Lee un fichero con números de línea. Soporta lectura parcial.
 ```
 
 **Configuración:** `tools.readFileLinesDefault` (defecto: 150), `tools.readFileLinesWarnLarge` (defecto: 500).
+
+**`skip_comment_banner` — detección multi-lenguaje (v0.4.8):** reconoce la sintaxis de comentario según la extensión: C-family (`//`, `/* */`; las directivas `#include`/`#define` NO se colapsan), `#` (Python/shell/Ruby/YAML/TOML… + docstrings `"""`/`'''` en Python), `--` (SQL/Lua/Haskell), `;` (Lisp/ASM), `!` (Fortran), `%` (LaTeX/Erlang/MATLAB), `<!-- -->` (HTML/XML/SVG/Markdown), `(* *)` (OCaml/F#/Pascal), `"` (Vim). Como los números de línea se conservan, las ediciones posteriores no se desalinean.
 
 ---
 
@@ -65,12 +68,22 @@ Reemplaza una cadena exacta dentro de un fichero. Más seguro que `write_file` p
 | Parámetro | Tipo | Descripción |
 |-----------|------|-------------|
 | `path` | string | Ruta del fichero |
-| `old_string` | string | Texto a buscar (debe ser único en el fichero) |
+| `old_string` | string | Texto a buscar (único). Copia el texto del fichero; pequeñas diferencias de espacios/indentación se toleran |
 | `new_string` | string | Texto de reemplazo |
 
 **Permiso defecto:** `ask`
 
-Falla si `old_string` no se encuentra o no es único.
+Falla si `old_string` no se encuentra o la coincidencia es **ambigua** (aparece varias veces).
+
+#### Match tolerante a whitespace, multi-lenguaje (v0.4.8)
+
+La causa nº1 de "PRE-EDIT FALLIDO" era el modelo equivocándose en espacios/tabs/indentación de un `old_string` multilínea. `edit_file`/`edit_files` ya **no exigen match exacto**: el matcher escala la tolerancia y **solo aplica si la coincidencia es ÚNICA** (si es ambigua, no adivina y devuelve error):
+
+1. **Exacto.**
+2. **Por línea ignorando espacios finales** (`rstrip`) — cubre espacios al final de línea y diferencias CRLF/LF.
+3. **Por línea ignorando indentación** (`strip`) — cubre tabs vs espacios o un bloque desplazado; al aplicar, se **reaplica la indentación real del fichero** al `new_string`.
+
+Funciona en **cualquier lenguaje** (opera sobre líneas y whitespace, sin asumir sintaxis). El resultado avisa cuando hubo que tolerar whitespace (`(match tolerante a indentación — revisa el diff)`); el diff mostrado es la verdad. `replace_all=true` sigue usando match literal exacto.
 
 #### Verificación previa y anti-bucle de ediciones (v0.4.2)
 
@@ -84,6 +97,26 @@ Para evitar que el modelo malgaste turnos editando con texto alucinado, OOCode a
   3. **3.º:** parada en seco — deja de reintentar sobre ese fichero; lo más probable es que el cambio ya esté hecho (debe verificarlo e informar al usuario) o que falte el texto exacto (debe pedir ayuda).
 
   El contador se reinicia cuando una modificación a ese fichero tiene éxito. Así se corta el bucle típico `edit → regex → write` que no avanza tras una compactación.
+
+#### Fiabilidad de edición — invalidación de la caché de lecturas (v0.4.7)
+
+Las salvaguardas anteriores mitigaban el **síntoma**; en v0.4.7 se corrigió la **causa raíz** de que las ediciones "nunca acertaran y tuvieran que revertir".
+
+OOCode cachea los resultados de las herramientas de **solo lectura** (`read_file`, `grep_code`, `read_sections`, `ls_dir`…) durante el turno para no repetir trabajo. Esa caché solo se vaciaba **una vez por turno**, pero el auto-continue ejecuta muchas herramientas dentro del mismo turno. El efecto era:
+
+1. `read_file(fichero)` → se cachea el contenido.
+2. `edit_file(fichero)` → **éxito**, el fichero cambia en disco.
+3. `read_file(fichero)` (mismos argumentos) → devolvía el contenido **cacheado pre-edición**.
+4. El agente creía que el cambio no se aplicó, reintentaba el mismo `old_string` y obtenía `PRE-EDIT FALLIDO` (ya estaba aplicado) → bucle de reintento/revert.
+
+Era un fallo de la herramienta, no del modelo. Ahora, **tras cada operación de mutación las lecturas afectadas se invalidan automáticamente**:
+
+- **Dirigida por ruta** para las herramientas con ruta concreta (`edit_file`, `write_file`, `regex_replace`, `smart_replace`, `bulk_replace`, `edit_files`, `patch_apply`, `mv_file`, `cp_file`, `rm_file`…): se purgan las lecturas cacheadas de ese fichero y de su directorio.
+- **Vaciado completo** para las que ejecutan comandos y pueden tocar ficheros arbitrarios (`bash`, `python_exec`, `make_run`, `git_*`, `docker_*`…).
+
+Además, `smart_replace` y varias operaciones git mutadoras (`checkout`/`reset`/`merge`/`rebase`/`apply`) dejaron de cachearse: antes, una segunda llamada idéntica devolvía el resultado cacheado **sin editar de verdad**.
+
+Consecuencia práctica: un `read_file` posterior a un edit siempre refleja el cambio, así que el agente ya no entra en el bucle de reintentos por leer contenido obsoleto.
 
 ---
 
@@ -131,6 +164,37 @@ Las siguientes herramientas se registran directamente en `ToolRegistry` (además
 | `python_exec` | Ejecuta código Python en un subintérprete aislado | `ask` |
 | `ls_dir` | Lista directorios en formato compacto | `auto` |
 | `workspace_remember` | Añade notas persistentes al OOCODE.md del workspace | `auto` |
+| `plan_create` / `task_done` | Plan de tareas del agente (ver doc 24) | `auto` |
+| `ask_user` | Pregunta(s) estructurada(s) al usuario y espera respuesta | `auto` |
+
+---
+
+## `ask_user` — preguntar al usuario (v0.4.6)
+
+El agente usa `ask_user` cuando la decisión es **del usuario** (en vez de adivinar o listar opciones en texto pasivo): ambigüedad real, elegir enfoque/orden, o proponer próximos pasos que dependen de una decisión.
+
+```python
+ask_user(questions=[
+  {
+    "header": "Enfoque",                      # chip corto
+    "question": "¿Qué enfoque prefieres?",
+    "multiSelect": false,                      # true = varias opciones (conserva el orden)
+    "options": [
+      {"label": "Rápido", "description": "menos robusto"},
+      {"label": "Completo", "description": "más lento"}
+    ]
+  }
+  # … hasta 4 preguntas
+])
+```
+
+- Hasta **4 preguntas** por llamada; **2-4 opciones** cada una. El sistema añade siempre una opción de **texto libre**.
+- **TUI**: formulario en la barra de estado con chips y navegación libre `←/→`; respondes por teclado. **WebUI**: tarjeta con secciones y botón Submit.
+- Al cerrar, un bloque `● User answered OOCode's questions: …` recoge las respuestas antes de continuar.
+- **Tolerante**: un modelo pequeño puede llamar con la forma simple `ask_user(question="…", options=["A","B"])` → se normaliza a 1 pregunta.
+- **Subagentes** NO pueden preguntar: reciben un fallback y deciden solos.
+- Es la base de `/plan` (plan-mode) y del prompt de permisos del WebUI.
+- **Siempre se muestra (v0.4.8):** `ask_user` es una pregunta genuina del agente, así que `/elevated` **no la silencia** — elevated solo afecta a los permisos de herramientas. Lo mismo para la aprobación de plan (`/plan on`): si la activas, siempre te pregunta. La aprobación de plan muestra el plan **formateado** en la conversación y un formulario con una **pregunta corta**.
 
 ---
 

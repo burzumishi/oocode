@@ -199,8 +199,13 @@ def doctor_page():
 
     # Flask
     try:
-        import flask
-        _ok("Flask", f"Flask {flask.__version__}")
+        import flask  # noqa: F401  (comprueba que está instalado)
+        from importlib.metadata import version as _pkg_version, PackageNotFoundError
+        try:
+            _flask_ver = _pkg_version("flask")
+        except PackageNotFoundError:
+            _flask_ver = "?"
+        _ok("Flask", f"Flask {_flask_ver}")
     except Exception:
         _fail("Flask", "Flask no instalado")
 

@@ -825,5 +825,48 @@ class TestDefaultPermissions(unittest.TestCase):
         self.assertEqual(DEFAULT_CONFIG["permissions"]["write_file"], "ask")
 
 
+class TestResultIndicatesFailure(unittest.TestCase):
+    """Clasificación robusta de éxito/fallo para el log tool_calls.jsonl.
+
+    El heurístico antiguo ('Error' not in result and 'fallida' not in result) marcaba
+    '⛔ PRE-EDIT FALLIDO' como éxito y daba falsos negativos con lint que dice 'error'."""
+
+    def test_tolerant_edit_is_success(self):
+        from tools.hooks import result_indicates_failure
+        self.assertFalse(result_indicates_failure(
+            "Edición aplicada en '/x' (match tolerante a indentación — revisa el diff)."))
+
+    def test_plain_success(self):
+        from tools.hooks import result_indicates_failure
+        self.assertFalse(result_indicates_failure("Edición aplicada en '/x'."))
+
+    def test_missing_arg_is_failure(self):
+        from tools.hooks import result_indicates_failure
+        self.assertTrue(result_indicates_failure(
+            "Error ejecutando 'edit_file': missing 1 required positional argument: 'path'"))
+
+    def test_pre_edit_fallido_is_failure(self):
+        from tools.hooks import result_indicates_failure
+        self.assertTrue(result_indicates_failure(
+            "⛔ PRE-EDIT FALLIDO: old_string no encontrado en '/x'."))
+
+    def test_duplicate_is_failure(self):
+        from tools.hooks import result_indicates_failure
+        self.assertTrue(result_indicates_failure("⚠️ DUPLICADO BLOQUEADO: ..."))
+
+    def test_smart_replace_not_found_is_failure(self):
+        from tools.hooks import result_indicates_failure
+        self.assertTrue(result_indicates_failure("⚠ smart_replace: patrón NO encontrado"))
+
+    def test_success_with_lint_errors_stays_success(self):
+        from tools.hooks import result_indicates_failure
+        self.assertFalse(result_indicates_failure(
+            "Edición aplicada.\n[Lint] ✗ cppcheck (rc=1): Preprocessing error for file"))
+
+    def test_empty_is_failure(self):
+        from tools.hooks import result_indicates_failure
+        self.assertTrue(result_indicates_failure(""))
+
+
 if __name__ == "__main__":
     unittest.main()

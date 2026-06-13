@@ -8,6 +8,16 @@ from api.base import BackendClient, Chunk, Response, ToolCall, _ToolFunction
 import agent.logger as log
 
 
+def _is_unsupported_think_error(exc: Exception) -> bool:
+    """True si el error de Ollama indica que el modelo no soporta el parámetro `think`.
+
+    Permite reintentar sin `think` en modelos sin canal de razonamiento (en vez de
+    propagar el error al usuario). Ollama responde algo como "model does not support
+    thinking" / "thinking is not supported"."""
+    m = str(exc).lower()
+    return "think" in m and ("not support" in m or "does not" in m or "unsupported" in m)
+
+
 def _raw_models(host: str) -> list:
     """Lista cruda de modelos de un servidor Ollama (objetos o dicts del SDK)."""
     data = ollama.Client(host=host).list()
@@ -99,16 +109,35 @@ class OllamaBackend(BackendClient):
         messages: list,
         tools: list,
         model_params: dict,
+        think=None,
     ) -> Iterator[Chunk]:
         kwargs = {"options": model_params} if model_params else {}
-        stream = self._client.chat(
-            model=model,
-            messages=messages,
-            tools=tools or [],
-            stream=True,
-            **kwargs,
-        )
-        for chunk in stream:
+        # `think` controla el canal de razonamiento de Ollama (bool o 'low'/'medium'/
+        # 'high'). None = omitir → default del modelo, sin error en modelos sin
+        # soporte de thinking. SIN esto, /think y /reasoning no llegaban al servidor.
+        if think is not None:
+            kwargs["think"] = think
+
+        def _open_stream(kw: dict):
+            return self._client.chat(
+                model=model, messages=messages, tools=tools or [],
+                stream=True, **kw,
+            )
+        try:
+            stream = _open_stream(kwargs)
+            first = next(stream, None)
+        except Exception as exc:
+            # Modelo sin soporte de thinking → reintentar sin el parámetro.
+            if "think" in kwargs and _is_unsupported_think_error(exc):
+                log.debug("ollama_think_unsupported_retry", model=model)
+                kwargs.pop("think", None)
+                stream = _open_stream(kwargs)
+                first = next(stream, None)
+            else:
+                raise
+
+        import itertools
+        for chunk in (itertools.chain([first], stream) if first is not None else stream):
             msg = chunk.message
             yield Chunk(
                 text=msg.content or "",
@@ -128,33 +157,48 @@ class OllamaBackend(BackendClient):
         tools: list,
         model_params: dict,
         timeout: float = 0,
+        think=None,
     ) -> Response:
         kwargs = {"options": model_params} if model_params else {}
-        if timeout > 0:
-            from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeout
-            with ThreadPoolExecutor(max_workers=1) as _ex:
-                _fut = _ex.submit(
-                    self._client.chat,
-                    model=model, messages=messages, tools=tools or [],
-                    stream=False, **kwargs,
-                )
-                try:
-                    resp = _fut.result(timeout=timeout)
-                except _FutureTimeout:
-                    # Señal de timeout — el caller maneja _TIMEOUT_SENTINEL
-                    raise TimeoutError("ollama_timeout")
-        else:
-            resp = self._client.chat(
-                model=model,
-                messages=messages,
-                tools=tools or [],
-                stream=False,
-                **kwargs,
+        if think is not None:
+            kwargs["think"] = think
+
+        def _call(kw: dict):
+            if timeout > 0:
+                from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeout
+                with ThreadPoolExecutor(max_workers=1) as _ex:
+                    _fut = _ex.submit(
+                        self._client.chat,
+                        model=model, messages=messages, tools=tools or [],
+                        stream=False, **kw,
+                    )
+                    try:
+                        return _fut.result(timeout=timeout)
+                    except _FutureTimeout:
+                        # Señal de timeout — el caller maneja _TIMEOUT_SENTINEL
+                        raise TimeoutError("ollama_timeout")
+            return self._client.chat(
+                model=model, messages=messages, tools=tools or [],
+                stream=False, **kw,
             )
+
+        try:
+            resp = _call(kwargs)
+        except TimeoutError:
+            raise
+        except Exception as exc:
+            # Modelo sin soporte de thinking → reintentar sin el parámetro.
+            if "think" in kwargs and _is_unsupported_think_error(exc):
+                log.debug("ollama_think_unsupported_retry", model=model)
+                kwargs.pop("think", None)
+                resp = _call(kwargs)
+            else:
+                raise
         msg = resp.message
         return Response(
             text=msg.content or "",
             tool_calls=_norm_tool_calls(msg.tool_calls),
+            thinking=getattr(msg, "thinking", "") or "",
             input_tokens=getattr(resp, "prompt_eval_count", 0) or 0,
             output_tokens=getattr(resp, "eval_count", 0) or 0,
         )

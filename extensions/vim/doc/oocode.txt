@@ -1,4 +1,4 @@
-*oocode.txt*  OOCode VIM Plugin — Wrapper completo del TUI OOCode (v3.1)
+*oocode.txt*  OOCode VIM Plugin — Wrapper completo del TUI OOCode (v3.2)
 
 ==============================================================================
 CONTENIDO                                                      *oocode-contents*
@@ -78,9 +78,36 @@ Pon en tu .vimrc / init.vim: >
   " Desactivar todos los mapeos por defecto
   let g:oocode_no_mappings = 0
 
+  " Inyectar contexto del fichero/directorio activo en cada :OOCode (1=on)
+  " Antepone al mensaje la RUTA ABSOLUTA del fichero abierto + línea/columna del
+  " cursor + directorio de trabajo, para que el agente sepa a qué te refieres
+  " ("revisa esta función") y lo lea con read_file. En un explorador de
+  " directorios referencia el directorio. No se inyecta en slash commands.
+  let g:oocode_inject_file_hint = 1
+
   " Mostrar mensajes de depuración en la detección
   let g:oocode_verbose   = 0
 <
+
+CONTEXTO DEL FICHERO ABIERTO                                   *oocode-context*
+
+El plugin trabaja sobre el fichero o directorio abierto en Vim. Dos vías:
+
+  • Referencia automática (g:oocode_inject_file_hint, on por defecto): cada
+    `:OOCode {mensaje}` y `:OOCodeAsk` antepone una línea como
+      [Contexto Vim — el usuario está viendo el fichero: /ruta/abs.c
+       (línea L12:5, ft=c). Directorio de trabajo: /ruta/proyecto]
+    El agente NO recibe el contenido, solo la referencia: lo lee bajo demanda
+    con read_file. Barato y suficiente para "revisa la función X de aquí". En un
+    explorador (netrw) referencia el directorio en lugar del fichero.
+
+  • Contenido explícito: :OOCodeContext (fichero entero), :OOCodeSelection /
+    :OOCodeExplain / :OOCodeReview (selección visual) embeben el código en el
+    mensaje dentro de un bloque ```lang. Úsalas para razonar sobre un fragmento
+    concreto sin que el agente tenga que leer el fichero.
+
+Las rutas son SIEMPRE absolutas para que el agente las abra aunque su
+project_dir difiera del directorio de trabajo de Vim.
 
 ==============================================================================
 4. COMANDOS                                                    *oocode-commands*
@@ -204,9 +231,23 @@ eventos que fluyen por el stream SSE ya abierto:
   plan_progress  → "  ◈  Plan [done/total] ▸ tarea activa"
   subagent_start → cabecera del subagente; su texto/tools se prefijan con │
   subagent_done  → "  │ ⎿ nombre ✓"
+  question       → ask_user: prompt interactivo (inputlist) → /api/chat/answer
+  ask_answers    → bloque resumen "● Respondiste a OOCode: ⎿ Q → A"
+  permission     → confirmación de permiso (si webui.permissionPrompt ON)
+  queued         → mensaje encolado mientras el agente trabaja (cola FIFO)
+  slash_result   → resultado de un slash command ejecutado server-side
+  reasoning      → razonamiento del modelo (💭) si el pensamiento está activo
   embed_flash    → operación de memoria/RAG (indicador discreto)
   done           → flush de texto + separador de turno
   error          → mensaje de error
+
+Paridad interactiva (TUI/WebUI): cuando el agente llama a `ask_user`, el turno
+del servidor BLOQUEA hasta recibir la respuesta. El plugin muestra las preguntas
+y opciones en el panel y pide tu elección con inputlist() (o texto libre); la
+respuesta se envía a /api/chat/answer y el turno continúa. Lo mismo para los
+permisos (POST /api/chat/permission) si webui.permissionPrompt está activo. El
+prompt se difiere con un timer porque input() no puede invocarse desde el
+callback del stream.
 
 El stream reconecta automáticamente si se desconecta (timeout o red). Un
 watchdog (g:oocode_turn_timeout) cierra el turno si el stream enmudece, para

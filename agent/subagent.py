@@ -367,6 +367,7 @@ RESTRICCIONES ABSOLUTAS:
             permissions=sub_config.permissions,
             max_memory_lines=sub_config.ws_max_memory_lines,
             max_daily_chars=sub_config.ws_max_daily_chars,
+            memory_full_max_chars=sub_config.ws_memory_full_max_chars,
         )
         if not ws_manager.exists():
             ws_manager.init()
@@ -572,7 +573,7 @@ RESTRICCIONES ABSOLUTAS:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "message": {"type": "string", "description": "Resumen de lo completado (opcional)"},
+                        "message": {"type": "string", "description": "Narración del desenlace (qué hiciste, qué decidiste y por qué, resultado) — se muestra al usuario; no repitas solo el título"},
                     },
                 },
             })
@@ -934,7 +935,7 @@ RESTRICCIONES ABSOLUTAS:
                         "type": "string",
                         "description": (
                             "Pregunta específica de exploración — qué arquitectura/módulos necesitas entender. "
-                            "Ej: 'Mapea cómo fluye una conexión TCP desde accept() hasta el bucle de comandos en src/', "
+                            "Ej: 'Mapea cómo fluye una conexión TCP desde accept() hasta el bucle de comandos', "
                             "'¿Qué ficheros implementan el sistema de combate y cómo se relacionan?'"
                         ),
                     },
@@ -986,7 +987,7 @@ RESTRICCIONES ABSOLUTAS:
                 return (f"Error: el equipo tiene {len(members)} miembros pero el máximo "
                         f"configurado es {_max_team_size} (subagents.maxTeamSize). "
                         f"Reduce el número de agentes distintos en assign_to.")
-            team = _create_team_fn(team_id, lead_agent_id, members)
+            _create_team_fn(team_id, lead_agent_id, members)
             from agent.tasks import add_subtask as _add_st
             added = 0
             for st in subtasks:
@@ -1172,7 +1173,6 @@ RESTRICCIONES ABSOLUTAS:
                     errors[i] = sub.error or "unknown error"
 
             n_ok  = len(results)
-            n_err = len(errors)
             sections = [f"## Fanout {agent_id}: {n_ok}/{len(chunks)} chunks OK\n"]
             for i, chunk in enumerate(chunks):
                 header = f"### Chunk {i+1}/{len(chunks)}: {chunk[:80]}"
@@ -1214,9 +1214,9 @@ RESTRICCIONES ABSOLUTAS:
                         "description": (
                             "Lista de 1-10 chunks. Cada chunk es una tarea autónoma que el agente "
                             "puede ejecutar de forma independiente. "
-                            "Ejemplo: ['Analiza src/auth/ buscando vulnerabilidades XSS', "
-                            "'Analiza src/db/ buscando vulnerabilidades SQL injection', "
-                            "'Analiza src/api/ buscando vulnerabilidades IDOR']"
+                            "Ejemplo: ['Analiza el módulo de autenticación buscando vulnerabilidades XSS', "
+                            "'Analiza la capa de base de datos buscando inyección SQL', "
+                            "'Analiza la capa de API buscando vulnerabilidades IDOR']"
                         ),
                         "minItems": 1,
                         "maxItems": 10,

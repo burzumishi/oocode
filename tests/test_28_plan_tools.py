@@ -206,6 +206,174 @@ class TestExecuteTaskDone:
         assert result
 
 
+class TestTaskDoneDedupFlagSync:
+    """Regresión: al avanzar de tarea, _execute_task_done cierra y REABRE el live block.
+    Los flags de dedup (_bullet_block_open / _last_displayed_bullet) deben sincronizarse
+    con esa realidad. Sin esto, si el modelo reemite el texto de la nueva tarea en el
+    turno siguiente, _is_duplicate_bullet comparaba contra el bullet viejo → ● duplicado
+    (mismo patrón que el bug de stale-state tras compactación)."""
+
+    def _tui_loop(self):
+        loop = _make_loop()
+        loop.capture_output = False
+        loop._status_cb = MagicMock()
+        loop._start_live_block_cb = MagicMock()
+        loop._flush_live_block_cb = MagicMock()
+        loop._update_live_tools_cb = MagicMock()
+        loop._live_tool_count = 0
+        # Aislar el render del panel/summary intermedio (no es lo que probamos)
+        loop._print_plan_panel_update = MagicMock()
+        loop._flush_task_intermediate_summary = MagicMock()
+        loop._print = MagicMock()
+        return loop
+
+    def test_reanchors_dedup_state_to_next_task(self):
+        loop = self._tui_loop()
+        loop._execute_plan_create(["Primera tarea", "Segunda tarea muy concreta"])
+        # Simular el estado tras mostrar el bullet del turno que llamó task_done
+        loop._bullet_block_open = True
+        loop._last_displayed_bullet = "texto del turno anterior"
+
+        loop._execute_task_done()   # T1 → done, T2 → active, reabre live block
+
+        # El live block se reabrió → el bullet debe anclarse al texto de la NUEVA tarea
+        assert loop._start_live_block_cb.called
+        assert loop._bullet_block_open is True
+        assert loop._last_displayed_bullet == "Segunda tarea muy concreta"
+
+        # Turno siguiente reemite el texto de la tarea → debe considerarse duplicado
+        # (acumular en el bloque vivo), NO arrancar un ● nuevo.
+        assert loop._is_duplicate_bullet(
+            "Segunda tarea muy concreta", [{"function": {"name": "x"}}]) is True
+
+    def test_all_done_clears_bullet_block_open(self):
+        loop = self._tui_loop()
+        loop._execute_plan_create(["Única tarea"])
+        loop._bullet_block_open = True
+        loop._last_displayed_bullet = "algo"
+
+        loop._execute_task_done()   # todas completadas → cierra, NO reabre
+
+        # Sin bloque reabierto, el flag debe reflejar que NO hay dónde acumular
+        assert loop._bullet_block_open is False
+        # Un turno tool-only posterior NO debe adjuntarse a un bloque cerrado
+        assert loop._is_duplicate_bullet("", [{"function": {"name": "x"}}]) is False
+
+
+class TestPlanApprovalGate:
+    """Plan-mode (GAP 2): si rt.plan_approval=True y hay usuario interactivo, plan_create
+    presenta el plan y espera aprobación (vía ask_user) antes de comprometerlo."""
+
+    def _gate_loop(self, plan_approval=True, is_subagent=False, capture=False):
+        loop = _make_loop()
+        loop.capture_output = capture
+        loop.is_subagent = is_subagent
+        loop.rt = MagicMock()
+        loop.rt.plan_approval = plan_approval
+        loop.tasks = None
+        loop._webui_queue = None
+        loop._set_plan_header_mode_cb = None
+        loop._print = MagicMock()
+        loop._plan_summary = ""
+        loop._plan_active_msg_idx = -1
+        loop.context = MagicMock(); loop.context.messages = []
+        return loop
+
+    def test_approve_commits_plan(self):
+        loop = self._gate_loop()
+        loop._execute_ask_user = MagicMock(return_value="Elegido por el usuario: Aprobar y ejecutar")
+        out = loop._execute_plan_create(["T1", "T2"])
+        loop._execute_ask_user.assert_called_once()
+        assert "Plan creado" in out
+        assert len(loop._plan_tasks) == 2
+
+    def test_cancel_does_not_commit(self):
+        loop = self._gate_loop()
+        loop._plan_tasks = []
+        loop._execute_ask_user = MagicMock(return_value="Elegido por el usuario: Cancelar")
+        out = loop._execute_plan_create(["T1", "T2"])
+        assert "NO creado" in out
+        assert loop._plan_tasks == []
+
+    def test_edit_does_not_commit(self):
+        loop = self._gate_loop()
+        loop._plan_tasks = []
+        loop._execute_ask_user = MagicMock(
+            return_value="Elegido por el usuario: Editar el plan  ·  Además indicó: añade tests")
+        out = loop._execute_plan_create(["T1", "T2"])
+        assert "Replantea" in out and "añade tests" in out
+        assert loop._plan_tasks == []
+
+    def test_off_does_not_ask(self):
+        loop = self._gate_loop(plan_approval=False)
+        loop._execute_ask_user = MagicMock()
+        out = loop._execute_plan_create(["T1"])
+        loop._execute_ask_user.assert_not_called()
+        assert "Plan creado" in out
+
+    def test_subagent_bypasses_gate(self):
+        loop = self._gate_loop(is_subagent=True)
+        loop._execute_ask_user = MagicMock()
+        out = loop._execute_plan_create(["T1"])
+        loop._execute_ask_user.assert_not_called()   # gate requiere not is_subagent
+        assert "Plan creado" in out
+
+    def test_capture_output_bypasses_gate(self):
+        loop = self._gate_loop(capture=True)
+        loop._execute_ask_user = MagicMock()
+        out = loop._execute_plan_create(["T1"])
+        loop._execute_ask_user.assert_not_called()
+        assert "Plan creado" in out
+
+
+class TestPlanApprovalConfig:
+    def test_default_in_context_block(self):
+        from config import DEFAULT_CONFIG
+        assert DEFAULT_CONFIG["context"].get("planApproval") is False
+
+    def test_load_reads_plan_approval_as_bool(self, tmp_path, monkeypatch):
+        import json, config as _cfgmod
+        from config import OOConfig
+        p = tmp_path / "oocode.json"
+        p.write_text(json.dumps({"context": {"planApproval": True}}))
+        monkeypatch.setattr(_cfgmod.constants, "CONFIG_FILE", p, raising=False)
+        # _const resuelve CONFIG_FILE dinámicamente; forzamos vía monkeypatch del módulo
+        monkeypatch.setattr("config.model._const",
+                            lambda k: p if k == "CONFIG_FILE" else _cfgmod.constants.__dict__.get(k))
+        cfg = OOConfig.load()
+        assert cfg.plan_approval is True
+
+    def test_save_persists_plan_approval(self):
+        from config import OOConfig
+        cfg = OOConfig()
+        cfg.plan_approval = True
+        raw = {}
+        # emular el bloque que save() escribe en context
+        ctx = raw.setdefault("context", {})
+        ctx["planApproval"] = cfg.plan_approval
+        assert raw["context"]["planApproval"] is True
+
+
+class TestPlanCommand:
+    def test_cmd_plan_on_off(self):
+        from unittest.mock import patch
+        from ui.commands import _cmd_plan
+        rt = MagicMock(); rt.plan_approval = False
+        with patch("ui.commands.console"):
+            _cmd_plan("on", rt)
+            assert rt.plan_approval is True
+            _cmd_plan("off", rt)
+            assert rt.plan_approval is False
+
+    def test_cmd_plan_status_no_change(self):
+        from unittest.mock import patch
+        from ui.commands import _cmd_plan
+        rt = MagicMock(); rt.plan_approval = True
+        with patch("ui.commands.console"):
+            _cmd_plan("", rt)   # solo muestra estado
+        assert rt.plan_approval is True
+
+
 class TestPlanToolsPermissions:
     def test_plan_create_default_permission_is_auto(self):
         from config import DEFAULT_CONFIG

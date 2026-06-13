@@ -1014,7 +1014,7 @@ class TestMCPChartTools:
 
     def test_insert_chart_creates_native_docx(self):
         import tempfile, zipfile
-        from mcp_servers.home_office_assistant import _TOOL_FNS
+        from mcp_servers.word_assistant import _TOOL_FNS
         with tempfile.TemporaryDirectory() as d:
             out = str(Path(d) / "chart.docx")
             result = _TOOL_FNS["insert_chart"]({
@@ -1032,7 +1032,7 @@ class TestMCPChartTools:
 
     def test_insert_chart_pie_native(self):
         import tempfile
-        from mcp_servers.home_office_assistant import _TOOL_FNS
+        from mcp_servers.word_assistant import _TOOL_FNS
         with tempfile.TemporaryDirectory() as d:
             out = str(Path(d) / "pie.docx")
             result = _TOOL_FNS["insert_chart"]({
@@ -1044,12 +1044,12 @@ class TestMCPChartTools:
             assert Path(out).exists()
 
     def test_insert_chart_missing_path(self):
-        from mcp_servers.home_office_assistant import _TOOL_FNS
+        from mcp_servers.word_assistant import _TOOL_FNS
         result = _TOOL_FNS["insert_chart"]({"chart_type": "bar", "data": {}})
         assert "requerido" in result.lower() or "path" in result.lower()
 
     def test_chart_tools_registered_in_tool_fns(self):
-        from mcp_servers.home_office_assistant import _TOOL_FNS
+        from mcp_servers.word_assistant import _TOOL_FNS
         assert "insert_chart" in _TOOL_FNS, "Tool 'insert_chart' no registrada"
         # Las tools antiguas (matplotlib PNG y duplicadas) ya no existen
         for removed in ("create_bar_chart", "create_pie_chart", "create_line_chart",

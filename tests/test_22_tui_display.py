@@ -387,6 +387,186 @@ class TestFlushTurnBlockHeader:
         assert loop._turn_block_has_header is False
 
 
+class TestModifyClosesVisualUnit:
+    """Una edición completada con éxito CIERRA su unidad visual (estilo Claude Code):
+    exploración + razonamiento + edición + diff pasan al buffer estático al momento;
+    la siguiente write tool reabre su propio bloque. Sin esto, N ediciones del MISMO
+    fichero se apilaban en un live block ("Used 16 tools") y los diffs se soltaban
+    todos de golpe al final."""
+
+    def _loop(self):
+        loop = _make_loop()
+        loop._status_cb = lambda x: None
+        loop._webui_queue = None
+        loop._print = lambda *a, **k: None
+        loop._render_tool_diff_print = lambda *a, **k: None
+        return loop
+
+    def test_modify_success_flushes_block(self):
+        """edit_file OK (pre_shown) → _flush_turn_block tras renderizar el diff."""
+        loop = self._loop()
+        flushed = []
+        loop._flush_turn_block = lambda: flushed.append(True)
+        loop._show_tool_block("edit_file", {"path": "/p/a.c"},
+                              "✓ aplicado", allowed=True, pre_shown=True)
+        assert flushed == [True]
+
+    def test_modify_failure_keeps_block_open(self):
+        """Edición FALLIDA → NO cierra (el reintento se queda en el mismo bloque)."""
+        loop = self._loop()
+        flushed = []
+        loop._flush_turn_block = lambda: flushed.append(True)
+        loop._show_tool_block("edit_file", {"path": "/p/a.c"},
+                              "⛔ PRE-EDIT FALLIDO", allowed=True, pre_shown=True)
+        assert flushed == []
+
+    def test_read_tool_does_not_flush(self):
+        """Las tools de lectura se bufferizan y NO cierran la unidad."""
+        loop = self._loop()
+        flushed = []
+        loop._flush_turn_block = lambda: flushed.append(True)
+        loop._show_tool_block("read_file", {"path": "/p/a.c"},
+                              "contenido", allowed=True, pre_shown=True)
+        assert flushed == []
+
+    def test_next_modify_reopens_block(self):
+        """Tras el cierre post-diff (sin bloque abierto), la siguiente write tool
+        reabre su propia unidad ● vía _start_live_block_cb."""
+        loop = self._loop()
+        loop._current_write_target = ""   # reset por el flush post-diff
+        loop._bullet_block_open = False
+        started = []
+        loop._start_live_block_cb = lambda b: started.append(b)
+        loop._show_tool_running_header("edit_file", {"path": "/p/b.c"})
+        assert len(started) == 1
+        assert "b.c" in started[0]
+        assert loop._bullet_block_open is True
+        assert loop._current_write_target.endswith("b.c")
+
+    def test_open_block_does_not_reopen(self):
+        """Con bloque abierto (1ª edición tras explorar el fichero) NO se reabre
+        ni se cierra nada — la exploración y la edición siguen juntas."""
+        loop = self._loop()
+        loop._current_write_target = ""
+        loop._bullet_block_open = True    # el ● del texto del modelo sigue abierto
+        started, flushed = [], []
+        loop._start_live_block_cb = lambda b: started.append(b)
+        loop._flush_turn_block = lambda: flushed.append(True)
+        loop._show_tool_running_header("edit_file", {"path": "/p/c.c"})
+        assert started == [] and flushed == []
+
+
+class TestConcernChangeSplitsBlock:
+    """Frontera de bloque por CAMBIO DE ASUNTO (concern) en iteraciones tool-only:
+    un intento de compilación (bash/make) y la edición de un fichero son unidades
+    visuales distintas. Sin esto, 'autogen + make + razonar errores + editar
+    house.h' acababan TODOS bajo un mismo "Used N tools" con los 💭 enterrados.
+    Las tandas de solo lectura son NEUTRALES y nunca rompen el bloque (la regla
+    canónica 'razonar a solas nunca cierra' sigue intacta — deciden las TOOLS)."""
+
+    def _loop(self):
+        loop = _make_loop()
+        loop._status_cb = lambda x: None
+        loop._webui_queue = None
+        loop._print = lambda *a, **k: None
+        return loop
+
+    @staticmethod
+    def _tc(name, args):
+        from types import SimpleNamespace
+        return SimpleNamespace(function=SimpleNamespace(name=name, arguments=args))
+
+    # ── _tools_concern ───────────────────────────────────────────────────────
+    def test_concern_write_tool(self):
+        loop = self._loop()
+        tcs = [self._tc("read_file", {"path": "/p/h.c"}),
+               self._tc("edit_file", {"path": "/p/h.c", "old_string": "a", "new_string": "b"})]
+        assert loop._tools_concern(tcs) == "file:/p/h.c"
+
+    def test_concern_smart_replace_file_param(self):
+        loop = self._loop()
+        tcs = [self._tc("smart_replace", {"file": "/p/n.h", "pattern": "x", "replacement": "y"})]
+        assert loop._tools_concern(tcs) == "file:/p/n.h"
+
+    def test_concern_cmd_tools(self):
+        loop = self._loop()
+        for name in ("bash", "python_exec", "make_run", "run_script"):
+            assert loop._tools_concern([self._tc(name, {"command": "make"})]) == "cmd"
+
+    def test_concern_reads_are_neutral(self):
+        loop = self._loop()
+        tcs = [self._tc("read_file", {"path": "/p/a.c"}),
+               self._tc("grep_code", {"pattern": "foo"})]
+        assert loop._tools_concern(tcs) == ""
+
+    def test_concern_write_without_path_is_neutral(self):
+        """Write tool sin ruta extraíble → '' (sin concern fiable, no romper)."""
+        loop = self._loop()
+        assert loop._tools_concern([self._tc("edit_file", {"old_string": "a"})]) == ""
+
+    # ── tracking del concern del bloque ──────────────────────────────────────
+    def test_cmd_tool_marks_block(self):
+        loop = self._loop()
+        loop._block_has_cmd = False
+        loop._show_tool_running_header("bash", {"command": "make"})
+        assert loop._block_has_cmd is True
+
+    def test_flush_resets_concern(self):
+        loop = self._loop()
+        loop._flush_live_block_cb = lambda s: None
+        loop._block_has_cmd = True
+        loop._current_write_target = "/p/a.c"
+        loop._flush_turn_block()
+        assert loop._block_has_cmd is False
+        assert loop._current_write_target == ""
+
+    # ── decisión en run(): cmd → file rompe; lecturas no ─────────────────────
+    def test_run_source_overrides_dup_on_concern_change(self):
+        """run() degrada _is_dup_bullet a False cuando el concern de la tanda
+        entrante difiere del concern establecido del bloque abierto. La decisión
+        la toman las tools (_tools_concern), NUNCA el razonamiento a solas."""
+        import inspect
+        from agent.loop import AgentLoop
+        src = inspect.getsource(AgentLoop.run)
+        i_dup  = src.index("_is_dup_bullet = self._is_duplicate_bullet")
+        i_ovr  = src.index("_next_concern = self._tools_concern(tool_calls)")
+        i_step = src.index("_text_step = bool(")
+        assert i_dup < i_ovr < i_step
+        seg = src[i_dup:i_step]
+        assert "if _is_dup_bullet:" in seg          # solo iteraciones de continuación
+        assert "_blk_concern" in seg
+        assert "_is_dup_bullet = False" in seg
+
+    def test_cmd_block_then_edit_splits(self):
+        """Simulación: bloque abierto con comandos (make) + tanda entrante con
+        edit_file → la decisión de run() marca la tanda como unidad nueva."""
+        loop = self._loop()
+        loop._bullet_block_open = True
+        loop._block_has_cmd = True
+        loop._current_write_target = ""
+        tcs = [self._tc("edit_file", {"path": "/p/house.h", "old_string": "a", "new_string": "b"})]
+        assert loop._is_duplicate_bullet("", tcs) is True       # tool-only continuación…
+        blk = "cmd"
+        nxt = loop._tools_concern(tcs)
+        assert nxt == "file:/p/house.h" and nxt != blk          # …pero el asunto cambia
+
+    def test_cmd_block_then_reads_does_not_split(self):
+        """Lecturas tras comandos (diagnóstico del error de make) NO rompen."""
+        loop = self._loop()
+        loop._bullet_block_open = True
+        loop._block_has_cmd = True
+        tcs = [self._tc("read_file", {"path": "/p/house.c"})]
+        assert loop._tools_concern(tcs) == ""                   # neutral → continuación
+
+    def test_same_file_block_does_not_split(self):
+        """Más ediciones del MISMO fichero → mismo concern → mismo bloque."""
+        loop = self._loop()
+        loop._bullet_block_open = True
+        loop._current_write_target = "/p/house.h"
+        tcs = [self._tc("edit_file", {"path": "/p/house.h", "old_string": "x", "new_string": "y"})]
+        assert loop._tools_concern(tcs) == "file:/p/house.h"    # == concern del bloque
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # tools.progress — mecanismo de callback de progreso
 # ─────────────────────────────────────────────────────────────────────────────
@@ -568,6 +748,122 @@ class TestShowToolRunningHeaderTUI:
         out = " ".join(lines)
         assert "◐" in out
 
+    def test_mem_tool_flushes_block_and_skips_live_feed(self):
+        """mem_save/workspace_remember NO se encierran en el bloque de tools: cierran
+        el live block (su ◐ ⬡ sale estático, fuera) y no alimentan el live feed."""
+        loop = _make_loop()
+        loop._status_cb = lambda x: None
+        loop._webui_queue = None
+        flushed, live_updates = [], []
+        loop._flush_live_block_cb = lambda s="": None
+        loop._flush_turn_block = lambda: flushed.append(True)
+        loop._update_live_tool_start_cb = lambda label, prev: live_updates.append(label)
+        loop._print = lambda *a, **k: None
+        loop._show_tool_running_header("mem_save", {"name": "x"})
+        assert flushed == [True]
+        assert live_updates == []
+
+    def test_mem_tool_result_does_not_count_in_next_block(self):
+        """El resultado de una mem tool (pre_shown) no incrementa el contador del
+        bloque siguiente (saldría 'Used N+1 tools' en un bloque al que no pertenece)."""
+        loop = _make_loop()
+        loop._status_cb = lambda x: None
+        loop._webui_queue = None
+        loop._print = lambda *a, **k: None
+        loop._show_inline_compact_result = lambda *a, **k: None
+        counts = []
+        loop._update_live_tools_cb = lambda n: counts.append(n)
+        loop._show_tool_block("mem_save", {"name": "x"}, "✓ guardado",
+                              allowed=True, pre_shown=True)
+        assert counts == []
+
+    def test_task_done_flushes_block_and_skips_live_feed(self):
+        """task_done marca el fin de una tarea del plan: cierra la unidad visual de
+        la tarea ANTES de ejecutarse (su narración ● sale estática entre bloques,
+        no enterrada en _live_block_body) y no alimenta el live feed."""
+        loop = _make_loop()
+        loop._status_cb = lambda x: None
+        loop._webui_queue = None
+        flushed, live_updates = [], []
+        loop._flush_live_block_cb = lambda s="": None
+        loop._flush_turn_block = lambda: flushed.append(True)
+        loop._update_live_tool_start_cb = lambda label, prev: live_updates.append(label)
+        loop._print = lambda *a, **k: None
+        loop._show_tool_running_header("task_done", {"message": "Tarea 3 hecha"})
+        assert flushed == [True]
+        assert live_updates == []
+
+    def test_task_done_result_does_not_count_in_next_block(self):
+        """El resultado de task_done ('✔ Tarea N/M…') es guía para el modelo, no
+        display: no se bufferiza ni incrementa el contador del bloque siguiente."""
+        loop = _make_loop()
+        loop._status_cb = lambda x: None
+        loop._webui_queue = None
+        loop._print = lambda *a, **k: None
+        counts = []
+        loop._update_live_tools_cb = lambda n: counts.append(n)
+        loop._turn_block = []
+        loop._show_tool_block("task_done", {"message": "x"}, "✔ Tarea 1/3 completada",
+                              allowed=True, pre_shown=True)
+        assert counts == []
+        assert loop._turn_block == []
+
+    def test_first_edit_same_file_does_not_flush(self):
+        """Read+edit del MISMO fichero (1ª edición tras explorarlo) NO rompe el bloque:
+        la exploración y la edición del fichero quedan juntas en un bloque."""
+        loop = _make_loop()
+        loop._status_cb = lambda x: None
+        loop._current_write_target = ""           # aún no se editó nada
+        loop._live_tool_count = 3                  # ya hubo exploración del fichero
+        flushed = []
+        loop._flush_turn_block = lambda: flushed.append(True)
+        loop._print = lambda *a, **k: None
+        loop._show_tool_running_header("edit_file", {"path": "/p/foo.c"})
+        assert not flushed, "la 1ª edición no debe romper el bloque (mismo fichero)"
+        assert loop._current_write_target.endswith("foo.c")
+
+    def test_switch_file_flushes_block(self):
+        """Editar un fichero DISTINTO al que veníamos editando SÍ abre un bloque nuevo."""
+        loop = _make_loop()
+        loop._status_cb = lambda x: None
+        loop._current_write_target = "/p/foo.c"   # veníamos editando foo.c
+        loop._live_tool_count = 1
+        flushed = []
+        loop._flush_turn_block = lambda: flushed.append(True)
+        loop._print = lambda *a, **k: None
+        loop._show_tool_running_header("edit_file", {"path": "/p/bar.c"})
+        assert flushed, "cambiar de fichero debe cerrar el bloque anterior"
+        assert loop._current_write_target.endswith("bar.c")
+
+    def test_extract_write_target_covers_file_param(self):
+        """smart_replace/regex_replace usan el parámetro `file` (no `path`): si
+        _extract_write_target no lo cubre, el auto-split por fichero NUNCA dispara
+        para ellas y las ediciones de varios ficheros se acumulan en un solo bloque
+        ("Used 13 tools" con 3 Replace de 3 ficheros — bug real 2026-06-11)."""
+        loop = _make_loop()
+        assert loop._extract_write_target(
+            "smart_replace", {"file": "/p/a.c", "pattern": "x", "replacement": "y"}
+        ) == "/p/a.c"
+        assert loop._extract_write_target(
+            "regex_replace", {"file": "/p/b.c", "pattern": "x", "replacement": "y"}
+        ) == "/p/b.c"
+        assert loop._extract_write_target("edit_file", {"path": "/p/c.c"}) == "/p/c.c"
+        assert loop._extract_write_target("write_file", {"file_path": "/p/d.c"}) == "/p/d.c"
+
+    def test_switch_file_flushes_block_smart_replace(self):
+        """El auto-split también dispara entre smart_replace de ficheros distintos."""
+        loop = _make_loop()
+        loop._status_cb = lambda x: None
+        loop._current_write_target = "/p/act_move.c"
+        loop._live_tool_count = 1
+        flushed = []
+        loop._flush_turn_block = lambda: flushed.append(True)
+        loop._print = lambda *a, **k: None
+        loop._show_tool_running_header(
+            "smart_replace", {"file": "/p/parser.c", "pattern": "x", "replacement": "y"})
+        assert flushed, "smart_replace sobre OTRO fichero debe cerrar el bloque"
+        assert loop._current_write_target.endswith("parser.c")
+
     def test_repl_mode_no_status_cb(self):
         """En modo REPL (sin _status_cb), el header se muestra igual."""
         loop = _make_loop()
@@ -733,6 +1029,245 @@ class TestSubagentBulletAlignment:
         joined = " ".join(str(x) for c in calls for x in c)
         assert "│" not in joined
         assert "●" in joined and "Mensaje principal" in joined
+
+
+class TestToolOnlyTurnStartsLiveBlock:
+    """qwen3.5 (y otros modelos) emiten tool_calls SIN texto. El live block debe
+    arrancar igual para que las salidas de read/bash/grep sean visibles en vivo.
+
+    Regresión: antes el render del turno se gateaba con `if text:`, así que las
+    iteraciones sin texto no arrancaban el live block ni flusheaban _turn_block →
+    las tools quedaban bufferizadas e invisibles (y el siguiente flush las
+    descartaba con el live block inactivo). Sólo se veía cambiar "Pensando".
+    """
+
+    def _tc(self, name, args):
+        fn = MagicMock()
+        fn.name = name
+        fn.arguments = args
+        tc = MagicMock()
+        tc.function = fn
+        return tc
+
+    def test_empty_text_with_tools_starts_live_block(self, monkeypatch):
+        import agent.loop as _loop_mod
+        loop = _make_loop()
+        loop.is_subagent = False
+        loop.capture_output = False
+        loop._webui_queue = None
+        loop._WRITE_TOOLS = set()
+        loop._live_tool_count = 0
+        started = []
+        loop._start_live_block_cb = lambda bullet: started.append(bullet)
+        monkeypatch.setattr(_loop_mod, "console", MagicMock())
+        # Respuesta tool-only: texto vacío + un read_file
+        loop._turn_display_bullet("", [self._tc("read_file", {"path": "x.py"})])
+        assert started, "el live block no arrancó con texto vacío + tool_calls"
+
+    def test_empty_text_no_tools_does_not_start_live_block(self, monkeypatch):
+        import agent.loop as _loop_mod
+        loop = _make_loop()
+        loop.is_subagent = False
+        loop.capture_output = False
+        loop._webui_queue = None
+        loop._WRITE_TOOLS = set()
+        loop._live_tool_count = 0
+        started = []
+        loop._start_live_block_cb = lambda bullet: started.append(bullet)
+        monkeypatch.setattr(_loop_mod, "console", MagicMock())
+        # Sin tools y sin texto: no debe arrancar el live block
+        loop._turn_display_bullet("", [])
+        assert not started
+
+    def test_empty_text_bullet_labels_first_tool_not_ellipsis(self, monkeypatch):
+        """Tool-only turn: el bullet inicial del live block debe etiquetar la primera
+        tool ('Reading x.py'), NO el placeholder '…' (que era lo que el flush estático
+        mostraba como header permanente del turno)."""
+        import agent.loop as _loop_mod
+        loop = _make_loop()
+        loop.is_subagent = False
+        loop.capture_output = False
+        loop._webui_queue = None
+        loop._WRITE_TOOLS = set()
+        loop._live_tool_count = 0
+        started = []
+        loop._start_live_block_cb = lambda bullet: started.append(bullet)
+        monkeypatch.setattr(_loop_mod, "console", MagicMock())
+        loop._turn_display_bullet("", [self._tc("read_file", {"path": "x.py"})])
+        assert started
+        assert started[0] != "…"
+        assert "Reading" in started[0] and "x.py" in started[0]
+
+    def test_empty_text_bullet_shows_bash_command(self, monkeypatch):
+        """Para bash, el bullet muestra el verbo 'Running' + el comando."""
+        import agent.loop as _loop_mod
+        loop = _make_loop()
+        loop.is_subagent = False
+        loop.capture_output = False
+        loop._webui_queue = None
+        loop._WRITE_TOOLS = set()
+        loop._live_tool_count = 0
+        started = []
+        loop._start_live_block_cb = lambda bullet: started.append(bullet)
+        monkeypatch.setattr(_loop_mod, "console", MagicMock())
+        loop._turn_display_bullet("", [self._tc("bash", {"command": "make"})])
+        assert started and started[0] != "…"
+        assert "Running" in started[0]
+
+    def test_separator_only_text_labels_first_tool(self, monkeypatch):
+        """Regresión: el LLM emite '---' (regla horizontal markdown) como separador
+        tras un plan. No debe renderizarse como '● ---'; el bullet del live block
+        debe etiquetar la primera tool (p. ej. 'Running make…')."""
+        import agent.loop as _loop_mod
+        loop = _make_loop()
+        loop.is_subagent = False
+        loop.capture_output = False
+        loop._webui_queue = None
+        loop._WRITE_TOOLS = set()
+        loop._live_tool_count = 0
+        started = []
+        loop._start_live_block_cb = lambda bullet: started.append(bullet)
+        monkeypatch.setattr(_loop_mod, "console", MagicMock())
+        loop._turn_display_bullet("---", [self._tc("bash", {"command": "make clean"})])
+        assert started, "el live block no arrancó"
+        assert started[0] != "---" and "---" not in started[0]
+        assert "Running" in started[0]
+
+    def test_separator_then_text_keeps_real_text(self, monkeypatch):
+        """'---\\n\\nTexto real' → el separador inicial se descarta y el bullet usa
+        el texto informativo, no '---'."""
+        import agent.loop as _loop_mod
+        loop = _make_loop()
+        loop.is_subagent = False
+        loop.capture_output = False
+        loop._webui_queue = None
+        loop._WRITE_TOOLS = set()
+        loop._live_tool_count = 0
+        started = []
+        loop._start_live_block_cb = lambda bullet: started.append(bullet)
+        _console = MagicMock()
+        monkeypatch.setattr(_loop_mod, "console", _console)
+        loop._turn_display_bullet("---\n\nCompilando el proyecto.",
+                                  [self._tc("bash", {"command": "make"})])
+        assert started
+        # El bullet (live o estático) no debe ser el separador
+        _printed = " ".join(str(c) for c in _console.print.call_args_list)
+        assert "Compilando" in _printed or "Compilando" in (started[0] if started else "")
+        assert started[0] != "---"
+
+    def test_bullet_from_first_tool_empty_when_no_tools(self):
+        loop = _make_loop()
+        assert loop._bullet_from_first_tool([]) == ""
+
+    def test_bullet_from_first_tool_multi_suffix(self):
+        """Con varias tools, añade '(+N)' para indicar que hay más."""
+        loop = _make_loop()
+        lbl = loop._bullet_from_first_tool(
+            [self._tc("read_file", {"path": "a.py"}), self._tc("bash", {"command": "ls"})])
+        assert "(+1)" in lbl
+
+    def test_edit_bullet_shows_file_not_tool_name(self):
+        """'Editing Update' (sin sentido) → 'Editing (db.c)': muestra el fichero."""
+        loop = _make_loop()
+        lbl = loop._bullet_from_first_tool([self._tc("edit_file", {"path": "/x/src/db.c"})])
+        assert lbl == "Editing (db.c)"
+        assert "Update" not in lbl
+
+    def test_edit_bullet_resolves_path_alias(self):
+        """El modelo llama edit_file(file=…); el ● debe resolver el alias de ruta."""
+        loop = _make_loop()
+        lbl = loop._bullet_from_first_tool([self._tc("edit_file", {"file": "/x/src/db.c"})])
+        assert lbl == "Editing (db.c)"
+
+    def test_read_variants_bullet_show_file(self):
+        """read_sections/read_files/ls_dir/code_outline… deben mostrar el fichero en el
+        ● (antes el bullet caía a solo 'Reading' aunque el ⎿ sí mostraba el fichero)."""
+        loop = _make_loop()
+        assert loop._bullet_from_first_tool(
+            [self._tc("read_sections", {"path": "/x/src/omedit.c", "sections": ["f"]})]
+        ) == "Reading (omedit.c)"
+        assert loop._bullet_from_first_tool(
+            [self._tc("read_files", {"paths": ["/x/src/omedit.c", "/x/src/db.c"]})]
+        ) == "Reading (omedit.c +1)"
+        assert loop._bullet_from_first_tool(
+            [self._tc("ls_dir", {"path": "/x/src"})]
+        ) == "Listing (src)"
+        # alias de ruta también en read_sections
+        assert loop._bullet_from_first_tool(
+            [self._tc("read_sections", {"file": "/x/src/omedit.c", "sections": ["f"]})]
+        ) == "Reading (omedit.c)"
+
+    def test_live_verb_label_no_ctx_drops_tool_name(self):
+        """Sin contexto, un verbo propio NO cuelga el display ('Editing', no 'Editing Update')."""
+        loop = _make_loop()
+        assert loop._live_verb_label("edit_file", "", "Update") == "Editing"
+        # Tool sin verbo propio: el display sí es la mejor pista.
+        assert loop._live_verb_label("docker_inspect", "", "DockerInspect") == "Using DockerInspect"
+
+
+class TestDuplicateBulletDedup:
+    """qwen3.5 reemite el MISMO preámbulo cada iteración del auto-continue ejecutando
+    tools distintas. _is_duplicate_bullet detecta el ● duplicado para que las tools se
+    acumulen bajo un solo bloque (⎿ Ran N commands) en vez de un ● por turno."""
+
+    def _tc(self):
+        fn = MagicMock()
+        fn.name = "bash"
+        fn.arguments = {"command": "ls"}
+        tc = MagicMock()
+        tc.function = fn
+        return tc
+
+    def test_identical_text_with_open_block_is_duplicate(self):
+        loop = _make_loop()
+        loop.is_subagent = False
+        loop.capture_output = False
+        loop._bullet_block_open = True
+        loop._last_displayed_bullet = "Continuaré con la modernización."
+        assert loop._is_duplicate_bullet(
+            "Continuaré  con   la modernización.", [self._tc()]) is True
+
+    def test_different_text_is_not_duplicate(self):
+        loop = _make_loop()
+        loop.is_subagent = False
+        loop.capture_output = False
+        loop._bullet_block_open = True
+        loop._last_displayed_bullet = "Paso A."
+        assert loop._is_duplicate_bullet("Paso B.", [self._tc()]) is False
+
+    def test_no_open_block_is_not_duplicate(self):
+        loop = _make_loop()
+        loop.is_subagent = False
+        loop.capture_output = False
+        loop._bullet_block_open = False          # sin bloque vivo → no se puede acumular
+        loop._last_displayed_bullet = "Mismo texto."
+        assert loop._is_duplicate_bullet("Mismo texto.", [self._tc()]) is False
+
+    def test_no_tools_is_not_duplicate(self):
+        loop = _make_loop()
+        loop.is_subagent = False
+        loop.capture_output = False
+        loop._bullet_block_open = True
+        loop._last_displayed_bullet = "Mismo texto."
+        assert loop._is_duplicate_bullet("Mismo texto.", []) is False
+
+    def test_subagent_never_duplicates(self):
+        loop = _make_loop()
+        loop.is_subagent = True
+        loop.capture_output = True
+        loop._bullet_block_open = True
+        loop._last_displayed_bullet = "Mismo texto."
+        assert loop._is_duplicate_bullet("Mismo texto.", [self._tc()]) is False
+
+    def test_flush_turn_block_closes_open_flag(self):
+        loop = _make_loop()
+        loop.capture_output = False
+        loop._status_cb = None
+        loop._flush_live_block_cb = None
+        loop._bullet_block_open = True
+        loop._turn_block = []
+        loop._flush_turn_block()
+        assert loop._bullet_block_open is False
 
 
 class TestOrchestrationToolFooter:
@@ -978,3 +1513,61 @@ class TestTurnBlockAccumulation:
         ]
         loop._flush_turn_block()
         loop._print.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OSC 8 hyperlinks: Rich (force_terminal=True) los emite en enlaces de markdown,
+# pero el ANSI() de prompt_toolkit no los entiende y muestra el contenido crudo
+# ("8;id=…;https://…URL  texto  8;;"). _flatten_osc8 los reescribe a "texto (url)".
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestFlattenOsc8:
+    def _fn(self):
+        from ui.app import _flatten_osc8
+        return _flatten_osc8
+
+    def test_real_reported_case(self):
+        """El caso exacto reportado: enlace con id= y ST = ESC backslash."""
+        flat = self._fn()
+        s = ('\x1b]8;id=788935;https://en.cppreference.com/w/c/standard'
+             '\x1b\\C17 Standard\x1b]8;;\x1b\\')
+        assert flat(s) == 'C17 Standard (https://en.cppreference.com/w/c/standard)'
+        # No queda ningún resto de la secuencia OSC 8 cruda
+        assert '\x1b]8' not in flat(s)
+        assert '8;id=' not in flat(s)
+
+    def test_bel_terminator(self):
+        """Soporta ST = BEL (\\x07) además de ESC backslash."""
+        flat = self._fn()
+        s = '\x1b]8;;https://example.com\x07texto\x1b]8;;\x07'
+        assert flat(s) == 'texto (https://example.com)'
+
+    def test_autolink_no_duplicate_url(self):
+        """Si el texto visible ES la url, no se duplica."""
+        flat = self._fn()
+        s = '\x1b]8;;https://example.com\x07https://example.com\x1b]8;;\x07'
+        assert flat(s) == 'https://example.com'
+
+    def test_preserves_surrounding_sgr_color(self):
+        """Los códigos de color SGR alrededor del enlace se conservan intactos."""
+        flat = self._fn()
+        s = '\x1b[32m\x1b]8;;https://a.com\x1b\\A\x1b]8;;\x1b\\\x1b[0m'
+        assert flat(s) == '\x1b[32mA (https://a.com)\x1b[0m'
+
+    def test_multiple_links_one_line(self):
+        flat = self._fn()
+        s = ('\x1b]8;;https://a.com\x1b\\A\x1b]8;;\x1b\\ y '
+             '\x1b]8;;https://b.com\x1b\\B\x1b]8;;\x1b\\')
+        assert flat(s) == 'A (https://a.com) y B (https://b.com)'
+
+    def test_orphan_opener_stripped(self):
+        """Un introductor sin cierre se elimina (no deja basura cruda)."""
+        flat = self._fn()
+        s = '\x1b]8;;https://a.com\x1b\\texto sin cierre'
+        assert flat(s) == 'texto sin cierre'
+
+    def test_plain_text_untouched_fastpath(self):
+        """Texto sin OSC 8 pasa sin cambios (fast-path)."""
+        flat = self._fn()
+        s = 'línea normal \x1b[1msin enlaces\x1b[0m'
+        assert flat(s) is s  # mismo objeto: salida temprana sin regex

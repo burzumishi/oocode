@@ -200,6 +200,7 @@ body {{ overflow:hidden; }}
       <span class="tui-wave-bar"></span>
       <span class="tui-wave-bar"></span>
     </span>
+    <span class="tui-thinking-elapsed" id="tui-think-elapsed"></span>
   </div>
   <!-- Input -->
   <div class="tui-input-area">
@@ -227,19 +228,23 @@ body {{ overflow:hidden; }}
     <span class="tui-sb-sep">│</span>
     <span class="tui-sb-model" id="sb-model">—</span>
     <span class="tui-sb-sep">│</span>
+    <!-- Grupo de contexto (espeja la línea 2 del status del TUI: tokens · ctx · mem · rag) -->
+    <span id="sb-tokens" class="tui-sb-tokens" style="display:none"></span>
     <span class="tui-sb-ctx" id="sb-ctx">▱▱▱▱▱▱▱▱▱▱  0%</span>
     <span id="sb-compact-hint" style="display:none;font-size:.68rem;margin-left:4px;font-weight:600"></span>
+    <span class="tui-sb-cnt" id="sb-mem" title="Memorias recuperadas este turno" style="display:none"></span>
+    <span class="tui-sb-cnt" id="sb-rag" title="Chunks RAG recuperados este turno" style="display:none"></span>
     <span class="tui-sb-sep" id="sb-tasks-sep" style="display:none">│</span>
     <span class="tui-sb-tasks" id="sb-tasks" style="display:none"></span>
     <div class="tui-sb-right">
+      <span class="tui-sb-badge" id="sb-think"  title="Nivel de razonamiento" style="display:none"></span>
+      <span class="tui-sb-badge" id="sb-memcap" title="Memorias guardadas"    style="display:none"></span>
+      <span class="tui-sb-badge" id="sb-ragcap" title="RAG: ficheros/chunks indexados" style="display:none"></span>
       <span class="tui-sb-badge" id="sb-mcp"    title="Servidores MCP"    style="display:none">◎ MCP</span>
       <span class="tui-sb-badge" id="sb-lsp"    title="LSP activo"        style="display:none">⟨⟩ LSP</span>
-      <span class="tui-sb-badge" id="sb-mem"    title="Memoria vectorial" style="display:none">⬡ MEM</span>
-      <span class="tui-sb-badge" id="sb-rag"    title="RAG indexado"      style="display:none">⬢ RAG</span>
       <span class="tui-sb-badge" id="sb-embed"  title="Embeddings activos" style="display:none">◈ EMBED</span>
       <span class="tui-sb-badge" id="sb-vision" title="Modelo con visión" style="display:none">👁 VIS</span>
       <span class="tui-sb-badge elev-clickable" id="sb-elev" title="Click para cambiar permisos" onclick="cycleElevated()" style="display:none"></span>
-      <span id="sb-tokens" style="color:#334455;font-size:.72rem"></span>
     </div>
   </div>
   <!-- MCP/LSP detail rows (una línea cada uno, bajo la status bar — como en el toolbar del TUI) -->
@@ -282,6 +287,10 @@ const _TWM = ["Planificando","Organizando","Orquestando","Coordinando",
               "Secuenciando","Estructurando","Implementando","Ejecutando"];
 let _thinkWordIdx   = 0;
 let _thinkWordTimer = null;
+let _thinkStart     = 0;        // ts de inicio del "Pensando" (para el contador de tiempo)
+let _thinkElapsedTimer = null;  // timer del contador (38s · frase) estilo TUI
+// Frases "cerca de terminar" (>25s) — paridad con _NEAR_FINISH_PHRASES del TUI
+const _NFP = ["casi…","ya casi…","afinando…","rematando…","puliendo…","cerrando…"];
 let _inputHistory  = [];     // mensajes enviados en esta sesión (historial de input)
 let _historyIdx    = -1;     // -1 = posición actual (no en modo historia)
 let _historyDraft  = '';     // borrador guardado al entrar en modo historia
@@ -328,11 +337,49 @@ function handleEvent(ev) {{
     renderTeamBar();
   }}
 
+  // Reanudar estado "ocupado" si un turno arranca SERVER-SIDE (drenaje de la cola FIFO
+  // tras terminar el turno anterior): no hubo sendMsg que pusiera _busy=true, pero llegan
+  // eventos de actividad del agente. Sin esto, el turno encolado se renderizaría con el
+  // input habilitado y sin "Pensando".
+  if (!_busy && !_killed &&
+      ['thinking','preflight','tool_start','plan','subagent_start'].includes(ev.type)) {{
+    setBusy(true);
+    appendThinking();
+  }}
+
   switch (ev.type) {{
     case 'connected':
       loadHistory();
       loadInputHistory();   // recall de flecha arriba compartido con el TUI
       loadStatus(15);  // retry: loop may still be initializing
+      break;
+
+    case 'queued':
+      // Confirmación del servidor de que el input quedó en cola. El mensaje del usuario
+      // ya se mostró (optimista) con el badge "⏳ en cola" en sendMsg → no-op aquí.
+      break;
+
+    case 'slash_result':
+      // Respuesta de un slash de DISPLAY ejecutado mientras el agente estaba ocupado.
+      // Se renderiza como línea de sistema independiente, sin tocar el turno en curso.
+      appendSlashResult(ev.text || '');
+      break;
+
+    case 'question':
+      // El agente pregunta al usuario (ask_user). Renderiza una tarjeta de opciones;
+      // al responder, POST /api/chat/answer desbloquea el turno (que sigue activo).
+      appendQuestion(ev);
+      break;
+
+    case 'permission':
+      // Confirmación de permiso de una tool (GAP 4). Tarjeta Sí/No/Siempre → POST
+      // /api/chat/permission desbloquea el turno.
+      appendPermission(ev);
+      break;
+
+    case 'ask_answers':
+      // Resumen de las respuestas del usuario a ask_user, antes de continuar.
+      appendAskAnswers(ev.pairs || []);
       break;
 
     case 'heartbeat':
@@ -368,7 +415,7 @@ function handleEvent(ev) {{
         // "Pensando" del prompt es status: NO se sobreescribe con el nombre del tool
         // (sigue ciclando palabras/preflight) — antes los títulos de tools "salían"
         // en el prompt en vez de en la conversación.
-        appendToolStart(ev.tool, ev.context || '');
+        appendToolStart(ev.tool, ev.context || '', !!ev.is_modify, ev.write_target || '');
       }}
       break;
 
@@ -390,6 +437,12 @@ function handleEvent(ev) {{
           // Insertar en el tool block activo (posición actual en la conversación)
           appendFileCard(ev.file_path, ev.file_name || ev.file_path,
                          ev.file_size || 0, ev.file_action || 'created', null);
+        }}
+        // Paridad TUI: una edición completada con éxito CIERRA su unidad visual
+        // (exploración + razonamiento + edición); la siguiente tool abre bloque
+        // nuevo — un bloque con su diff por edición, no 16 tools apiladas.
+        if (ev.is_modify && ev.ok !== false) {{
+          _finishToolBlock();
         }}
       }}
       break;
@@ -426,6 +479,11 @@ function handleEvent(ev) {{
       }} else {{
         appendStreamChunk(ev.text);
       }}
+      break;
+
+    case 'reasoning':
+      removeThinking();
+      appendReasoning(ev.text || '', !!ev.new_step);
       break;
 
     case 'embed_flash':
@@ -528,6 +586,7 @@ let _toolBlockTurn    = -1;
 let _toolDoneCount    = 0;
 let _toolTotalCount   = 0;
 let _toolNames        = [];     // nombres de tools completadas (para resumen ⎿)
+let _blockWriteTarget = '';     // fichero que se está editando en el bloque actual (auto-split)
 
 function _getOrCreateToolBlock() {{
   // Reutilizar si existe y es del turno actual
@@ -567,6 +626,7 @@ function _getOrCreateToolBlock() {{
   _toolDoneCount    = 0;
   _toolTotalCount   = 0;
   _toolNames        = [];
+  _blockWriteTarget = '';
   return inner;
 }}
 
@@ -618,10 +678,22 @@ function _finishToolBlock() {{
   _toolDoneCount    = 0;
   _toolTotalCount   = 0;
   _toolNames        = [];
+  _blockWriteTarget = '';
 }}
 
-function appendToolStart(tool, ctx) {{
+function appendToolStart(tool, ctx, isModify, writeTarget) {{
+  // Auto-split por fichero (paridad con el TUI _show_tool_running_header): si una tool
+  // de modificación apunta a un fichero DISTINTO del que se viene editando en el bloque,
+  // cerramos el bloque actual y abrimos uno nuevo. read + razonamiento + varias ediciones
+  // del MISMO fichero quedan en UN bloque; la 1ª edición tras explorar NO rompe el bloque.
+  if (isModify && writeTarget && _blockWriteTarget
+      && writeTarget !== _blockWriteTarget
+      && _toolBlockInner && _toolBlockInner.childElementCount > 0) {{
+    _finishToolBlock();
+  }}
   const inner = _getOrCreateToolBlock();
+  // Recordar el fichero en edición para el auto-split del siguiente write a otro fichero
+  if (isModify && writeTarget) _blockWriteTarget = writeTarget;
   _toolTotalCount++;
   _updateToolBlockHeader(tool, true);
 
@@ -953,10 +1025,27 @@ function _mdToHtml(md) {{
 
 // ── Message rendering ──────────────────────────────────────────────────────
 // Muestra la línea "Pensando" encima del prompt con barras verticales ondulantes
+function _startThinkElapsed() {{
+  // Contador "(38s · frase)" junto a las barras — paridad con la línea 1 del TUI.
+  if (!_thinkStart) _thinkStart = Date.now();
+  if (_thinkElapsedTimer) return;
+  const tick = () => {{
+    const el = document.getElementById('tui-think-elapsed');
+    if (!el) return;
+    const s = Math.floor((Date.now() - _thinkStart) / 1000);
+    const t = s >= 60 ? Math.floor(s/60) + 'm ' + (s%60) + 's' : s + 's';
+    const phrase = s > 25 ? ' · ' + _NFP[Math.floor(s/3) % _NFP.length] : '';
+    el.textContent = '(' + t + phrase + ')';
+  }};
+  tick();
+  _thinkElapsedTimer = setInterval(tick, 1000);
+}}
+
 function appendThinking(overrideLabel) {{
   if (_streamEndTimer) {{ clearTimeout(_streamEndTimer); _streamEndTimer = null; }}
   const bar = document.getElementById('tui-thinking-bar');
   if (bar) bar.style.display = '';
+  _startThinkElapsed();
   if (overrideLabel) {{
     _setThinkingLabel(overrideLabel);
     return;
@@ -977,6 +1066,10 @@ function appendThinking(overrideLabel) {{
 function removeThinking() {{
   if (_streamEndTimer) {{ clearTimeout(_streamEndTimer); _streamEndTimer = null; }}
   if (_thinkWordTimer) {{ clearInterval(_thinkWordTimer); _thinkWordTimer = null; }}
+  if (_thinkElapsedTimer) {{ clearInterval(_thinkElapsedTimer); _thinkElapsedTimer = null; }}
+  _thinkStart = 0;
+  const el = document.getElementById('tui-think-elapsed');
+  if (el) el.textContent = '';
   const bar = document.getElementById('tui-thinking-bar');
   if (bar) bar.style.display = 'none';
 }}
@@ -1007,6 +1100,34 @@ function _resumeThinkingWords() {{
 function _agentHdr(streaming) {{
   // Estilo TUI: solo ● pulsante, sin header separado
   return '<span class="tui-dot' + (streaming ? ' streaming' : '') + '">●</span>';
+}}
+
+function appendReasoning(text, newStep) {{
+  // Razonamiento del modelo (think_level != off). Paridad con el TUI:
+  //  • newStep=true (el paso cambia de FICHERO) → CIERRA el bloque de tools anterior
+  //    para que el nuevo fichero tenga su PROPIO bloque + diff; el 💭 es su cabecera.
+  //  • newStep=false (MISMO fichero: read+grep+razonar) → el 💭 va DENTRO del bloque
+  //    abierto como fila `│ 💭`, agrupando las tools del fichero en curso.
+  if (!text || !text.trim()) return;
+  _turnHadContent = true;
+  if (!newStep && _toolBlockInner && _toolBlockInner.isConnected
+      && _toolBlockWrapper && _toolBlockTurn === _turnId) {{
+    const row = document.createElement('div');
+    row.className = 'tui-tool tui-tool-reasoning';
+    row.innerHTML = '<span class="tui-tool-pipe">│  </span>'
+      + '<span class="tui-reasoning-inline">💭 ' + _esc(text).replace(/\\n/g, '<br>') + '</span>';
+    _toolBlockInner.appendChild(row);
+    scrollBottom();
+    return;
+  }}
+  if (_toolBlockWrapper) _finishToolBlock();   // nuevo paso → cierra el bloque anterior
+  _agentDiv = null;   // cierra el bloque de texto del agente para que el siguiente abra otro
+  const d = document.createElement('div');
+  d.className = 'tui-msg tui-msg-reasoning';
+  d.style.cssText = 'opacity:.6;font-style:italic;margin:2px 0 4px 0;';
+  d.innerHTML = '<div class="md-body">💭 ' + _mdToHtml(text) + '</div>';
+  document.getElementById('tui-messages').appendChild(d);
+  scrollBottom();
 }}
 
 function appendAgentText(text) {{
@@ -1352,15 +1473,17 @@ function appendAgentBlock(text) {{
   scrollBottom();
 }}
 
-function appendUserMsg(text, isSlash, images) {{
+function appendUserMsg(text, isSlash, images, queued) {{
   const msgs = document.getElementById('tui-messages');
   const d = document.createElement('div');
   d.className = 'tui-msg tui-msg-user';
+  // Badge "en cola": el agente está ocupado → este input se procesará al terminar el turno.
+  const _q = queued ? ' <span class="tui-queued-badge">⏳ en cola</span>' : '';
   if (isSlash) {{
-    d.innerHTML = '<div class="tui-msg-hdr" style="color:#bb66ff">⌘ Comando</div>'
+    d.innerHTML = '<div class="tui-msg-hdr" style="color:#bb66ff">⌘ Comando' + _q + '</div>'
       + '<div class="tui-msg-body" style="border-color:#bb66ff;color:#cba6f7"></div>';
   }} else {{
-    d.innerHTML = '<div class="tui-msg-hdr">▶ Tú</div><div class="tui-msg-body"></div>';
+    d.innerHTML = '<div class="tui-msg-hdr">▶ Tú' + _q + '</div><div class="tui-msg-body"></div>';
   }}
   
   // Construir el contenido del mensaje
@@ -1387,6 +1510,163 @@ function appendUserMsg(text, isSlash, images) {{
   
   msgs.appendChild(d);
   scrollBottom();
+  return d;
+}}
+
+function appendSlashResult(text) {{
+  // Línea de sistema para la respuesta de un slash de display ejecutado durante un turno.
+  const msgs = document.getElementById('tui-messages');
+  const d = document.createElement('div');
+  d.className = 'tui-msg tui-msg-slash-result';
+  d.innerHTML = '<div class="tui-msg-hdr" style="color:#66ccff">⌘ Resultado</div>'
+    + '<div class="tui-msg-body" style="border-color:#66ccff;color:#a6e3ff"></div>';
+  d.querySelector('.tui-msg-body').textContent = text;
+  msgs.appendChild(d);
+  scrollBottom();
+  return d;
+}}
+
+function appendQuestion(ev) {{
+  // Formulario multi-pregunta (ask_user v2). Secciones apiladas: cada pregunta con sus
+  // opciones (toggle si multiSelect) + un campo de texto libre. Submit envía todas vía
+  // POST /api/chat/answer con {{answers:[{{selection:[idx0based], free_text}}, …]}}.
+  const msgs = document.getElementById('tui-messages');
+  const questions = ev.questions || [];
+  const card = document.createElement('div');
+  card.className = 'tui-msg tui-question-card';
+  card.innerHTML = '<div class="tui-msg-hdr" style="color:#f9c74f">◈ Preguntas de OOCode</div>'
+    + '<div class="tui-question-body"></div>';
+  const body = card.querySelector('.tui-question-body');
+
+  // Estado por pregunta: índices seleccionados (en orden) + texto libre.
+  const state = questions.map(() => ({{selection: [], free: ''}}));
+  let answered = false;
+  let submitBtn = null;
+
+  function refreshSubmit() {{
+    const allDone = state.every(s => s.selection.length || s.free.trim());
+    if (submitBtn) submitBtn.disabled = answered || !allDone;
+  }}
+  function send() {{
+    if (answered) return;
+    const allDone = state.every(s => s.selection.length || s.free.trim());
+    if (!allDone) return;
+    answered = true;
+    card.classList.add('answered');
+    card.querySelectorAll('button, input').forEach(el => el.disabled = true);
+    const answers = state.map(s => ({{selection: s.selection.slice(), free_text: s.free.trim()}}));
+    fetch('/api/chat/answer', {{method:'POST', headers:{{'Content-Type':'application/json'}},
+      body: JSON.stringify({{answers}})}}).catch(()=>{{}});
+  }}
+
+  questions.forEach((q, qi) => {{
+    const sec = document.createElement('div');
+    sec.className = 'tui-question-sec';
+    const h = document.createElement('div');
+    h.className = 'tui-question-q';
+    h.textContent = (q.header ? q.header + ' — ' : '') + (q.question || '');
+    sec.appendChild(h);
+    if (q.multiSelect) {{
+      const hint = document.createElement('div');
+      hint.className = 'tui-question-hint'; hint.textContent = 'Puedes elegir varias';
+      sec.appendChild(hint);
+    }}
+    const optsWrap = document.createElement('div');
+    optsWrap.className = 'tui-question-opts';
+    (q.options || []).forEach((opt, oi) => {{
+      const b = document.createElement('button');
+      b.className = 'tui-question-opt';
+      b.innerHTML = '<b></b>' + (opt.description ? ' <span style="opacity:.7"></span>' : '');
+      b.querySelector('b').textContent = opt.label || '';
+      if (opt.description) b.querySelector('span').textContent = '— ' + opt.description;
+      b.onclick = () => {{
+        if (answered) return;
+        const sel = state[qi].selection;
+        if (q.multiSelect) {{
+          const at = sel.indexOf(oi);
+          if (at >= 0) sel.splice(at, 1); else sel.push(oi);
+        }} else {{
+          sel.length = 0; sel.push(oi);
+          state[qi].free = ''; const fi = sec.querySelector('.tui-question-free'); if (fi) fi.value = '';
+        }}
+        optsWrap.querySelectorAll('.tui-question-opt').forEach((el, j) => {{
+          const pos = sel.indexOf(j);
+          el.classList.toggle('sel', pos >= 0);
+          el.dataset.badge = (pos >= 0 && q.multiSelect && sel.length > 1) ? (pos + 1) : '';
+        }});
+        refreshSubmit();
+      }};
+      optsWrap.appendChild(b);
+    }});
+    sec.appendChild(optsWrap);
+    const free = document.createElement('input');
+    free.type = 'text'; free.className = 'tui-question-free';
+    free.placeholder = '✎ escribir otra respuesta…';
+    free.addEventListener('input', () => {{ state[qi].free = free.value; refreshSubmit(); }});
+    sec.appendChild(free);
+    body.appendChild(sec);
+  }});
+
+  submitBtn = document.createElement('button');
+  submitBtn.className = 'tui-question-send'; submitBtn.textContent = '✓ Submit';
+  submitBtn.onclick = send;
+  body.appendChild(submitBtn);
+  refreshSubmit();
+
+  msgs.appendChild(card);
+  scrollBottom();
+  return card;
+}}
+
+function appendAskAnswers(pairs) {{
+  // Bloque resumen de las respuestas del usuario, antes de que el agente continúe.
+  const msgs = document.getElementById('tui-messages');
+  const d = document.createElement('div');
+  d.className = 'tui-msg tui-msg-slash-result';
+  let html = '<div class="tui-msg-hdr" style="color:#00e5ff">● User answered OOCode\\'s questions</div>'
+           + '<div class="tui-msg-body" style="border-color:#00e5ff"></div>';
+  d.innerHTML = html;
+  const b = d.querySelector('.tui-msg-body');
+  (pairs || []).forEach(p => {{
+    const line = document.createElement('div');
+    line.textContent = '· ' + p.q + ' → ' + p.a;
+    b.appendChild(line);
+  }});
+  msgs.appendChild(d);
+  scrollBottom();
+  return d;
+}}
+
+function appendPermission(ev) {{
+  // Tarjeta de confirmación de permiso de una tool (GAP 4). Botones Sí/No/Siempre.
+  const msgs = document.getElementById('tui-messages');
+  const card = document.createElement('div');
+  card.className = 'tui-msg tui-question-card';
+  card.innerHTML = '<div class="tui-msg-hdr" style="color:#f9c74f">◈ Permiso requerido</div>'
+    + '<div class="tui-question-body">'
+    + '<div class="tui-question-q"></div>'
+    + '<div class="tui-question-opts" style="flex-direction:row;flex-wrap:wrap"></div>'
+    + '</div>';
+  card.querySelector('.tui-question-q').textContent = ev.description || ev.tool || 'Permitir tool';
+  let answered = false;
+  function answer(choice) {{
+    if (answered) return; answered = true;
+    card.classList.add('answered');
+    card.querySelectorAll('button').forEach(b => b.disabled = true);
+    fetch('/api/chat/permission', {{method:'POST', headers:{{'Content-Type':'application/json'}},
+      body: JSON.stringify({{choice}})}}).catch(()=>{{}});
+  }}
+  const wrap = card.querySelector('.tui-question-opts');
+  [['Sí','s'], ['No','n'], ['Siempre','siempre']].forEach(([label, val]) => {{
+    const b = document.createElement('button');
+    b.className = 'tui-question-opt'; b.textContent = label;
+    b.style.flex = '0 0 auto';
+    b.onclick = () => answer(val);
+    wrap.appendChild(b);
+  }});
+  msgs.appendChild(card);
+  scrollBottom();
+  return card;
 }}
 
 function scrollBottom() {{
@@ -1534,12 +1814,34 @@ function updateStatus(ev) {{
     }}
   }}
 
-  // Tokens—solo si el evento los trae
+  // Tokens — junto a la barra de contexto (espeja la línea 2 del TUI: "tokens · ctx")
   if ('tokens_in' in ev || 'tokens_out' in ev) {{
     const inp = ev.tokens_in  || 0;
     const out = ev.tokens_out || 0;
-    if (inp > 0 || out > 0)
-      document.getElementById('sb-tokens').textContent = inp + '↑ ' + out + '↓';
+    const tEl = document.getElementById('sb-tokens');
+    if (tEl) {{
+      if (inp > 0 || out > 0) {{ tEl.textContent = inp + '↑ ' + out + '↓  ·  '; tEl.style.display = ''; }}
+      else {{ tEl.style.display = 'none'; }}
+    }}
+  }}
+
+  // Memorias / RAG recuperados este turno — contadores junto a ctx (estilo TUI línea 2:
+  // "⬡ N mem · ◈ N/M rag"). Solo se muestran cuando hubo recuperación (> 0).
+  if ('mem_hits' in ev) {{
+    const mEl = document.getElementById('sb-mem');
+    if (mEl) {{
+      if ((ev.mem_hits || 0) > 0) {{ mEl.textContent = '  ·  ⬡ ' + ev.mem_hits + ' mem'; mEl.style.display = ''; }}
+      else {{ mEl.style.display = 'none'; }}
+    }}
+  }}
+  if ('rag_hits' in ev) {{
+    const rEl = document.getElementById('sb-rag');
+    if (rEl) {{
+      const h = ev.rag_hits || 0;
+      const a = ev.rag_available || 0;
+      if (h > 0) {{ rEl.textContent = '  ·  ◈ ' + (a > h ? h + '/' + a : h) + ' rag'; rEl.style.display = ''; }}
+      else {{ rEl.style.display = 'none'; }}
+    }}
   }}
 
   // Feature badges (from /api/chat/status response)
@@ -1557,9 +1859,45 @@ function updateStatus(ev) {{
       lspEl.title = 'Lenguajes: ' + lspLangs.join(', ');
     }}
   }}
-  if ('memory_on' in ev) _setBadge('sb-mem', ev.memory_on, 'mem-active');
-  if ('rag_on' in ev)    _setBadge('sb-rag', ev.rag_on,    'rag-active');
+  // (sb-mem/sb-rag ya NO son badges de capacidad: ahora muestran los contadores
+  //  runtime junto a ctx, alimentados por mem_hits/rag_hits — ver arriba.)
   if ('vision_on' in ev) _setBadge('sb-vision', ev.vision_on, 'vision-active');
+
+  // Think/razonamiento — espeja "think:med.+r" del toolbar TUI (junto a MCP/LSP).
+  if ('think_level' in ev) {{
+    const thEl = document.getElementById('sb-think');
+    if (thEl) {{
+      const lvl = ev.think_level || 'off';
+      if (lvl !== 'off') {{
+        let txt = 'think:' + lvl.slice(0, 3);
+        if (ev.reasoning) txt += '.+r';
+        thEl.textContent = txt;
+        _setBadge('sb-think', true, 'think-active');
+      }} else {{
+        thEl.style.display = 'none';
+      }}
+    }}
+  }}
+
+  // Memorias guardadas — espeja "⬢ mem:41" del toolbar TUI (capability, total).
+  if ('mem_count' in ev) {{
+    const mcEl = document.getElementById('sb-memcap');
+    if (mcEl) {{
+      const n = ev.mem_count || 0;
+      if (n > 0) {{ mcEl.textContent = '⬢ mem:' + n; _setBadge('sb-memcap', true, 'mem-active'); }}
+      else {{ mcEl.style.display = 'none'; }}
+    }}
+  }}
+
+  // RAG indexado — espeja "✦ rag:590f/4923c" del toolbar TUI (ficheros/chunks).
+  if ('rag_files' in ev || 'rag_chunks' in ev) {{
+    const rcEl = document.getElementById('sb-ragcap');
+    if (rcEl) {{
+      const f = ev.rag_files || 0, c = ev.rag_chunks || 0;
+      if (f > 0) {{ rcEl.textContent = '✦ rag:' + f + 'f/' + c + 'c'; _setBadge('sb-ragcap', true, 'rag-active'); }}
+      else {{ rcEl.style.display = 'none'; }}
+    }}
+  }}
 
   // Compact hint junto a la barra de contexto
   const hintEl = document.getElementById('sb-compact-hint');
@@ -1815,7 +2153,6 @@ async function killAgent() {{
 }}
 
 async function sendMsg() {{
-  if (_busy) return;
   const inp  = document.getElementById('tui-input');
   const text = inp.value.trim();
   if (!text) return;
@@ -1836,19 +2173,26 @@ async function sendMsg() {{
   const imgPaths = _pendingFiles.filter(f => f.type === 'image').map(f => f.previewUrl || f.path);
   const isSlash = text.startsWith('/');
   // /session <id> restaura una sesión en el servidor → re-renderizar al terminar el turno
-  _pendingSessionReload = /^\/session\s+\S/.test(text);
-  appendUserMsg(text, isSlash, imgPaths);
+  _pendingSessionReload = /^\\/session\\s+\\S/.test(text);
 
-  // Nuevo turno: incrementar ID, resetear kill flag, limpiar estado anterior
-  _turnId++;
-  _killed = false;
-  _turnHadContent = false;
-  _finishAgentMsg();
-  _finishToolBlock();
+  // Si el agente está OCUPADO: no se ignora el input (antes: return) — el servidor lo
+  // encola (mensajes + slash mutadores) o lo ejecuta al momento (slash de display). NO
+  // tocamos el ciclo de vida del turno en curso (busy/thinking/turnId): solo mostramos
+  // el input con badge "en cola" y dejamos que el servidor decida.
+  const _wasBusy = _busy;
+  appendUserMsg(text, isSlash, imgPaths, _wasBusy);
 
-  setBusy(true);
+  if (!_wasBusy) {{
+    // Nuevo turno: incrementar ID, resetear kill flag, limpiar estado anterior
+    _turnId++;
+    _killed = false;
+    _turnHadContent = false;
+    _finishAgentMsg();
+    _finishToolBlock();
+    setBusy(true);
+    appendThinking();  // Mostrar "Pensando..." inmediatamente en cada turno
+  }}
   _forceScrollBottom();  // Al enviar, bajar siempre al fondo
-  appendThinking();  // Mostrar "Pensando..." inmediatamente en cada turno
 
   // Include pending images for vision models
   const payload = {{message: text, agent_id: _agentId}};
@@ -1865,14 +2209,16 @@ async function sendMsg() {{
       body: JSON.stringify(payload),
     }});
     const d = await resp.json();
-    if (!d.ok) {{
+    if (!d.ok && !_wasBusy) {{
       removeThinking();
       setBusy(false);
       showToast((d.error || 'Error enviando mensaje'), false);
     }}
   }} catch(err) {{
-    removeThinking();
-    setBusy(false);
+    if (!_wasBusy) {{
+      removeThinking();
+      setBusy(false);
+    }}
     showToast('Error de red: ' + err.message, false);
   }}
 }}

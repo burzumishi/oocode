@@ -303,7 +303,7 @@ class TUIDisplayMixin:
             self._pending_usage_line = f"{line1}\n{line2}"
 
     def _show_compact_reset(self, dropped: int, freed_tok: int, has_summary: bool) -> None:
-        """Reset visual al estilo Claude Code tras compactación automática.
+        """Reset visual tras compactación automática.
 
         1. Limpia el área visible (sin borrar el scroll buffer del terminal).
         2. Muestra el mini banner de OOCode (3 líneas).
@@ -388,7 +388,28 @@ class TUIDisplayMixin:
         # Fallback a _last_response por compatibilidad. Markdown, sangría 2.
         last = (getattr(self, "_last_agent_msg", "")
                 or getattr(self, "_last_response", "") or "").strip()
-        if last:
+
+        # Mid-turn: el agente sigue en el bucle y emitirá más tools (a menudo SIN texto).
+        # En vez de pintar el mensaje como bloque estático retrospectivo, RE-ANCLAMOS el
+        # live block en él: las tools del siguiente turno se asignan a este ● (su texto
+        # vacío cuenta como continuación en _is_duplicate_bullet) → quedan visibles bajo
+        # el mensaje guardado antes de compactar, en vez de en un bloque cerrado (stale)
+        # donde se perderían. _bullet_block_open vuelve a reflejar la verdad (bloque vivo).
+        _mid_turn = getattr(self, "_compacting_mid_turn", False)
+        if last and _mid_turn and getattr(self, "_start_live_block_cb", None):
+            from rich.markup import escape as _mesc
+            from rich.markdown import Markdown as _Md
+            from rich.padding import Padding as _Pad
+            _lparts = last.split("\n", 1)
+            _lfirst = _lparts[0].strip() or "…"
+            self._start_live_block_cb(_mesc(_lfirst))
+            self._bullet_block_open = True
+            self._last_displayed_bullet = " ".join(last.split())
+            self._live_tool_count = 0
+            if len(_lparts) > 1 and _lparts[1].strip():
+                _con.print(_Pad(_Md(_lparts[1].lstrip("\n")), (0, 0, 0, 2)))
+        elif last:
+            # Idle/manual: retrospectiva estática (no hay continuación que anclar).
             from rich.markdown import Markdown as _Md
             from rich.padding import Padding as _Pad
             _con.print("  [dim]●[/dim] [dim]último mensaje del agente (antes de compactar):[/dim]")
@@ -398,6 +419,10 @@ class TUIDisplayMixin:
                 for _ln in last.split("\n"):
                     _con.print(f"  {_ln}")
             _con.print()
+            self._bullet_block_open = False
+            self._last_displayed_bullet = " ".join(last.split())
+        else:
+            self._bullet_block_open = False
 
         # Plan: no reprint tras compactación — el spinner multitarea ya indica la tarea activa
 
@@ -458,9 +483,10 @@ class TUIDisplayMixin:
             # Cerrar live block abierto antes de la animación de compactación
             if self._flush_live_block_cb:
                 self._flush_live_block_cb("")
-            # Suprimir task panel durante compactación + señalizar a run() que espere
+            # Suprimir task panel durante compactación. _compact_running (la señal
+            # para que run() encole el siguiente turno) ya la activa _do_compact al
+            # inicio — no se toca aquí para evitar la ventana de carrera.
             self._compacting_ctx = True
-            self._compact_running.set()
             try:
                 ctx      = self.context
                 n_msgs   = len(ctx.messages)
@@ -470,13 +496,13 @@ class TUIDisplayMixin:
 
                 # ── Cabecera + progreso en el status window (con colores) ──
                 _hdr = (
-                    _sfmt("compact-arrow", "↻") + "  "
+                    _sfmt("compact-arrow", "↻") + " "
                     + _sfmt("compact-title", "Compactando") + "  "
                     + _sfmt("compact-dim", f"{n_msgs} msgs · ~{cur_tok:,} tok · {cur_pct}%")
                 )
                 self._status_cb(
                     f"{_hdr}\n"
-                    f"○  {_sfmt('compact-bar', _pbar_thin_ratio(0.0))}"
+                    f"○ {_sfmt('compact-bar', _pbar_thin_ratio(0.0))}"
                     f"   {_sfmt('compact-pct', '0%')}  "
                     + _sfmt("compact-phrase", "analizando mensajes…")
                 )
@@ -505,7 +531,7 @@ class TUIDisplayMixin:
                             pct   = int(ratio * 100)
                             _frame_cmp = _SPINNER_FRAMES[_fi_cmp % len(_SPINNER_FRAMES)]
                             self._status_cb(
-                                f"{_hdr}\n{_frame_cmp}  "
+                                f"{_hdr}\n{_frame_cmp} "
                                 + _sfmt("compact-bar", _pbar_thin_ratio(ratio))
                                 + f"  {_sfmt('compact-pct', f'{pct:3d}%')}  "
                                 + _sfmt("compact-phrase", f"resumiendo {len(msgs)} msgs…")
@@ -529,7 +555,6 @@ class TUIDisplayMixin:
                 return len(dropped)
             finally:
                 self._compacting_ctx = False
-                self._compact_running.clear()
 
         from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn
         from ui.console import console as _con

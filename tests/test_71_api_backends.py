@@ -149,6 +149,22 @@ class TestOllamaBackend:
         assert resp.input_tokens == 10
         assert resp.output_tokens == 5
 
+    def test_chat_sync_returns_thinking(self):
+        """chat_sync conserva el canal thinking del modelo (antes Response no tenía
+        el campo y se descartaba: subagentes y retries XML perdían el razonamiento)."""
+        from api.ollama import OllamaBackend
+        mock_resp = MagicMock()
+        mock_resp.message.content = "ok"
+        mock_resp.message.tool_calls = None
+        mock_resp.message.thinking = "primero leo el fichero"
+        mock_resp.prompt_eval_count = 1
+        mock_resp.eval_count = 1
+        with patch("api.ollama.ollama.Client") as MockClient:
+            MockClient.return_value.chat.return_value = mock_resp
+            b = OllamaBackend(host="http://localhost:11434")
+        resp = b.chat_sync("llama3", [], [], {})
+        assert resp.thinking == "primero leo el fichero"
+
     def test_chat_sync_with_tool_calls(self):
         from api.ollama import OllamaBackend
         mock_tc = MagicMock()
@@ -204,6 +220,101 @@ class TestOllamaBackend:
         assert len(done_chunks) == 1
         assert done_chunks[0].input_tokens == 5
         assert done_chunks[0].output_tokens == 3
+
+    # ── think param wiring ────────────────────────────────────────────────────
+    def _mk_resp(self):
+        r = MagicMock()
+        r.message.content = "ok"
+        r.message.tool_calls = None
+        r.message.thinking = ""
+        r.prompt_eval_count = 1
+        r.eval_count = 1
+        return r
+
+    def test_chat_sync_forwards_think(self):
+        """think se pasa a client.chat — SIN esto /think y /reasoning no llegaban a Ollama."""
+        from api.ollama import OllamaBackend
+        with patch("api.ollama.ollama.Client") as MockClient:
+            MockClient.return_value.chat.return_value = self._mk_resp()
+            b = OllamaBackend(host="http://localhost:11434")
+            b.chat_sync("qwen3", [], [], {}, think="high")
+            _, kw = MockClient.return_value.chat.call_args
+            assert kw.get("think") == "high"
+
+    def test_chat_sync_think_false_forwarded(self):
+        """think=False (=/think off) se envía para silenciar modelos que razonan por defecto."""
+        from api.ollama import OllamaBackend
+        with patch("api.ollama.ollama.Client") as MockClient:
+            MockClient.return_value.chat.return_value = self._mk_resp()
+            b = OllamaBackend(host="http://localhost:11434")
+            b.chat_sync("qwen3", [], [], {}, think=False)
+            _, kw = MockClient.return_value.chat.call_args
+            assert kw.get("think") is False
+
+    def test_chat_sync_omits_think_when_none(self):
+        """think=None → no se incluye el kwarg (default del modelo, sin error)."""
+        from api.ollama import OllamaBackend
+        with patch("api.ollama.ollama.Client") as MockClient:
+            MockClient.return_value.chat.return_value = self._mk_resp()
+            b = OllamaBackend(host="http://localhost:11434")
+            b.chat_sync("qwen3", [], [], {})
+            _, kw = MockClient.return_value.chat.call_args
+            assert "think" not in kw
+
+    def test_chat_sync_retries_without_think_on_unsupported(self):
+        """Modelo sin soporte de thinking → retry sin el parámetro (no propaga el error)."""
+        from api.ollama import OllamaBackend
+        good = self._mk_resp()
+        calls = {"n": 0}
+        def _chat(*a, **kw):
+            calls["n"] += 1
+            if "think" in kw:
+                raise Exception("model does not support thinking")
+            return good
+        with patch("api.ollama.ollama.Client") as MockClient:
+            MockClient.return_value.chat.side_effect = _chat
+            b = OllamaBackend(host="http://localhost:11434")
+            resp = b.chat_sync("plain", [], [], {}, think=True)
+        assert resp.text == "ok"
+        assert calls["n"] == 2   # 1º con think (falla), 2º sin think (ok)
+
+    def test_chat_stream_forwards_think(self):
+        from api.ollama import OllamaBackend
+        chunk = MagicMock()
+        chunk.message.content = "hi"
+        chunk.message.tool_calls = None
+        chunk.message.thinking = ""
+        chunk.done = True
+        chunk.prompt_eval_count = 1
+        chunk.eval_count = 1
+        with patch("api.ollama.ollama.Client") as MockClient:
+            MockClient.return_value.chat.return_value = iter([chunk])
+            b = OllamaBackend(host="http://localhost:11434")
+            list(b.chat_stream("qwen3", [], [], {}, think="medium"))
+            _, kw = MockClient.return_value.chat.call_args
+            assert kw.get("think") == "medium"
+
+    def test_chat_stream_retries_without_think_on_unsupported(self):
+        from api.ollama import OllamaBackend
+        chunk = MagicMock()
+        chunk.message.content = "hi"
+        chunk.message.tool_calls = None
+        chunk.message.thinking = ""
+        chunk.done = True
+        chunk.prompt_eval_count = 1
+        chunk.eval_count = 1
+        calls = {"n": 0}
+        def _chat(*a, **kw):
+            calls["n"] += 1
+            if "think" in kw:
+                raise Exception("thinking is not supported")
+            return iter([chunk])
+        with patch("api.ollama.ollama.Client") as MockClient:
+            MockClient.return_value.chat.side_effect = _chat
+            b = OllamaBackend(host="http://localhost:11434")
+            out = list(b.chat_stream("plain", [], [], {}, think=True))
+        assert any(c.text == "hi" for c in out)
+        assert calls["n"] == 2
 
     def test_stream_tool_calls_normalized(self):
         from api.ollama import OllamaBackend
@@ -818,3 +929,34 @@ class TestForceCloseHttpxSockets:
                 pass
             srv.shutdown()
             srv.server_close()
+
+
+# ── AgentLoop._think_param mapping (política /think /reasoning → think param) ────
+
+class TestThinkParamMapping:
+    """_think_param traduce rt.think_level/reasoning al valor `think` del backend.
+
+    Es el puente que faltaba: antes /think y /reasoning se guardaban en oocode.json
+    pero el valor nunca llegaba a la petición LLM."""
+
+    def _think(self, level, reasoning):
+        from agent.loop import AgentLoop
+        from types import SimpleNamespace
+        fake = SimpleNamespace(rt=SimpleNamespace(think_level=level, reasoning=reasoning))
+        return AgentLoop._think_param(fake)
+
+    def test_off_no_reasoning_disables(self):
+        # off explícito → False (silencia modelos que razonan por defecto, p.ej. qwen3.5)
+        assert self._think("off", False) is False
+
+    def test_off_with_reasoning_enables(self):
+        assert self._think("off", True) is True
+
+    def test_levels_map_to_strings(self):
+        assert self._think("minimal", False) == "low"
+        assert self._think("low", False) == "low"
+        assert self._think("medium", False) == "medium"
+        assert self._think("high", False) == "high"
+
+    def test_unknown_level_defaults_true(self):
+        assert self._think("full", False) is True

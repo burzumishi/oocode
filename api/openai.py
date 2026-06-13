@@ -60,7 +60,7 @@ class OpenAIBackend(BackendClient):
             raise ImportError("httpx es necesario para el backend openai: pip install httpx")
 
     def _build_payload(self, model: str, messages: list, tools: list,
-                       model_params: dict, stream: bool) -> dict:
+                       model_params: dict, stream: bool, think=None) -> dict:
         """Construye el payload común para stream/sync, inyectando max_tokens si procede."""
         adapted = _adapt_params(model_params)
         # Inyectar max_tokens del modelo si el caller no lo especificó
@@ -69,6 +69,10 @@ class OpenAIBackend(BackendClient):
         payload: dict = {"model": model, "messages": messages, "stream": stream, **adapted}
         if tools:
             payload["tools"] = tools
+        # Razonamiento → reasoning_effort (o1/o3/gpt-oss y servidores compatibles).
+        # bool True → 'medium'; False → omitir; str → nivel directo. None = omitir.
+        if think is not None and think is not False:
+            payload["reasoning_effort"] = think if isinstance(think, str) else "medium"
         return payload
 
     # ── Streaming ─────────────────────────────────────────────────────────────
@@ -79,8 +83,9 @@ class OpenAIBackend(BackendClient):
         messages: list,
         tools: list,
         model_params: dict,
+        think=None,
     ) -> Iterator[Chunk]:
-        payload = self._build_payload(model, messages, tools, model_params, stream=True)
+        payload = self._build_payload(model, messages, tools, model_params, stream=True, think=think)
         # Pedir el bloque de usage en el chunk final (OpenAI lo envía tras finish_reason)
         payload["stream_options"] = {"include_usage": True}
 
@@ -116,6 +121,11 @@ class OpenAIBackend(BackendClient):
                 delta = choices[0].get("delta") or {}
 
                 text = delta.get("content") or ""
+                # Razonamiento: llama.cpp/vLLM lo emiten como reasoning_content
+                # (o reasoning); sin esto el canal <think> se perdía con backend openai.
+                _think = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                if _think:
+                    yield Chunk(thinking=_think)
                 # Acumular tool call deltas
                 for tc_delta in (delta.get("tool_calls") or []):
                     idx = tc_delta.get("index", 0)
@@ -147,9 +157,10 @@ class OpenAIBackend(BackendClient):
         tools: list,
         model_params: dict,
         timeout: float = 0,
+        think=None,
     ) -> Response:
         import httpx
-        payload = self._build_payload(model, messages, tools, model_params, stream=False)
+        payload = self._build_payload(model, messages, tools, model_params, stream=False, think=think)
 
         request_timeout = timeout if timeout > 0 else None
         try:
@@ -170,6 +181,7 @@ class OpenAIBackend(BackendClient):
         return Response(
             text=message.get("content") or "",
             tool_calls=_norm_tool_calls(message.get("tool_calls") or []),
+            thinking=message.get("reasoning_content") or message.get("reasoning") or "",
             input_tokens=usage.get("prompt_tokens", 0),
             output_tokens=usage.get("completion_tokens", 0),
         )

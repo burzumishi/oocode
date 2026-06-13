@@ -14,8 +14,20 @@ DEFAULTS = {
     "databaseAssistant": {
         "enabled": False     # arrancar el MCP server bundled database_assistant.py
     },
-    "homeOfficeAssistant": {
-        "enabled": False     # arrancar el MCP server bundled home_office_assistant.py
+    "wordAssistant": {
+        "enabled": False     # arrancar el MCP server bundled word_assistant.py (Word/PDF + núcleo O365)
+    },
+    "excelAssistant": {
+        "enabled": False     # arrancar el MCP server bundled excel_assistant.py (hojas .xlsx/CSV)
+    },
+    "pptxAssistant": {
+        "enabled": False     # arrancar el MCP server bundled pptx_assistant.py (presentaciones .pptx)
+    },
+    "mailAssistant": {
+        "enabled": False     # arrancar el MCP server bundled mail_assistant.py (email/cal/notas)
+    },
+    "cmdbAssistant": {
+        "enabled": False     # arrancar el MCP server bundled cmdb_assistant.py (inventario IT)
     },
     "securityAssistant": {
         "enabled": False     # arrancar el MCP server bundled security_assistant.py

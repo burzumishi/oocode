@@ -1,4 +1,4 @@
-"""Renderizado visual de diffs al estilo Claude Code.
+"""Renderizado visual de diffs.
 
 Módulo autónomo: no importa nada de plugins/. Es importado por:
   - tools/hooks.py  (builtin diff_after_write)

@@ -84,34 +84,34 @@ from agent.tasks import AgentTeam
 
 # 1. Crear equipo de refactorización
 team = AgentTeam(
-    team_id="refactor-mud-2026-05-25",
+    team_id="refactor-core-2026-05-25",
     lead_agent_id="coding",
     members=["coding", "reasoning", "main"]
 )
 
 # 2. Añadir subtasks por fichero
 team.add_subtask(
-    description="Fase 1: Analizar mud.h",
+    description="Fase 1: Analizar core.h",
     assign_to="reasoning"
 )
 
 team.add_subtask(
-    description="Fase 2: Refactorizar mud.h",
+    description="Fase 2: Refactorizar core.h",
     assign_to="coding"
 )
 
 team.add_subtask(
-    description="Fase 3: Ejecutar tests mud.h",
+    description="Fase 3: Ejecutar tests core.h",
     assign_to="main"
 )
 
 team.add_subtask(
-    description="Fase 4: Validar mud.h",
+    description="Fase 4: Validar core.h",
     assign_to="main"
 )
 
 # 3. Repetir para cada fichero
-for fichero in ["mud.h", "mud2.h", "mud3.h"]:
+for fichero in ["core.h", "utils.h", "config.h"]:
     team_id = f"refactor-{fichero}-2026-05-25"
     team = AgentTeam(team_id, "coding", members=["coding", "reasoning", "main"])
     

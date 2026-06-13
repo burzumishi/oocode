@@ -1,5 +1,4 @@
 """ConversationContext: historial + compactación con resumen LLM."""
-import json
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -8,10 +7,14 @@ import agent.logger as log
 # Chars por token según tipo de contenido (Llama/Qwen, estimaciones empíricas)
 _CPT_TOOL   = 2.5   # tool results: JSON/código, muy denso
 _CPT_CALLS  = 2.5   # assistant tool_calls: payload JSON
-_CPT_THINK  = 4.0   # thinking blocks: lenguaje natural fluido, menos denso
 _CPT_TEXT   = 3.5   # user/assistant text: mezcla código+lenguaje
 _CPT_SYS    = 3.0   # system: plantillas con keywords
 _CPT_DEFLT  = 3.0   # fallback
+# Coste aproximado en tokens de UNA imagen en un mensaje de visión. Los tokens visuales
+# NO están en el texto del `content`, así que sin esto el estimador infravaloraba los
+# turnos con imágenes (la calibración con prompt_eval_count lo corrige tras el 1.er call,
+# pero la barra previa al call quedaba baja). Estimación conservadora estilo Qwen-VL.
+_TOKENS_PER_IMAGE = 768
 
 
 @dataclass
@@ -20,8 +23,11 @@ class ConversationContext:
     min_keep:          int   = 6
     compact_threshold: float = 0.80   # fracción de max_tokens para auto-compact; siempre sobreescrito por config.compact_threshold
     max_summary_chars: int   = 2100
-    high_water:        float = 0.70   # fracción para truncar tool results en 2ª pasada
+    high_water:        float = 0.70   # fracción para disparo de pre-compactación en background
     tool_max_chars:    int   = 3000   # chars máx. por tool result en 2ª pasada
+    compact_target:    float = 0.50   # fracción objetivo TRAS compactar: la 2ª pasada trunca
+                                       # tool results largos hasta bajar de aquí (deja headroom
+                                       # antes del compact_threshold para no recompactar enseguida)
 
     messages: list[dict] = field(default_factory=list)
     summary:  str        = ""        # resumen de msgs compactados, inyectado en prompt aparte
@@ -214,29 +220,47 @@ class ConversationContext:
             except Exception as e:
                 log.debug("context_compact_error", error=str(e))
 
-        # Segunda pasada: si el contexto sigue muy lleno (>high_water) tras soltar mensajes,
-        # truncar resultados de tools largos en los mensajes conservados.
-        # Las últimas 4 tool results se protegen (más recientes = más relevantes).
-        _high_water = int(self.max_tokens * self.high_water)
-        if self.token_estimate() > _high_water:
+        # Segunda pasada: tras soltar mensajes antiguos, truncar resultados de tools
+        # largos en los mensajes CONSERVADOS hasta bajar del objetivo post-compactación
+        # (compact_target). Antes se gateaba en high_water (0.70) y protegía las últimas
+        # 4 tool results: con ficheros grandes recientes el contexto se quedaba al 50-70%
+        # justo tras compactar (cerca de volver a compactar). Ahora el objetivo es más
+        # bajo y se protege menos para dejar headroom real antes del compact_threshold.
+        _target = int(self.max_tokens * self.compact_target)
+        if self.token_estimate() > _target:
             _MAX_TOOL_CHARS = self.tool_max_chars
             _KEEP_HEAD = max(0, _MAX_TOOL_CHARS - 500)
             _KEEP_TAIL = min(300, _MAX_TOOL_CHARS // 10)
-            _tool_indices = [i for i, m in enumerate(self.messages) if m.get("role") == "tool"]
-            _protected = set(_tool_indices[-4:])
-            for i, msg in enumerate(self.messages):
-                if msg.get("role") != "tool" or i in _protected:
-                    continue
-                content = msg.get("content", "")
-                if not isinstance(content, str) or len(content) <= _MAX_TOOL_CHARS:
-                    continue
-                msg["content"] = (
+
+            def _shrink(content: str) -> str:
+                return (
                     content[:_KEEP_HEAD]
                     + f"\n…[{len(content) - _KEEP_HEAD - _KEEP_TAIL:,} chars "
                     f"truncados tras compactación]…\n"
                     + content[-_KEEP_TAIL:]
                 )
+
+            _tool_indices = [i for i, m in enumerate(self.messages) if m.get("role") == "tool"]
+
+            # 1ª sweep: trunca todas las tool results largas salvo las 2 más recientes
+            # (la lectura activa del turno en curso).
+            _protected = set(_tool_indices[-2:])
+            for i in _tool_indices:
+                if i in _protected:
+                    continue
+                content = self.messages[i].get("content", "")
+                if isinstance(content, str) and len(content) > _MAX_TOOL_CHARS:
+                    self.messages[i]["content"] = _shrink(content)
             self._invalidate_token_cache()
+
+            # 2ª sweep: si AÚN seguimos por encima del objetivo (p.ej. las 2 protegidas
+            # son ficheros enormes), trunca también las protegidas salvo la última.
+            if self.token_estimate() > _target and len(_tool_indices) > 1:
+                for i in _tool_indices[:-1]:
+                    content = self.messages[i].get("content", "")
+                    if isinstance(content, str) and len(content) > _MAX_TOOL_CHARS:
+                        self.messages[i]["content"] = _shrink(content)
+                self._invalidate_token_cache()
 
         return dropped
 
@@ -287,18 +311,23 @@ def _msg_tokens(msg: dict) -> int:
 
     tokens = int(n_chars / cpt)
 
-    # tool_calls (JSON): el payload está en este campo aparte del content
+    # tool_calls: el payload está en este campo aparte del content. Usamos len(str(...))
+    # en vez de json.dumps — el estimador es aproximado (la calibración absorbe la
+    # pequeña diferencia de char count) y str() evita serializar JSON en cada recálculo
+    # de token_estimate (que barre todos los mensajes con tool_calls).
     tool_calls = msg.get("tool_calls")
     if tool_calls:
-        try:
-            tc_chars = len(json.dumps(tool_calls))
-        except Exception:
-            tc_chars = len(str(tool_calls))
-        tokens += int(tc_chars / _CPT_CALLS)
+        tokens += int(len(str(tool_calls)) / _CPT_CALLS)
 
-    # thinking blocks: lenguaje natural, ratio más bajo de tokens
-    thinking = msg.get("thinking") or ""
-    if thinking:
-        tokens += int(len(str(thinking)) / _CPT_THINK)
+    # NOTA: el razonamiento (thinking) NO se cuenta aquí a propósito. Es efímero:
+    # se genera, se muestra (💭) y se contabiliza como coste de salida (↓), pero
+    # NUNCA se almacena en ctx.messages ni lo reenvía ningún backend (Ollama/OpenAI/
+    # Anthropic solo reenvían content + tool_calls). Por tanto no entra en el contexto
+    # de turnos posteriores ni consume ventana → no debe sumar a esta estimación.
+
+    # imágenes de visión: tokens visuales no reflejados en el texto del content
+    images = msg.get("images")
+    if images:
+        tokens += len(images) * _TOKENS_PER_IMAGE
 
     return tokens

@@ -2,11 +2,231 @@ from pathlib import Path
 from typing import Optional
 
 
+# ── Matcher flexible para ediciones literales ────────────────────────────────
+# edit_file/edit_files reciben `old_string` literal del modelo, que a menudo difiere
+# del fichero solo en whitespace (espacios finales, tabs vs espacios, CRLF, o toda la
+# indentación desplazada). El match EXACTO falla por esas diferencias triviales. Este
+# matcher escala la tolerancia y SIEMPRE exige coincidencia ÚNICA (si es ambigua, no
+# adivina). Devuelve el span real del fichero para reemplazarlo conservando su formato.
+
+def _leading_ws(s: str) -> str:
+    return s[: len(s) - len(s.lstrip())]
+
+
+def _line_offsets(content_lines: list[str]) -> list[int]:
+    """Offset de inicio de cada línea en el texto unido por '\\n'."""
+    offsets, pos = [], 0
+    for ln in content_lines:
+        offsets.append(pos)
+        pos += len(ln) + 1   # +1 por el '\n' separador
+    return offsets
+
+
+def find_unique_span(content: str, old: str):
+    """Localiza el span [start, end) de `content` que corresponde a `old`.
+
+    Escala la tolerancia y solo acepta coincidencia ÚNICA:
+      1. Exacto.
+      2. Por línea, ignorando whitespace final (rstrip) → cubre espacios finales/CRLF.
+      3. Por línea, ignorando indentación (strip) → cubre indentación desplazada.
+      4. Por línea, colapsando TODO run de whitespace a un espacio (norm) → cubre
+         tabs interiores vs espacios (p.ej. C estilo GNU con tabs de alineación que
+         el modelo no puede ver en el output numerado de read_file).
+
+    Devuelve (start, end, level) donde level ∈ {'exact','rstrip','strip','norm'}, o
+    (None, None, reason) con reason ∈ {'ambiguo','no-encontrado','vacio'}.
+    """
+    if old == "":
+        return None, None, "vacio"
+    # ── Nivel 1: exacto ──
+    n = content.count(old)
+    if n == 1:
+        i = content.find(old)
+        return i, i + len(old), "exact"
+    if n > 1:
+        return None, None, "ambiguo"
+
+    # ── Niveles por línea ──
+    content_lines = content.split("\n")
+    old_lines = old.split("\n")
+    if old_lines and old_lines[-1] == "":
+        old_lines = old_lines[:-1]   # `old` terminaba en '\n': trabajar por líneas
+    L = len(old_lines)
+    if L == 0:
+        return None, None, "vacio"
+    if L > len(content_lines):
+        return None, None, "no-encontrado"
+
+    offsets = _line_offsets(content_lines)
+
+    def span_at(i: int):
+        start = offsets[i]
+        last = i + L - 1
+        end = offsets[last] + len(content_lines[last])
+        return start, end
+
+    def _norm_ws(s: str) -> str:
+        return " ".join(s.split())
+
+    for level, key in (("rstrip", str.rstrip), ("strip", str.strip), ("norm", _norm_ws)):
+        hits = [
+            i for i in range(len(content_lines) - L + 1)
+            if all(key(content_lines[i + k]) == key(old_lines[k]) for k in range(L))
+        ]
+        if len(hits) == 1:
+            s, e = span_at(hits[0])
+            return s, e, level
+        if len(hits) > 1:
+            return None, None, "ambiguo"
+
+    return None, None, "no-encontrado"
+
+
+def _reindent(new: str, old: str, matched: str) -> str:
+    """Ajusta la indentación de `new` cuando el match fue por `strip` (la indentación
+    del fichero difiere de la de `old`). Desplaza cada línea de `new` por la diferencia
+    de indentación de la primera línea (old → matched). Conservador: si `new` no usa la
+    indentación de `old` como prefijo, deja la línea tal cual."""
+    old0 = old.split("\n")[0]
+    mat0 = matched.split("\n")[0]
+    old_ind, mat_ind = _leading_ws(old0), _leading_ws(mat0)
+    if old_ind == mat_ind:
+        return new
+    out = []
+    for ln in new.split("\n"):
+        if ln.startswith(old_ind):
+            out.append(mat_ind + ln[len(old_ind):])
+        elif ln.strip() == "":
+            out.append(ln)
+        else:
+            out.append(mat_ind + ln.lstrip()) if mat_ind and not _leading_ws(ln) else out.append(ln)
+    return "\n".join(out)
+
+
+# Directivas de preprocesador C que NO son comentarios (no colapsar como banner).
+_C_PREPROC_PREFIXES = (
+    "#include", "#define", "#undef", "#if", "#ifdef", "#ifndef",
+    "#else", "#elif", "#endif", "#pragma", "#error", "#import", "#line",
+)
+# Familias por sintaxis de comentario (clave = extensión sin punto, en minúsculas).
+_C_FAMILY = {"c", "h", "cpp", "cxx", "cc", "hpp", "hh", "hxx", "java", "js", "jsx",
+             "ts", "tsx", "mjs", "cjs", "go", "rs", "swift", "kt", "kts", "scala",
+             "cs", "dart", "zig", "d", "groovy", "css", "scss", "less", "proto",
+             "glsl", "hlsl", "vala", "json5"}
+_HASH_FAMILY = {"py", "pyi", "sh", "bash", "zsh", "fish", "rb", "pl", "pm", "raku",
+                "yaml", "yml", "toml", "ini", "cfg", "conf", "r", "jl", "tcl", "nim",
+                "ex", "exs", "cr", "coffee", "ps1", "dockerfile", "makefile", "mk",
+                "gitignore", "env", "properties", "awk", "sed", "gd"}
+_DASH_FAMILY = {"sql", "lua", "hs", "lhs", "adb", "ads", "elm", "purs", "sql"}
+_SEMI_FAMILY = {"lisp", "el", "clj", "cljs", "cljc", "scm", "rkt", "asm", "s", "nasm",
+                "ahk", "ini2"}
+_BANG_FAMILY = {"f", "f90", "f95", "f03", "f08", "for", "fortran"}
+_PCT_FAMILY  = {"tex", "latex", "sty", "cls", "erl", "hrl", "matlab", "mat"}
+_XML_FAMILY  = {"html", "htm", "xml", "svg", "xhtml", "vue", "xsl", "xslt", "md", "markdown", "rst"}
+
+
+def _comment_syntax(ext: str):
+    """Devuelve (line_prefixes, block_pairs, is_c_family) según la extensión del fichero.
+    Cubre las familias de lenguajes más comunes; para extensiones desconocidas usa un
+    conjunto amplio y conservador."""
+    ext = (ext or "").lstrip(".").lower()
+    if ext in _C_FAMILY:
+        return (("//",), [("/*", "*/")], True)
+    if ext == "php":
+        return (("//", "#"), [("/*", "*/")], False)
+    if ext in _HASH_FAMILY:
+        # Python: además docstrings de módulo (""" / ''') como "banner".
+        blocks = [('"""', '"""'), ("'''", "'''")] if ext in ("py", "pyi") else []
+        return (("#",), blocks, False)
+    if ext in _DASH_FAMILY:
+        blocks = [("--[[", "]]")] if ext == "lua" else [("/*", "*/")]
+        return (("--",), blocks, False)
+    if ext in _SEMI_FAMILY:
+        return ((";",), [], False)
+    if ext in _BANG_FAMILY:
+        return (("!",), [], False)
+    if ext in _PCT_FAMILY:
+        return (("%",), [], False)
+    if ext in _XML_FAMILY:
+        return ((), [("<!--", "-->")], False)
+    if ext == "vim":
+        return (('"',), [], False)
+    if ext in ("ml", "mli", "fs", "fsi"):
+        return ((), [("(*", "*)")], False)
+    if ext in ("pas", "pp", "dpr"):
+        return ((), [("{", "}"), ("(*", "*)")], False)
+    # Desconocido: conjunto amplio (line) + bloques comunes. Conservador.
+    return (("//", "#", "--", ";", "%"), [("/*", "*/"), ("<!--", "-->")], False)
+
+
+def _leading_comment_banner_len(lines: list[str], path: str = "") -> int:
+    """Nº de líneas iniciales que forman una cabecera de comentario/licencia (logos,
+    listas de autores…), AGNÓSTICO al lenguaje (según la extensión del fichero). Reconoce
+    bloques `/* */`, `<!-- -->`, `(* *)`, docstrings Python… y comentarios de línea por
+    familia. En C-family, las directivas de preprocesador (`#include`/`#define`…) NO se
+    tratan como comentario. Para en la primera línea de código real."""
+    import os as _os
+    ext = _os.path.splitext(path)[1] if path else ""
+    line_prefixes, block_pairs, is_c = _comment_syntax(ext)
+    in_block_close = None   # cierre esperado si estamos dentro de un bloque
+    n = 0
+    for ln in lines:
+        s = ln.strip()
+        if in_block_close is not None:
+            n += 1
+            if in_block_close in s:
+                in_block_close = None
+            continue
+        if s == "":
+            n += 1
+            continue
+        # ¿Abre un bloque de comentario?
+        _opened = False
+        for _open, _close in block_pairs:
+            if s.startswith(_open):
+                n += 1
+                # cierra en la misma línea? (cuidado con """x""" de una línea)
+                rest = s[len(_open):]
+                if _close not in rest:
+                    in_block_close = _close
+                _opened = True
+                break
+        if _opened:
+            continue
+        # ¿Directiva de preprocesador C? → NO es comentario, es código.
+        if is_c and s.startswith("#"):
+            break
+        # ¿Comentario de línea de esta familia?
+        if line_prefixes and s.startswith(line_prefixes):
+            n += 1
+            continue
+        # Líneas de continuación de banner tipo ` * ...` (dentro de algunos estilos).
+        if s.startswith("*") and n > 0:
+            n += 1
+            continue
+        break   # primera línea de código real
+    return n
+
+
+def _apply_flexible_edit(content: str, old: str, new: str):
+    """Aplica una edición literal tolerante a whitespace. Devuelve (new_content, note)
+    o (None, error_reason)."""
+    start, end, level = find_unique_span(content, old)
+    if start is None:
+        return None, level
+    matched = content[start:end]
+    repl = new
+    if level in ("strip", "norm"):
+        repl = _reindent(new, old, matched)
+    return content[:start] + repl + content[end:], level
+
+
 def read_file(
     path: str,
     offset: int = 0,
     limit: int = 150,
     _warn_large: int = 500,
+    skip_comment_banner: bool = False,
 ) -> str:
     p = Path(path)
     if not p.exists():
@@ -16,6 +236,16 @@ def read_file(
     try:
         lines = p.read_text(errors="replace").splitlines()
         total = len(lines)
+        # Saltar una cabecera de comentario/licencia larga (opt-in): se colapsa en un
+        # marcador pero los NÚMEROS DE LÍNEA se conservan (offset avanza), así las
+        # ediciones posteriores no se desalinean. Solo desde el inicio del fichero.
+        banner_note = ""
+        if skip_comment_banner and offset == 0:
+            _bn = _leading_comment_banner_len(lines, path)
+            if _bn >= 8:   # solo si es realmente larga
+                banner_note = (f"[1-{_bn}: cabecera de comentario/licencia "
+                               f"({_bn} líneas) omitida — read_file(offset=0) para verla]\n")
+                offset = _bn
         chunk = lines[offset : offset + limit]
         numbered = [f"{offset + i + 1}\t{line}" for i, line in enumerate(chunk)]
         result = "\n".join(numbered)
@@ -24,7 +254,7 @@ def read_file(
             result += f"\n... ({remaining} líneas más — usa offset={offset + limit} para continuar)"
         if total > _warn_large and offset == 0:
             result = f"[fichero grande: {total} líneas — mostrando {offset+1}-{offset+len(chunk)}]\n" + result
-        return result
+        return banner_note + result
     except Exception as e:
         return f"Error leyendo '{path}': {e}"
 
@@ -85,14 +315,25 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
     p = Path(path)
     if not p.exists():
         return f"Error: fichero no encontrado: {path}"
+    if old_string == "":
+        return f"Error: 'old_string' vacío en '{path}'."
     try:
         content = p.read_text()
-        count = content.count(old_string)
-        if count == 0:
+        new_content, level = _apply_flexible_edit(content, old_string, new_string)
+        if new_content is None:
+            if level == "ambiguo":
+                return (f"Error: la cadena aparece varias veces en '{path}' (o coincide de forma "
+                        "ambigua ignorando espacios). Proporciona más contexto para hacerla única.")
             return f"Error: cadena no encontrada en '{path}'."
-        if count > 1:
-            return f"Error: la cadena aparece {count} veces en '{path}'. Proporciona más contexto para hacerla única."
-        p.write_text(content.replace(old_string, new_string, 1))
+        p.write_text(new_content)
+        # Nota cuando hubo que tolerar whitespace: transparencia (el diff mostrado es la verdad).
+        if level == "rstrip":
+            return f"Edición aplicada en '{path}' (match tolerante a espacios finales)."
+        if level == "strip":
+            return f"Edición aplicada en '{path}' (match tolerante a indentación — revisa el diff)."
+        if level == "norm":
+            return (f"Edición aplicada en '{path}' (match tolerante a whitespace interior "
+                    "— tabs/espacios normalizados; revisa el diff).")
         return f"Edición aplicada en '{path}'."
     except Exception as e:
         return f"Error editando '{path}': {e}"
@@ -181,16 +422,23 @@ def edit_files(edits: list, dry_run: bool = False) -> str:
                 errors.append(f"Edición {i+1} ({path_str}): error leyendo: {exc}")
                 continue
 
-            count = content.count(old_string)
-            if count == 0:
-                errors.append(f"Edición {i+1} ({path_str}): cadena no encontrada.")
-                continue
-            if count > 1 and not replace_all:
-                errors.append(
-                    f"Edición {i+1} ({path_str}): la cadena aparece {count} veces "
-                    "(usa replace_all=true para reemplazar todas las ocurrencias)."
-                )
-                continue
+            if replace_all:
+                count = content.count(old_string)
+                if count == 0:
+                    errors.append(f"Edición {i+1} ({path_str}): cadena no encontrada.")
+                    continue
+            else:
+                # Match flexible (tolerante a whitespace) y ÚNICO.
+                _s, _e, _lvl = find_unique_span(content, old_string)
+                if _s is None:
+                    if _lvl == "ambiguo":
+                        errors.append(
+                            f"Edición {i+1} ({path_str}): la cadena coincide de forma ambigua "
+                            "(varias veces, también ignorando espacios). Da más contexto o usa replace_all."
+                        )
+                    else:
+                        errors.append(f"Edición {i+1} ({path_str}): cadena no encontrada.")
+                    continue
             originals.append((p, content, old_string, new_string, replace_all, "edit"))
 
     if errors:
@@ -208,7 +456,11 @@ def edit_files(edits: list, dry_run: bool = False) -> str:
                 _orig = original or ""
                 _old = old_s or ""
                 _new = new_s or ""
-                new_content = _orig.replace(_old, _new) if repl_all else _orig.replace(_old, _new, 1)
+                if repl_all:
+                    new_content = _orig.replace(_old, _new)
+                else:
+                    new_content, _ = _apply_flexible_edit(_orig, _old, _new)
+                    new_content = new_content if new_content is not None else _orig
                 diff = _unified_diff_snippet(_orig, new_content, str(p))
                 note = f" [replace_all={_orig.count(_old)}]" if repl_all else ""
                 parts.append(f"--- {p}{note} ---\n{diff or '(sin cambios)'}\n")
@@ -232,7 +484,11 @@ def edit_files(edits: list, dry_run: bool = False) -> str:
                 _orig = original or ""
                 _old = old_s or ""
                 _new = new_s or ""
-                new_content = _orig.replace(_old, _new) if repl_all else _orig.replace(_old, _new, 1)
+                if repl_all:
+                    new_content = _orig.replace(_old, _new)
+                else:
+                    new_content, _ = _apply_flexible_edit(_orig, _old, _new)
+                    new_content = new_content if new_content is not None else _orig
                 diffs.append(_unified_diff_snippet(_orig, new_content, str(p)))
                 p.write_text(new_content)
             written.append((p, original, op))
@@ -276,8 +532,10 @@ def build_filesystem_schemas(
     Crea closures que capturan los valores de configuración.
     """
 
-    def _read_file(path: str, offset: int = 0, limit: int = read_lines_default) -> str:
-        return read_file(path, offset, limit, _warn_large=read_lines_warn_large)
+    def _read_file(path: str, offset: int = 0, limit: int = read_lines_default,
+                   skip_comment_banner: bool = False) -> str:
+        return read_file(path, offset, limit, _warn_large=read_lines_warn_large,
+                         skip_comment_banner=skip_comment_banner)
 
     return [
         (
@@ -297,6 +555,7 @@ def build_filesystem_schemas(
                         "path":   {"type": "string",  "description": "Ruta absoluta o relativa al fichero."},
                         "offset": {"type": "integer", "description": f"Primera línea a leer (0-indexada, por defecto 0)."},
                         "limit":  {"type": "integer", "description": f"Líneas a leer (por defecto {read_lines_default})."},
+                        "skip_comment_banner": {"type": "boolean", "description": "Si true, colapsa una cabecera de comentario/licencia larga al inicio (logos, listas de autores) conservando los números de línea — útil para no gastar contexto en banners."},
                     },
                     "required": ["path"],
                 },
@@ -339,12 +598,14 @@ def build_filesystem_schemas(
             edit_file,
             {
                 "name": "edit_file",
-                "description": "Reemplaza una cadena exacta y única en un fichero. Falla si aparece 0 o más de 1 vez.",
+                "description": ("Reemplaza una cadena ÚNICA en un fichero. El match tolera diferencias "
+                                "de whitespace (espacios finales, tabs vs espacios, CRLF, indentación) "
+                                "siempre que la coincidencia sea única. Falla si aparece 0 veces o es ambigua."),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path":       {"type": "string", "description": "Ruta del fichero a editar."},
-                        "old_string": {"type": "string", "description": "Cadena exacta a reemplazar (debe ser única)."},
+                        "old_string": {"type": "string", "description": "Cadena a reemplazar (única). Copia el texto del fichero; pequeñas diferencias de espacios/indentación se toleran."},
                         "new_string": {"type": "string", "description": "Cadena sustituta."},
                     },
                     "required": ["path", "old_string", "new_string"],

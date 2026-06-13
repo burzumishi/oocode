@@ -7,7 +7,7 @@ MEMORY_DIR       = CONFIG_DIR / "memory"
 HISTORY_FILE     = CONFIG_DIR / "history"
 KEYBINDINGS_FILE = CONFIG_DIR / "keybindings.json"
 
-VERSION      = "0.4.3"
+VERSION      = "0.5.0"
 APP_NAME     = "OOCode"
 APP_SUBTITLE = "Open Code Assistant"
 

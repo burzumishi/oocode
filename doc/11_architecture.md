@@ -57,7 +57,11 @@ oocode/
 ├── mcp_servers/           # Servidores MCP bundled (proceso stdio independiente)
 │   ├── oocode_assistant.py    # ~35 tools: git, docker, fs, grep, symbols, utils
 │   ├── system_assistant.py    # systemctl, journalctl, red, disco, procesos
-│   ├── home_office_assistant.py # 66 tools: Office nativo, email, calendario
+│   ├── word_assistant.py     # 29 tools: Word/PDF + doc_create + núcleo O365
+│   ├── excel_assistant.py    # 16 tools: hojas .xlsx + CSV
+│   ├── pptx_assistant.py     # 7 tools: presentaciones .pptx
+│   ├── mail_assistant.py      # 11 tools: email/calendario/notas/contactos
+│   ├── cmdb_assistant.py      # 3 tools: inventario IT (CMDB/asset register)
 │   ├── security_assistant.py  # 24 tools: nmap, web, crypto, CTF
 │   └── iot_assistant.py       # 25 tools: TAPO, Alexa, HA, MQTT, ESPHome
 │
@@ -171,10 +175,10 @@ El auto-split separa planning text largo de las ediciones concretas:
 ```
   ● Voy a refactorizar el módulo completo corrigiendo todos los warnings...
 
-  ● Updating act_comm.c:         ← auto-generado cuando el texto no menciona el fichero
+  ● Updating handlers.c:         ← auto-generado cuando el texto no menciona el fichero
   |  ◐ Update:
-  |     act_comm.c
-  ⎿ Updated act_comm.c (ctrl+o to expand)
+  |     handlers.c
+  ⎿ Updated handlers.c (ctrl+o to expand)
 ```
 
 Ver `doc/24_tui_display.md` para la documentación completa del live block.

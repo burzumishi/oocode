@@ -49,6 +49,33 @@ from mcp_servers.iot_assistant import (
 )
 
 
+# ── Fast network: ninguna prueba valida red real (todas comprueban tipo/strings),
+#    así que neutralizamos avahi-browse (subprocess), el barrido de sockets y urllib
+#    para que iot_discover/esphome_control no esperen timeouts reales (47s→~1s).
+#    Ver memoria "Tests rápidos IoT".
+@pytest.fixture(autouse=True)
+def _fast_network(request):
+    import subprocess as _sp
+    import mcp_servers.iot_assistant as _iot
+
+    # Los tests que mockean explícitamente _http/subprocess/socket se respetan:
+    # este fixture solo evita la red real por defecto.
+    def _which_only(args, *a, **kw):
+        # 'which avahi-browse' / 'which dns-sd' → no instalado (salta mDNS).
+        return _sp.CompletedProcess(args, 1, stdout="", stderr="")
+
+    def _no_socket(*a, **kw):
+        raise OSError("network disabled in tests")
+
+    def _no_urlopen(*a, **kw):
+        raise _iot.urllib.error.URLError("network disabled in tests")
+
+    with patch.object(_iot.subprocess, "run", side_effect=_which_only), \
+         patch.object(_iot.socket, "create_connection", side_effect=_no_socket), \
+         patch.object(_iot.urllib.request, "urlopen", side_effect=_no_urlopen):
+        yield
+
+
 # ── Schema integrity ─────────────────────────────────────────────────────────
 
 class TestToolSchemas:

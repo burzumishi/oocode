@@ -136,7 +136,11 @@ _BUNDLED_SERVER_MAP: dict[str, str] = {
     "system-assistant":      "systemAssistant",
     "devops-assistant":      "devopsAssistant",
     "database-assistant":    "databaseAssistant",
-    "home-office-assistant": "homeOfficeAssistant",
+    "word-assistant":        "wordAssistant",
+    "excel-assistant":       "excelAssistant",
+    "pptx-assistant":        "pptxAssistant",
+    "mail-assistant":        "mailAssistant",
+    "cmdb-assistant":        "cmdbAssistant",
     "security-assistant":    "securityAssistant",
     "iot-assistant":         "iotAssistant",
     "http-client-assistant": "httpClientAssistant",
@@ -234,7 +238,9 @@ def hot_add_to_pool(entry: dict, pool: Any, registry: Any) -> tuple[bool, str]:
 
     # Resources
     try:
-        resources = client.list_resources()
+        # Sonda de capacidad: si el servidor no soporta resources, lanza y el
+        # except evita registrar las tools list/read de resources.
+        client.list_resources()
         for res_name, res_fn, res_schema in _resource_tools_for(client, name):
             if not registry.has(res_name):
                 registry.register(res_name, res_fn, res_schema)

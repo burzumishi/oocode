@@ -111,3 +111,47 @@ def test_subagent_panel_header_ctx_is_subagent_not_main():
     # Tras el fix, el header ya NO deriva ctx_str de _agent_loop.context.stats().
     header_region = src.split("result: list")[0]
     assert "context.stats()" not in header_region
+
+
+# ── Barra de subagentes activos: tarea a UNA línea ───────────────────────────
+# Regresión: sub.task puede ser un plan markdown multilínea; la barra de estado
+# (_get_subagents_text) lo volcaba entero (con \n) rompiendo el layout. _task_one_line
+# lo reduce a la 1.ª línea útil, sin markdown de cabecera y truncado.
+
+def test_task_one_line_collapses_markdown_plan():
+    from ui.app import _task_one_line
+    out = _task_one_line(
+        "# 🚀 Tarea: Continuar Implementación de Sprints WebUI OOCode\n\n"
+        "## Plan\n- paso 1\n- paso 2"
+    )
+    assert "\n" not in out
+    assert not out.startswith("#")
+    assert out.startswith("🚀 Tarea:")
+    assert len(out) <= 60
+
+
+def test_task_one_line_truncates_long_first_line():
+    from ui.app import _task_one_line
+    out = _task_one_line("x" * 200)
+    assert len(out) == 60
+    assert out.endswith("…")
+
+
+def test_task_one_line_skips_leading_blank_lines():
+    from ui.app import _task_one_line
+    out = _task_one_line("\n\n   \n- primera línea real")
+    assert out == "primera línea real"
+
+
+def test_task_one_line_empty_and_plain():
+    from ui.app import _task_one_line
+    assert _task_one_line("") == ""
+    assert _task_one_line("analizar main.py") == "analizar main.py"
+
+
+def test_subagents_bar_uses_one_line_helper():
+    """La barra de subagentes (_get_subagent_panel_text) pasa sub.task por _task_one_line."""
+    from ui.app import OOCodeApp
+    import inspect
+    src = inspect.getsource(OOCodeApp._get_subagent_panel_text)
+    assert "_task_one_line(sub.task)" in src

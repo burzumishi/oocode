@@ -472,28 +472,43 @@ def build_registry(workdir: str, config=None) -> ToolRegistry:
     except ImportError:
         pass  # MCP server no disponible — las tools quedan sin registrar
 
-    # workspace_remember — guarda instrucciones persistentes en OOCODE.md del proyecto
+    # workspace_remember — guarda instrucciones persistentes en OOCODE.md del proyecto.
+    # Respeta el techo de tamaño de OOCODE.md (ws_oocode_md_max_kb): si añadir la nota
+    # lo superaría, NO escribe y pide condensar — el resumen vive siempre en OOCODE.md.
     def workspace_remember(note: str, section: str = "Notas del usuario") -> str:
-        """Añade una nota/instrucción persistente al OOCODE.md del workspace."""
+        """Añade una nota/instrucción persistente al OOCODE.md del workspace (respeta el límite)."""
         import datetime as _dt
         oocode_md = Path(workdir) / "OOCODE.md"
         ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M")
         entry = f"- [{ts}] {note}\n"
+        max_kb  = getattr(config, "ws_oocode_md_max_kb", 24) if config is not None else 24
+        warn_kb = getattr(config, "ws_oocode_md_warn_kb", 8) if config is not None else 8
         try:
             if oocode_md.exists():
                 content = oocode_md.read_text()
                 header = f"## {section}"
                 if header in content:
-                    content = content.replace(
+                    new_content = content.replace(
                         header + "\n",
                         header + "\n" + entry,
                     )
                 else:
-                    content += f"\n{header}\n{entry}"
+                    new_content = content + f"\n{header}\n{entry}"
             else:
-                content = f"# OOCODE.md\n\n## {section}\n{entry}"
-            oocode_md.write_text(content)
-            return f"Nota guardada en OOCODE.md: {note}"
+                new_content = f"# OOCODE.md\n\n## {section}\n{entry}"
+            size_kb = len(new_content.encode("utf-8")) / 1024
+            # Techo duro: no acumular más allá del límite — condensar primero.
+            if max_kb and size_kb > max_kb:
+                return (
+                    f"⛔ No guardado: OOCODE.md llegaría a {size_kb:.1f} KB (>{max_kb} KB, techo). "
+                    f"Condensa OOCODE.md primero (resume/elimina notas obsoletas con edit_file) y "
+                    f"reintenta. NO crees otro fichero: el resumen y las notas viven en OOCODE.md."
+                )
+            oocode_md.write_text(new_content)
+            msg = f"Nota guardada en OOCODE.md: {note}"
+            if warn_kb and size_kb > warn_kb:
+                msg += f"  (⚠ OOCODE.md: {size_kb:.1f} KB > {warn_kb} KB — considera condensar)"
+            return msg
         except Exception as exc:
             return f"Error guardando nota: {exc}"
 
@@ -503,9 +518,11 @@ def build_registry(workdir: str, config=None) -> ToolRegistry:
         {
             "name": "workspace_remember",
             "description": (
-                "Guarda una instrucción o nota persistente en OOCODE.md del proyecto. "
-                "Úsala cuando el usuario pida 'recuerda que...', 'siempre haz X', "
-                "o dé instrucciones que deben persistir entre sesiones."
+                "Añade una instrucción o nota persistente a OOCODE.md (el fichero de contexto del "
+                "proyecto). Úsala cuando el usuario pida 'recuerda que...', "
+                "'siempre haz X', o dé instrucciones que deben persistir entre sesiones. Respeta el "
+                "límite de tamaño de OOCODE.md: si lo superase, no escribe y pide condensar. Para el "
+                "resumen completo del proyecto edita OOCODE.md directamente; NUNCA crees otro fichero."
             ),
             "parameters": {
                 "type": "object",
@@ -626,6 +643,7 @@ def main() -> None:
     runtime = RuntimeSettings(
         accent_color=config.accent_color,
         ctx_mode=getattr(config, "ctx_mode", "mini"),
+        plan_approval=bool(getattr(config, "plan_approval", False)),
     )
     # Cargar preferencias de razonamiento guardadas para el modelo activo
     if config.model:
@@ -642,7 +660,7 @@ def main() -> None:
         console.print(f"  [green]✓[/green]  Workspace inicializado: {', '.join(created)}")
         console.print()
 
-    # OOCODE.md trust check — igual que Claude Code con CLAUDE.md
+    # OOCODE.md trust check
     _oocode_md_path = Path(project_dir) / "OOCODE.md"
     if not _oocode_md_path.exists() and project_dir != str(Path.home() / ".oocode"):
         from prompt_toolkit import prompt as _pt_prompt
@@ -658,6 +676,12 @@ def main() -> None:
             from ui.commands import _cmd_init
             _cmd_init(project_dir, config, None)
             console.print()
+
+    # Aviso (una vez) si OOCODE.md pesa demasiado — se inyecta entero cada turno
+    _oocode_warn = config.oocode_md_warning()
+    if _oocode_warn:
+        console.print(f"  [yellow]⚠[/yellow]  {_oocode_warn}")
+        console.print()
 
     if not config.model:
         select_model_interactive(config)
@@ -836,9 +860,61 @@ def main() -> None:
             "properties": {
                 "message": {
                     "type": "string",
-                    "description": "Mensaje opcional de resumen sobre lo que se completó en esta tarea",
+                    "description": (
+                        "Narración del desenlace de la tarea, que SE MUESTRA AL USUARIO: qué hiciste, "
+                        "qué decidiste y por qué, y el resultado (p.ej. 'gettext.h eliminado: no se "
+                        "incluye en ningún .c'; 'compilado sin errores, 0 warnings'). 1-2 frases con "
+                        "contenido — no repitas solo el título de la tarea."
+                    ),
                 },
             },
+        },
+    })
+    registry.register("ask_user", agent._execute_ask_user, {
+        "name": "ask_user",
+        "description": (
+            "Pregunta UNA O VARIAS preguntas al usuario y ESPERA sus respuestas antes de "
+            "continuar. Úsalo cuando haya ambigüedad real, varias interpretaciones válidas, "
+            "o decisiones de orden/prioridad que afecten el resultado — en vez de adivinar. "
+            "NO lo uses para trivialidades ni para pedir permiso (eso es automático). Cada "
+            "pregunta lleva 2-4 opciones con etiqueta y descripción; el sistema añade "
+            "automáticamente una opción de texto libre. multiSelect=true permite elegir "
+            "varias opciones en esa pregunta (el orden de selección se conserva, útil para "
+            "definir un orden de ejecución). Máximo 4 preguntas."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "description": "Lista de preguntas (1-4). Para una sola pregunta basta una lista de 1.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "header": {"type": "string",
+                                       "description": "Etiqueta corta de la pregunta (≤12 chars), para el chip."},
+                            "question": {"type": "string",
+                                         "description": "La pregunta completa."},
+                            "multiSelect": {"type": "boolean",
+                                            "description": "true = el usuario puede elegir varias opciones."},
+                            "options": {
+                                "type": "array",
+                                "description": "2-4 opciones.",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": {"type": "string", "description": "Texto corto de la opción."},
+                                        "description": {"type": "string", "description": "Explicación breve de la opción."},
+                                    },
+                                    "required": ["label"],
+                                },
+                            },
+                        },
+                        "required": ["question", "options"],
+                    },
+                },
+            },
+            "required": ["questions"],
         },
     })
 

@@ -235,6 +235,7 @@ DEFAULTS = {
     # Planificación autónoma del agente
     "plan_create":        "auto",
     "task_done":          "auto",
+    "ask_user":           "auto",   # preguntar al usuario no requiere permiso (sería circular)
     # Git nuevas tools
     "git_blame":          "auto",
     "git_rebase":         "ask",

@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from mcp_servers.oocode_assistant import (
     _tool_smart_replace,
+    _tool_regex_replace,
     _tool_context_before_edit,
     _tool_patch_apply,
     _tool_build_symbol_index,
@@ -66,6 +67,18 @@ class TestSmartReplace:
         })
         assert "new_name" in f.read_text()
         assert "reemplaz" in result.lower() or "✓" in result
+
+    def test_accepts_path_alias(self, tmp_path):
+        """El modelo viene acostumbrado a `path` de edit_file; smart_replace usa `file`.
+        Aceptar el alias evita fallos silenciosos por `file` vacío."""
+        f = tmp_path / "code.py"
+        f.write_text("def old_name():\n    return 1\n")
+        result = _tool_smart_replace({
+            "path": str(f),   # alias en vez de `file`
+            "pattern": r"old_name",
+            "replacement": "new_name",
+        })
+        assert "new_name" in f.read_text()
 
     def test_pattern_not_found(self, tmp_path):
         f = tmp_path / "code.py"
@@ -124,6 +137,75 @@ class TestSmartReplace:
             "flags": "MULTILINE",
         })
         assert isinstance(result, str)
+
+    def test_multiline_default(self, tmp_path):
+        """`^patrón$` casa por LÍNEA sin pedir flags: MULTILINE está activo por
+        defecto (los modelos usan ^/$ con semántica de editor; sin esto recibían
+        'NO encontrado' sistemático — caso real: ^HOME_DATA \\*first_home;$)."""
+        f = tmp_path / "house.h"
+        f.write_text("typedef struct home HOME_DATA;\nHOME_DATA *first_home;\nint x;\n")
+        result = _tool_smart_replace({
+            "file": str(f),
+            "pattern": r"^HOME_DATA \*first_home;$",
+            "replacement": "static HOME_DATA *first_home;",
+        })
+        assert "✓" in result
+        assert "static HOME_DATA *first_home;" in f.read_text()
+
+    def test_ws_tolerant_retry_tabs(self, tmp_path):
+        """Patrón con espacios casa una zona con TABS (el modelo no ve tabs en el
+        output numerado de read_file): reintento con [ \\t]+ anotado en el resultado."""
+        f = tmp_path / "Makefile.am"
+        f.write_text("OBJS =\tmyapp.o\tresolv.o\nall: $(OBJS)\n")
+        result = _tool_smart_replace({
+            "file": str(f),
+            "pattern": r"OBJS = myapp\.o resolv\.o",
+            "replacement": "OBJS = myapp.o",
+        })
+        assert "✓" in result and "tolerados" in result
+        assert "OBJS = myapp.o\nall:" in f.read_text()
+
+    def test_not_found_shows_related_lines(self, tmp_path):
+        """Al no casar, el contexto muestra las líneas RELACIONADAS con el patrón
+        (fragmento literal más largo), no las primeras 40 líneas del fichero."""
+        f = tmp_path / "big.c"
+        filler = "\n".join(f"int filler_{i};" for i in range(80))
+        f.write_text(filler + "\nvoid update_hints (void)\n{\n}\n")
+        result = _tool_smart_replace({
+            "file": str(f),
+            "pattern": r"^void update_hintz \(void\)$",   # typo: hintz
+            "replacement": "x",
+        })
+        assert "NO encontrado" in result
+        assert "update_hints" in result          # línea relacionada real (L81+)
+        assert "filler_0" not in result          # NO el volcado de primeras líneas
+
+    def test_regex_replace_multiline_default(self, tmp_path):
+        f = tmp_path / "news.h"
+        f.write_text("a\nNEWS_TYPE *first_news_type;\nb\n")
+        result = _tool_regex_replace({
+            "file": str(f),
+            "pattern": r"^NEWS_TYPE \*first_news_type;$",
+            "replacement": "static NEWS_TYPE *first_news_type;",
+        })
+        assert "OK" in result
+        assert "static NEWS_TYPE" in f.read_text()
+
+    def test_regex_replace_ws_retry_and_context(self, tmp_path):
+        f = tmp_path / "m.am"
+        f.write_text("bin_PROGRAMS =\tmyapp\tresolv\n")
+        r1 = _tool_regex_replace({
+            "file": str(f),
+            "pattern": r"bin_PROGRAMS = myapp resolv",
+            "replacement": "bin_PROGRAMS = myapp",
+        })
+        assert "OK" in r1 and "tolerados" in r1
+        r2 = _tool_regex_replace({
+            "file": str(f),
+            "pattern": r"no_such_thing_xyz here",
+            "replacement": "x",
+        })
+        assert "No se encontraron" in r2 and "context_before_edit" in r2
 
 
 # ── context_before_edit ───────────────────────────────────────────────────────

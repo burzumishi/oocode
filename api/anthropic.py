@@ -17,6 +17,30 @@ def _adapt_params(params: dict) -> dict:
     return {_PARAM_MAP.get(k, k): v for k, v in params.items() if k not in _PARAM_DROP}
 
 
+# Presupuesto de tokens de pensamiento por nivel (Anthropic extended thinking).
+_THINK_BUDGET = {"low": 2048, "medium": 4096, "high": 8192}
+
+
+def _apply_anthropic_thinking(kwargs: dict, think) -> None:
+    """Activa extended thinking en los kwargs de Anthropic según `think`.
+
+    None/False → no toca nada. Cuando se activa, Anthropic exige temperature=1 y
+    prohíbe top_p/top_k, así que se eliminan; budget_tokens debe ser ≥1024 y menor
+    que max_tokens."""
+    if think is None or think is False:
+        return
+    level  = think if isinstance(think, str) else "medium"
+    budget = _THINK_BUDGET.get(level, 4096)
+    max_t  = kwargs.get("max_tokens", 0) or 0
+    if max_t and budget >= max_t:
+        budget = max(1024, max_t - 512)
+    kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
+    # Incompatibles con extended thinking:
+    kwargs.pop("top_p", None)
+    kwargs.pop("top_k", None)
+    kwargs["temperature"] = 1
+
+
 def _tools_to_anthropic(tools: list) -> list:
     """Convierte schemas OpenAI/Ollama a formato Anthropic."""
     result = []
@@ -109,7 +133,7 @@ def _norm_tool_calls(content_blocks: list) -> list[ToolCall]:
 
 
 class AnthropicBackend(BackendClient):
-    """Backend para la API de Anthropic (Claude)."""
+    """Backend para la API de Anthropic."""
 
     def __init__(self, api_key: str = "", max_tokens: int | None = None) -> None:
         self._api_key    = api_key
@@ -132,6 +156,7 @@ class AnthropicBackend(BackendClient):
         messages: list,
         tools: list,
         model_params: dict,
+        think=None,
     ) -> Iterator[Chunk]:
         system, ant_messages = _messages_to_anthropic(messages)
         ant_tools = _tools_to_anthropic(tools) if tools else []
@@ -147,6 +172,7 @@ class AnthropicBackend(BackendClient):
             kwargs["system"] = system
         if ant_tools:
             kwargs["tools"] = ant_tools
+        _apply_anthropic_thinking(kwargs, think)
 
         text_acc      = ""
         thinking_acc  = ""
@@ -218,6 +244,7 @@ class AnthropicBackend(BackendClient):
         tools: list,
         model_params: dict,
         timeout: float = 0,
+        think=None,
     ) -> Response:
         system, ant_messages = _messages_to_anthropic(messages)
         ant_tools = _tools_to_anthropic(tools) if tools else []
@@ -233,6 +260,7 @@ class AnthropicBackend(BackendClient):
             kwargs["system"] = system
         if ant_tools:
             kwargs["tools"] = ant_tools
+        _apply_anthropic_thinking(kwargs, think)
 
         try:
             import anthropic
@@ -249,11 +277,14 @@ class AnthropicBackend(BackendClient):
             raise
 
         text       = ""
+        thinking   = ""
         content_blocks: list = []
         for block in (resp.content or []):
             btype = getattr(block, "type", "")
             if btype == "text":
                 text += getattr(block, "text", "")
+            elif btype == "thinking":
+                thinking += getattr(block, "thinking", "")
             elif btype == "tool_use":
                 content_blocks.append({
                     "type":  "tool_use",
@@ -266,6 +297,7 @@ class AnthropicBackend(BackendClient):
         return Response(
             text=text,
             tool_calls=_norm_tool_calls(content_blocks),
+            thinking=thinking,
             input_tokens=getattr(usage, "input_tokens", 0) if usage else 0,
             output_tokens=getattr(usage, "output_tokens", 0) if usage else 0,
         )

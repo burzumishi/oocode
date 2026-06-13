@@ -137,6 +137,111 @@ class TestToolRegistry:
         result = reg.call("nonexistent_tool", {})
         assert "Error" in result or "desconocida" in result or "not found" in result.lower()
 
+    # ── Normalización de alias de ruta (file↔path) ────────────────────────────
+    def _reg_strict_edit(self):
+        """edit_file con firma ESTRICTA (sin **kwargs) → valid es un frozenset real,
+        así la normalización de alias se activa (con **kwargs se omite)."""
+        from tools.registry import ToolRegistry
+        reg = ToolRegistry()
+
+        def edit_file(path, old_string, new_string):
+            return f"edited:{path}:{old_string}->{new_string}"
+
+        schema = {"name": "edit_file", "description": "",
+                  "parameters": {"type": "object", "properties": {}}}
+        reg.register("edit_file", edit_file, schema)
+        return reg
+
+    def test_path_alias_file_remapped(self):
+        """Regresión (logs reales): edit_file(file=…) reventaba con 'missing path'
+        porque el filtro de kwargs descartaba `file`. Ahora se remapea a `path`."""
+        reg = self._reg_strict_edit()
+        result = reg.call("edit_file", {"file": "/x.c", "old_string": "a", "new_string": "b"})
+        assert result == "edited:/x.c:a->b"
+
+    def test_path_alias_file_path_remapped(self):
+        reg = self._reg_strict_edit()
+        result = reg.call("edit_file", {"file_path": "/y.c", "old_string": "a", "new_string": "b"})
+        assert result == "edited:/y.c:a->b"
+
+    def test_path_alias_canonical_untouched(self):
+        reg = self._reg_strict_edit()
+        result = reg.call("edit_file", {"path": "/z.c", "old_string": "a", "new_string": "b"})
+        assert result == "edited:/z.c:a->b"
+
+    def test_path_alias_bidirectional_to_file(self):
+        """smart_replace usa `file`; si el modelo manda `path` se remapea a `file`."""
+        from tools.registry import ToolRegistry
+        reg = ToolRegistry()
+
+        def smart_replace(file, pattern, replacement):
+            return f"sr:{file}:{pattern}"
+
+        reg.register("smart_replace", smart_replace,
+                     {"name": "smart_replace", "description": "",
+                      "parameters": {"type": "object", "properties": {}}})
+        result = reg.call("smart_replace", {"path": "/q.c", "pattern": "p", "replacement": "r"})
+        assert result == "sr:/q.c:p"
+
+    def test_normalized_args_helper(self):
+        reg = self._reg_strict_edit()
+        out = reg.normalized_args("edit_file", {"file": "/a", "old_string": "x", "new_string": "y"})
+        assert out.get("path") == "/a" and "file" not in out
+
+    def _reg_with_fake_fs(self):
+        """Registry con un read_file y un edit_file que comparten un dict en memoria."""
+        from tools.registry import ToolRegistry
+        reg = ToolRegistry()
+        store = {"/proj/db.c": "old contents"}
+        rd_schema = {"name": "read_file", "description": "", "parameters": {"type": "object", "properties": {}}}
+        ed_schema = {"name": "edit_file", "description": "", "parameters": {"type": "object", "properties": {}}}
+
+        def read_file(path, **kw):
+            return store.get(path, "")
+
+        def edit_file(path, new_string, **kw):
+            store[path] = new_string
+            return f"Edición aplicada en '{path}'."
+
+        reg.register("read_file", read_file, rd_schema)
+        reg.register("edit_file", edit_file, ed_schema)
+        return reg, store
+
+    def test_read_cache_invalidated_after_edit(self):
+        """Regresión: read_file cacheado NO debe devolver contenido pre-edición
+        tras un edit_file de la misma ruta (causaba bucle PRE-EDIT FALLIDO)."""
+        reg, store = self._reg_with_fake_fs()
+        # 1ª lectura → se cachea el contenido viejo.
+        assert reg.call("read_file", {"path": "/proj/db.c"}) == "old contents"
+        # Edición de la misma ruta.
+        reg.call("edit_file", {"path": "/proj/db.c", "new_string": "new contents"})
+        # 2ª lectura idéntica: DEBE reflejar el cambio, no el caché obsoleto.
+        assert reg.call("read_file", {"path": "/proj/db.c"}) == "new contents"
+
+    def test_read_cache_kept_for_untouched_path(self):
+        """La invalidación dirigida no debe tirar lecturas de otras rutas."""
+        reg, store = self._reg_with_fake_fs()
+        store["/other/x.c"] = "untouched"
+        reg.call("read_file", {"path": "/other/x.c"})
+        reg.call("edit_file", {"path": "/proj/db.c", "new_string": "new"})
+        # La lectura de /other/x.c sigue cacheada (hit, no re-ejecuta).
+        before = reg.cache_stats()["hits"]
+        reg.call("read_file", {"path": "/other/x.c"})
+        assert reg.cache_stats()["hits"] == before + 1
+
+    def test_broad_tool_flushes_read_cache(self):
+        """bash/python_exec pueden tocar cualquier fichero → vacían toda la caché."""
+        reg, store = self._reg_with_fake_fs()
+
+        def bash(command, **kw):
+            store["/proj/db.c"] = "changed by bash"
+            return "ok"
+
+        reg.register("bash", bash, {"name": "bash", "description": "", "parameters": {"type": "object", "properties": {}}})
+        reg.call("read_file", {"path": "/proj/db.c"})
+        reg.call("bash", {"command": "echo hi > /proj/db.c"})
+        assert reg.call("read_file", {"path": "/proj/db.c"}) == "changed by bash"
+
     def test_ollama_schemas(self):
         from tools.registry import ToolRegistry
         reg = ToolRegistry()

@@ -9,6 +9,24 @@ import random
 import threading
 
 _SPINNER_FRAMES    = ["○", "◌", "◎", "◉", "●", "◉", "◎", "◌"]
+# Ciclo de estilos para el pulso de color del icono del spinner (◉) en el status: respira
+# verde↔cyan de forma sutil, al ritmo del propio spinner. Clases definidas en ui/repl.py.
+_SPIN_PULSE_CYCLE  = ["spin-pulse-0", "spin-pulse-1", "spin-pulse-2",
+                      "spin-pulse-3", "spin-pulse-1", "spin-pulse-0"]
+
+
+def _spin_pulse_cls(fi: int) -> str:
+    """Clase de estilo pulsante para el icono del spinner según el frame `fi`."""
+    return _SPIN_PULSE_CYCLE[fi % len(_SPIN_PULSE_CYCLE)]
+
+
+# Equivalente en colores Rich para el path REPL (Live), mismo respirar verde↔cyan.
+_RICH_SPIN_PULSE   = ["green", "cyan", "bright_cyan", "cyan", "cyan", "green"]
+
+
+def _spin_pulse_rich(fi: int) -> str:
+    """Color Rich pulsante para el icono del spinner (path REPL) según el frame `fi`."""
+    return _RICH_SPIN_PULSE[fi % len(_RICH_SPIN_PULSE)]
 _POLL_INTERVAL     = 0.2    # segundos entre ticks del spinner normal (5 fps)
 # spawn_subagent usa un intervalo más lento: la tool puede tardar minutos
 _SUBAGENT_SPINNER_POLL = 0.5   # segundos entre ticks del spinner de spawn_subagent
@@ -29,6 +47,17 @@ _MAX_PLAN_TASKS = 12
 # secuencial en _turn_dispatch_tools.
 _ORCHESTRATION_TOOLS = frozenset({
     "spawn_subagent", "spawn_fanout", "create_team", "run_team", "explore",
+})
+
+# Tools de EJECUCIÓN de comandos (compilar, correr scripts, instalar deps). Definen
+# el "concern" cmd de un bloque de tools: un intento de compilación y la edición de
+# un fichero son unidades visuales DISTINTAS — cuando una iteración tool-only pasa
+# de comandos a write tools (o viceversa) el bloque abierto se cierra y la nueva
+# tanda abre el suyo, con el 💭 del modelo ENTRE ambos (ver run() en agent/loop.py).
+# Las tools de lectura/exploración (read/grep/ls…) son NEUTRALES: no fijan concern
+# y nunca rompen el bloque (la exploración acompaña al trabajo que la motiva).
+_CMD_CONCERN_TOOLS = frozenset({
+    "bash", "python_exec", "make_run", "run_script", "pip_tool", "npm_tool",
 })
 
 # Umbral de ratio bash/total para activar el aviso de sobreuso (>40% = problema)
@@ -134,6 +163,21 @@ _PF_ACTIONS: list[tuple[str, str]] = [
     ("run",      r'\b(ejecuta|ejecutar|run\b|lanza|lanzar|levanta|levantar|inicia|iniciar|start\b|arranca|arrancar|pasa\b|pasar\b|corr[ei]|prueba\b|probar\b)\b'),
     ("update",   r'\b(actualiza|actualizar|modifica|modificar|edita|editar|cambia|cambiar|ajusta|ajustar|mejora|mejorar|update\b|upgrade\b|incorpora|configura|configurar)\b'),
 ]
+
+# ── Palabras BLANDAS por acción (señal débil/ambigua) ────────────────────────
+# Estas palabras aparecen muy a menudo en mensajes cuya intención NO es la acción
+# (p.ej. "¿qué pasa con esto?" no es 'run'; "haz un resumen" no es 'create'). Cuando
+# la acción ganadora se apoya SOLO en palabras blandas Y no hay un dominio específico
+# que la respalde, _pick_preflight_phrase baja a una frase neutral en vez de soltar
+# una frase comprometida ("Voy a ejecutar…/implementar…") que desencajaría. Solo se
+# listan las acciones COMPROMETIDAS (las que prometen una acción concreta); las
+# exploratorias (explain/search/review-genérico) casi nunca chocan.
+_PF_ACTIONS_SOFT: dict[str, str] = {
+    "create": r'\b(haz|hacer|nueva|nuevo)\b',
+    "run":    r'\b(pasa|pasar|corr[ei]|prueba|probar)\b',
+    "review": r'\b(mira|lee|leer)\b',
+    "update": r'\b(cambia|cambiar|mejora|mejorar|ajusta|ajustar|incorpora)\b',
+}
 
 # ── Patrones de DOMINIO (en qué área) ────────────────────────────────────────
 # Dominios específicos van antes que el genérico "code" para ganar en empates.
@@ -360,9 +404,20 @@ def _pick_preflight_phrase(msg: str, user_name: str = "") -> str:
     best_action = max(action_scores, key=action_scores.__getitem__) if action_scores else None
     best_domain = max(domain_scores, key=domain_scores.__getitem__) if domain_scores else None
 
+    # Puerta de confianza: si la acción ganadora se apoya SOLO en palabras blandas
+    # (señal débil) y NO hay dominio específico que la respalde, no nos comprometemos
+    # con una frase concreta — caemos a una neutral. Evita "Voy a ejecutarlo" en
+    # "¿qué pasa con esto?" o "Voy a implementar" en "haz un resumen".
+    confident = best_action is not None
+    if best_action:
+        soft_pat = _PF_ACTIONS_SOFT.get(best_action)
+        n_soft = len(re.findall(soft_pat, msg_for_match)) if soft_pat else 0
+        strong_backed = (action_scores[best_action] - n_soft) > 0
+        confident = strong_backed or (best_domain is not None)
+
     # Lookup: (acción, dominio) → (acción, None) → genérico
     phrase = ""
-    if best_action:
+    if best_action and confident:
         candidates = _PF_PHRASES.get((best_action, best_domain)) or _PF_PHRASES.get((best_action, None))
         if candidates:
             phrase = random.choice(candidates)
@@ -400,6 +455,25 @@ _FILE_SWITCH_PHRASES: list[str] = [
 def _pick_file_switch_phrase(basename: str) -> str:
     """Elige una frase aleatoria para el auto-split de fichero."""
     return random.choice(_FILE_SWITCH_PHRASES).format(file=basename)
+
+
+# Frases para REABRIR bloque sobre el MISMO fichero (siguiente edición tras el
+# cierre post-diff de la anterior) — continuación, no cambio de fichero.
+_FILE_CONTINUE_PHRASES: list[str] = [
+    "Continuing with {file}",
+    "More changes in {file}",
+    "Still working on {file}",
+    "Another pass at {file}",
+    "Next change in {file}",
+    "Further edits to {file}",
+    "Refining {file}",
+    "Back into {file}",
+]
+
+
+def _pick_file_continue_phrase(basename: str) -> str:
+    """Frase para la siguiente edición del MISMO fichero (unidad visual nueva)."""
+    return random.choice(_FILE_CONTINUE_PHRASES).format(file=basename)
 
 
 # Estilos _sfmt para el ◈ pulsante en modo Multitarea (se ciclan con fi)
@@ -874,10 +948,18 @@ Clasifica antes de actuar:
 | 3 — Panel | ≥3 módulos no relacionados · scope indefinido · refactor transversal · >1 auto-continue | Plan en texto → `plan_create` → `task_done()` por tarea |
 | 4 — Paralelo | ≥2 partes independientes (Nivel 3) | `spawn_fanout` (mismo dominio) · `spawn_subagent` (tareas separadas) · `create_team` (dominios distintos) |
 
+**`ask_user` — deja decidir al usuario:** cuando la decisión es DEL USUARIO, NO adivines ni listes opciones en texto pasivo → `ask_user(questions=[{header, question, options:[{label, description}], multiSelect}])` y ESPERA. Una sola llamada puede agrupar hasta 4 preguntas; el sistema añade automáticamente la opción de texto libre. Úsalo en estos 3 momentos:
+- **Ambigüedad real** / varias interpretaciones válidas de la petición → pregunta ANTES de actuar (ahorra rehacer trabajo).
+- **Elegir enfoque/orden/prioridad** → `multiSelect:true` conserva el ORDEN de selección (sirve para fijar el orden de ejecución). Patrón: `ask_user` → con la respuesta, `plan_create`.
+- **Próximos pasos / cierre con decisiones** → si al terminar propondrías varios caminos opcionales ("opcional", "si es necesario", "podríamos…"), NO los sueltes como lista pasiva: ofrécelos con `ask_user` para que el usuario elija el siguiente paso.
+- **REGLA DURA — toda pregunta al usuario va por `ask_user`:** si tu mensaje va a TERMINAR preguntando al usuario —ofreciendo alternativas (lista numerada, "¿Qué deseas hacer?", "¿Prefieres A o B?") O pidiendo confirmación tipo SÍ/NO para seguir ("¿Deseas que continúe con X?", "¿Sigo corrigiendo?", "¿Lo arreglo?", "¿Procedo?", "¿Quieres que…?")— eso ES un `ask_user` — formúlalo con la tool y ESPERA. Para un sí/no, da las dos opciones explícitas (p.ej. `options:[{label:"Sí, corrige los errores"},{label:"No, déjalo así"}]`). NUNCA escribas la pregunta en texto plano y te detengas: el usuario se queda sin forma estructurada de responder y el turno muere a ciegas. Convierte cada opción en `{label, description}`.
+- **Esto aplica AUNQUE consideres la tarea completada:** un resumen "✅ hecho X, ⚠️ pendiente Y… ¿quieres que siga con Y?" termina en una pregunta → la parte de la pregunta va por `ask_user` (narra el resumen en texto y ofrece el siguiente paso con la tool). No cierres un resumen con una pregunta en texto plano.
+NO lo uses para trivialidades, para pedir permiso (es automático), ni cuando el siguiente paso sea único y obvio (hazlo o anúncialo). Los subagentes NO pueden preguntar (deciden solos).
+
 **Nivel 3 — flujo `plan_create`:**
 1. Emite plan en texto (ANTES de tools): `Plan:\n1. [Acción] — ficheros: [rutas] — tools: [tools]\n2. …`
 2. Llama `plan_create(tasks=[…], summary="…")` — ÚNICA tool del turno.
-3. Por cada tarea: anuncia "Tarea N: descripción" → tools → `task_done()`.
+3. Por cada tarea: (a) **anuncia** "Tarea N: descripción"; (b) ejecuta las tools, **narrando cada acción/fichero** según lo tocas (no agrupes 10 ediciones en silencio); (c) **el RESULTADO va en `task_done(message="…")`** — este `message` SE MUESTRA AL USUARIO, así que escribe ahí 1-2 frases con qué hallaste, qué **decidiste y por qué**, y qué **acción** tomaste. Ej.: `task_done(message="gettext.h eliminado: no se incluye en ningún .c ni se llama a gettext()")` · `task_done(message="sha256.c/.h conservados: los usa crypt.c para el hash de contraseñas")`. NUNCA pongas en `message` solo el título de la tarea ni lo dejes vacío: el usuario debe ver el **desenlace y el porqué**, no un "Used 1 tool" mudo. Si la decisión es del usuario (no tuya), usa `ask_user` en vez de decidir solo.
 4. Al terminar TODAS: primera frase = `"__DONE_PHRASE__"`
 - Bloqueo: emite `⚠ REQUIERE REVISIÓN: [descripción]` → el sistema pausa.
 - Replanificación: anuncia `"Replanificación:"` → `plan_create([…])` → `workspace_remember(note="Aprendizaje: …")`. No cambies de estrategia silenciosamente.
@@ -887,8 +969,8 @@ Clasifica antes de actuar:
 - `spawn_subagent`: UNA tarea aislada con estado separado. Llámalo SOLO en su propio turno — nunca en el mismo lote que `read_file`/`grep_code`/otras tools (rompe el render del subagente). Para N tareas en paralelo usa `spawn_fanout` o `create_team`, no N×`spawn_subagent`.
 - `create_team` + `run_team`: ≥2 dominios distintos con agentes especializados (paralelo real).
 - ANTES de `create_team`/`run_team`/`spawn_fanout`: anuncia al usuario en 1 frase la composición y el reparto ("Monto un equipo: [agente A] → [parte], [agente B] → [parte]"). El usuario debe saber quién hace qué y por qué.
-- DESPUÉS de `run_team`/`spawn_fanout`: SINTETIZA para el usuario qué aportó cada agente (combina hallazgos, destaca lo completado, menciona errores) ANTES de `task_done()`. Nunca cierres con `task_done()` silencioso saltándote la síntesis.
-- `task_done()` (con plan activo) va DESPUÉS de la síntesis, no en lugar de ella.
+- DESPUÉS de `run_team`/`spawn_fanout`: SINTETIZA para el usuario qué aportó cada agente (combina hallazgos, destaca lo completado, menciona errores). Esa síntesis SE MUESTRA al usuario: ponla como texto o, si hay plan activo, en `task_done(message="…síntesis…")` (el message se muestra). Nunca cierres con `task_done()` vacío saltándote la síntesis.
+- `task_done()` (con plan activo) va DESPUÉS/CON la síntesis, no en lugar de ella.
 - NO usar subagente para: editar ficheros, tests, implementación directa.
 
 ## Flujo de trabajo
@@ -899,24 +981,29 @@ Aplica el ciclo a tu dominio (programación, ofimática, seguridad, investigaci�
 2. **Reúne contexto** — consulta lo necesario antes de actuar (lee ficheros, busca, usa las fuentes/herramientas de tu dominio). Errores o datos desconocidos → `web_search` primero.
 3. **Actúa** — antes de cada acción que cambia algo (editar, crear, enviar, ejecutar, configurar): emite UNA frase con el objeto concreto ("Actualizando Y", "Generando el informe Z", "Enviando a …"). Después: describe qué cambió.
 4. **Verifica** — comprueba el resultado con los medios de tu dominio y repórtalo de forma concreta (qué, dónde, con cifras: "N pasados, M fallidos", "3 filas escritas", `ruta:línea:msg`…).
-5. **Finaliza** — qué se hizo · qué se produjo o cambió (referencias exactas) · resultado de la verificación · advertencias. `mem_save` para hallazgos; `workspace_remember` para instrucciones persistentes.
+5. **Finaliza** — qué se hizo · qué se produjo o cambió (referencias exactas) · resultado de la verificación · advertencias. `mem_save` para hallazgos; `workspace_remember` para instrucciones persistentes. **Próximos pasos:** si hay varios caminos opcionales o que dependen de tu decisión, NO los listes en texto pasivo → ofrécelos con `ask_user` (el usuario elige y sigues). Si el siguiente paso es único y obvio, hazlo o anúncialo; si todo está hecho, cierra con la frase de fin.
 
 **Cuando trabajes con código:**
 - Explora con `read_file`/`grep_code`/`lsp_symbols` antes de editar; al editar anuncia el fichero concreto (`"Actualizando Y.c:"`).
 - Verifica con `run_tests`/`lint_file`/`lsp_diagnostics` y reporta "N pasados, M fallidos" o `ruta:línea:msg`.
 - Ficheros >__LARGE_FILE_LINES__ líneas: `code_outline` → `read_sections` → `grep_code` (verificar old_string) → `edit_file`. NUNCA `read_file` sin offset en ficheros grandes.
-- Edición segura: antes de `regex_replace` verifica con `grep_code`. Si falla: `read_file` → `edit_file` con literal exacto.
+- Edición segura: LEE el fichero (o la sección con `read_sections`) ANTES del primer `edit_file` y copia el `old_string` LITERAL del contenido recién leído — nunca lo escribas de memoria. Antes de `regex_replace` verifica el patrón con `grep_code`.
+- Si un edit falla con "no encontrado"/"no coincide": NO reintentes el mismo `old_string`. Vuelve a `read_file` la zona (el cambio puede estar YA aplicado) y, si sigue, usa `smart_replace`/`regex_replace` (más tolerantes a espacios) en vez de `edit_file` (match exacto).
 
 ## Reglas
 
 **Comunicación (el usuario NO ve tools ni resultados, SOLO tu texto — nunca trabajes en silencio):**
-Mantén un hilo de diálogo conciso pero continuo. Norma: frases breves, alto contenido, cero relleno. Ahorra tokens en floritura, NO en informar.
+Habla con el usuario de forma **cálida, cercana y conversacional** — como un compañero que va contando lo que hace, no como un log seco. Mantén un hilo CONTINUO: explica con naturalidad qué haces, qué encuentras y por qué decides lo que decides. Ser amigable NO es rellenar: cada frase aporta (un dato, un avance, una razón). Evita solo el relleno HUECO (acuses vacíos tipo "¡Claro!"/"Entendido, voy a…"), no la calidez ni las explicaciones. Ante la duda, comunica de MÁS: es preferible un usuario bien informado a uno a ciegas.
+- **Tu razonamiento interno (💭) NO sustituye al texto visible.** Si "piensas" qué vas a hacer pero no escribes una frase de texto, el usuario NO ve nada y la acción aparece muda. ANTES de cada acción o grupo de tools emite SIEMPRE una frase corta de texto normal (no solo en el bloque de pensamiento) que diga qué haces y por qué. Piensa lo que necesites, pero deja una línea visible en cada paso: es lo único que el usuario lee.
+- **Giros y descubrimientos = frase de texto NUEVA (no lo entierres en el mismo bloque):** cuando un resultado te cambia el plan o el diagnóstico (un error inesperado, un hallazgo que reorienta el trabajo —p.ej. "los símbolos que faltan son funciones de Windows, no del sistema de moneda"—), PÁRATE y escribe 1-2 frases de texto visible explicando qué descubriste y cómo cambia el enfoque, ANTES de seguir con más tools. No continúes la cadena de herramientas como si nada: ese giro es justo lo que el usuario necesita ver narrado, y abrir un mensaje de texto nuevo separa visualmente la nueva línea de trabajo.
 - Al abrir el turno (antes de la 1ª tool): 1-2 frases con qué entendiste y cómo lo abordarás. Si son ≥3 pasos, el plan hace de resumen.
 - Mientras exploras/consultas: di qué buscas y qué vas encontrando con datos concretos (rutas, `ruta:línea`, cifras). No solo antes de cambiar — también al leer/buscar.
 - Antes de cada acción que cambia algo: 1 frase con el objeto concreto ("Actualizando Y", "Generando Z"). Después: qué cambió y su efecto.
+- **Valoraciones y decisiones (NO basta anunciar que vas a valorar):** cuando una tarea es "revisar/valorar/decidir si X es necesario" o eliges entre opciones por tu cuenta, di EXPLÍCITAMENTE el **veredicto**, el **motivo** y la **acción** ("X no se referencia en ningún sitio → lo elimino"; "Y sí lo usa Z → lo mantengo"). El usuario debe poder entender qué decidiste y por qué; si solo dejas el título de la tarea y un "Used 1 tool", la valoración es invisible. Si la decisión debería tomarla el usuario, usa `ask_user`.
+- **Cambios en lote:** si vas a tocar muchos ficheros, no los apliques en bloque silencioso. Agrupa y narra el patrón con cifras ("Sustituyo la macro `_()` en 42 ficheros: …") y, en cambios no triviales, di qué cambia en cada fichero o grupo. Evita el "Used 128 tools" sin contexto: el usuario no sabe qué tocaste.
 - Nunca encadenes 2+ tools sin una frase entre medias: si lo haces, el usuario queda a ciegas.
-- Al finalizar: resumen estructurado — qué se hizo · qué se produjo o cambió (referencias exactas) · verificación (cifras) · advertencias. No cierres con la frase de fin "a secas".
-- Sin relleno ("Entendido, voy a…", "Como puedes ver…", "¡Claro!"). Código en ```language. Errores en ```text.
+- Al finalizar: resumen estructurado — qué se hizo · qué se produjo o cambió (referencias exactas) · verificación (cifras) · advertencias. No cierres con la frase de fin "a secas". Si propones próximos pasos que dependen de una decisión del usuario, ofrécelos con `ask_user` (no como lista de viñetas pasiva).
+- Tono: cercano y natural, con la calidez de un compañero de equipo (un comentario humano puntual está bien si aporta o da contexto). Lo que se evita es el acuse HUECO sin contenido ("¡Claro!", "Entendido, voy a…", "Como puedes ver…"), no la amabilidad. Código en ```language. Errores en ```text.
 
 **`web_search` — escala antes de repetir:**
 - Error HTTP/API/import desconocido → busca el error exacto + versión ANTES de probar nada.
@@ -953,10 +1040,13 @@ C/C++: `lsp_symbols`→`lsp_hover`→`lsp_call_hierarchy`→`edit_file`→`lsp_d
 Python: `lsp_diagnostics` tras editar · `lsp_references` antes de renombrar
 JS/TS/Shell/Perl/YAML: `lsp_diagnostics` tras cada edición
 
-## Memoria
-- OOCODE.md + "## Instrucciones del proyecto" — máxima prioridad, SIEMPRE respetadas.
-- Instrucciones persistentes → `workspace_remember(note)`.
-- Hallazgos clave (arquitectura, bugs, decisiones) → `mem_save(nombre, contenido)`.
+## Memoria del proyecto — `OOCODE.md`
+`OOCODE.md` en la raíz del proyecto es la ÚNICA fuente del resumen y las instrucciones del proyecto; se inyecta entero como "## Instrucciones del proyecto" (máxima prioridad, SIEMPRE respetadas).
+- **Resumir/documentar el proyecto** ("haz un resumen", "documenta esto", "genera el contexto del proyecto") → actualiza `OOCODE.md` IN SITU con `write_file`/`edit_file`. PROHIBIDO crear ficheros nuevos (RESUMEN.md, NOTAS.md, PROYECTO.md, README_*…) o proponer "otra solución": el resumen vive SIEMPRE en OOCODE.md.
+- **Qué incluir** (conciso, sin relleno): propósito · lenguaje/stack · estructura de carpetas · ficheros/módulos clave con su funcionalidad (1 línea c/u) · comandos build/test/run · convenciones · notas para el agente.
+- **Respeta el límite**: mantén OOCODE.md por debajo del techo (`workspace.oocodeMdMaxKb`; aviso en `oocodeMdWarnKb`). Si se acerca, CONDENSA (resume/elimina lo obsoleto) — nunca acumules ni dupliques. Por encima del techo se trunca al leerlo, así que el exceso no lo verás.
+- **Persistencia periódica**: guarda en OOCODE.md SOLO lo estrictamente necesario para retomar el trabajo (decisiones, estructura nueva, comandos) — nada de logs ni detalles efímeros.
+- Instrucciones persistentes del usuario ("recuerda que…", "siempre haz X") → `workspace_remember(note)` (añade a OOCODE.md respetando el límite). Hallazgos puntuales que NO son instrucciones → `mem_save(nombre, contenido)` (memoria semántica), no OOCODE.md.
 """
 
 def filter_system_rules(rules: str, has_tool) -> str:
@@ -1013,6 +1103,86 @@ def filter_system_rules(rules: str, has_tool) -> str:
             continue
         out.append(line)
     return "\n".join(out)
+
+
+def _short_header(question: str, max_len: int = 16) -> str:
+    """Resumen de 1-3 palabras para el chip-botón de ask_user cuando el modelo no da
+    `header`. Corta por PALABRA (no a media palabra como '¿Apruebo y e') y quita signos
+    de apertura iniciales."""
+    q = question.strip().lstrip("¿¡").strip()
+    words = q.split()
+    out = ""
+    for w in words:
+        cand = (out + " " + w).strip()
+        if len(cand) > max_len:
+            break
+        out = cand
+    if not out:
+        out = q[:max_len]
+    return out.rstrip(" ,.;:?!")
+
+
+def normalize_ask_questions(questions=None, question: str = "",
+                            options=None, multi_select: bool = False) -> list:
+    """Normaliza la entrada de ask_user a la lista canónica de preguntas (v2).
+
+    TOLERANTE (decisión 2026-06): el schema canónico es `questions=[…]`, pero si un
+    modelo pequeño llama con la forma plana `question`/`options`, se envuelve en una
+    lista de 1. Cada pregunta canónica:
+        {header, question, multiSelect, options:[{label, description, detail}]}
+    `[Type Something]` NO se incluye aquí — lo añade la capa de UI. Devuelve [] si nada
+    válido (≥2 opciones por pregunta, máx 4 preguntas, máx 6 opciones)."""
+    raw = questions if (isinstance(questions, list) and questions) else None
+    if raw is None and question and options:
+        raw = [{"question": question, "options": options, "multiSelect": multi_select}]
+    if not raw:
+        return []
+    out = []
+    for q in raw[:4]:
+        if not isinstance(q, dict):
+            continue
+        qt = str(q.get("question", "")).strip()
+        norm_opts = []
+        for o in (q.get("options") or [])[:6]:
+            if isinstance(o, dict):
+                lbl  = str(o.get("label", "")).strip()
+                desc = str(o.get("description", "")).strip()
+                det  = str(o.get("detail", "")).strip()
+            else:
+                lbl, desc, det = str(o).strip(), "", ""
+            if lbl:
+                norm_opts.append({"label": lbl, "description": desc, "detail": det})
+        if not qt or len(norm_opts) < 2:
+            continue
+        out.append({
+            "header":      (str(q.get("header", "")).strip() or _short_header(qt)),
+            "question":    qt,
+            "multiSelect": bool(q.get("multiSelect", False)),
+            "options":     norm_opts,
+        })
+    return out
+
+
+def format_ask_questions_result(questions: list, answers: list) -> tuple:
+    """Formatea el resultado multi-pregunta de ask_user (idéntico en TUI y WebUI).
+
+    `answers`: lista paralela a `questions`; cada item {selection:[idx0based], free_text}.
+    Devuelve (agent_result, pairs): `agent_result` es el texto Q→A que recibe el agente;
+    `pairs` es [(pregunta, respuesta)] para el bloque resumen de la conversación."""
+    pairs = []
+    for i, q in enumerate(questions):
+        a = answers[i] if (answers and i < len(answers)) else {}
+        opts = q["options"]
+        sel = [j for j in (a or {}).get("selection", [])
+               if isinstance(j, int) and 0 <= j < len(opts)]
+        free = ((a or {}).get("free_text") or "").strip()
+        parts = [opts[j]["label"] for j in sel]
+        if free:
+            parts.append(free)
+        pairs.append((q["question"], ", ".join(parts) if parts else "(sin respuesta)"))
+    agent = ("El usuario respondió a las preguntas:\n"
+             + "\n".join(f"· {qq} → {aa}" for qq, aa in pairs))
+    return agent, pairs
 
 
 _SUBAGENT_COLORS = ["cyan", "blue", "magenta", "green", "yellow", "bright_cyan"]
@@ -1252,7 +1422,7 @@ def _make_tool_preview(name: str, args: dict) -> list[str]:
 
 
 def _make_compact_summary(blocks: list[tuple[str, dict, str, bool]]) -> str:
-    """Genera resumen compacto estilo Claude Code para un batch de tool calls TUI con metadata.
+    """Genera resumen compacto para un batch de tool calls TUI con metadata.
 
     Ejemplo: "Searched for 3 patterns, read 2 files, wrote 1 file (ctrl+o to expand)"
     Para ediciones únicas: "Updated agent/loop.py"  (nombre de fichero, no contador genérico)

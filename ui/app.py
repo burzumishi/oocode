@@ -25,6 +25,7 @@ import shutil
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Optional
 
@@ -50,6 +51,53 @@ from agent.keybindings import KeybindingManager
 
 _RICH_TAG_RE  = re.compile(r'\[/?[^\]]+\]')        # strip markup Rich para status
 _DEC_PRIV_RE  = re.compile(r'\x1b\[\?[0-9;]*[a-zA-Z]')  # \x1b[?25l, ?25h, etc.
+# Hyperlinks OSC 8 que Rich emite con force_terminal=True (enlaces de markdown).
+# El parser ANSI() de prompt_toolkit no los entiende: deja el ESC/ST fuera y muestra
+# el contenido crudo ("8;id=…;https://…URL  texto  8;;"). Los reescribimos a
+# "texto (url)" para conservar el enlace visible y copiable (prompt_toolkit no puede
+# hacerlos clicables). _OSC8_FULL captura el span completo open(url)+texto+close
+# (ST = ESC\\ o BEL); _OSC8_ORPHAN limpia cualquier introductor suelto sin cierre.
+_OSC8_FULL    = re.compile(
+    r'\x1b\]8;[^;]*;([^\x1b\x07]*)(?:\x1b\\|\x07)(.*?)\x1b\]8;;(?:\x1b\\|\x07)',
+    re.DOTALL,
+)
+_OSC8_ORPHAN  = re.compile(r'\x1b\]8;[^;]*;[^\x1b\x07]*(?:\x1b\\|\x07)')
+
+
+def _flatten_osc8(text: str) -> str:
+    """Aplana hyperlinks OSC 8 a 'texto (url)' (o solo 'texto' si url==texto)."""
+    if '\x1b]8' not in text:
+        return text
+
+    def _repl(m: "re.Match") -> str:
+        url, label = m.group(1), m.group(2)
+        if not url or url == label or url in label:
+            return label
+        return f'{label} ({url})'
+
+    return _OSC8_ORPHAN.sub('', _OSC8_FULL.sub(_repl, text))
+
+
+def _task_one_line(task: str, max_len: int = 60) -> str:
+    """Reduce la tarea de un subagente a UNA línea para la barra de estado.
+
+    `sub.task` puede contener un plan markdown multilínea (los \\n romperían el
+    layout de la barra). Tomamos la primera línea útil, le quitamos los marcadores
+    markdown de cabecera/lista del inicio y la truncamos. Las barras de estado son
+    la excepción donde un label corto es correcto (ver feedback_no_line_truncation).
+    """
+    if not task:
+        return ""
+    line = ""
+    for raw in task.splitlines():
+        s = raw.strip()
+        if s:
+            line = s
+            break
+    line = line.lstrip("#*->•").strip()
+    if len(line) > max_len:
+        line = line[:max_len - 1].rstrip() + "…"
+    return line
 
 # Marcadores de estilo inline: \x01STYLE\x02TEXT\x03
 # Emitidos por agent/loop.py via _sfmt(); parsed aquí para colores en el status window.
@@ -90,6 +138,19 @@ _LIVE_PULSE_COLORS = [
     "\x1b[1;32m",   # bold green (dim-up)
     "\x1b[1;36m",   # bold cyan
 ]
+# Pulso SUTIL para "Running…" (preview activa de bash): misma familia verde/cian que el
+# ●, pero en tonos dim/normal (nunca bold-bright) para que respire sin competir con el
+# bullet. Misma cadencia (indexado por _live_pulse_idx → 350ms).
+_RUNNING_PULSE_COLORS = [
+    "\x1b[2;36m",   # dim cyan
+    "\x1b[0;36m",   # normal cyan
+    "\x1b[0;96m",   # bright cyan (peso normal, no bold)
+    "\x1b[0;36m",   # normal cyan
+    "\x1b[2;36m",   # dim cyan
+    "\x1b[2;32m",   # dim green (breathe down)
+    "\x1b[2;36m",   # dim cyan
+    "\x1b[0;36m",   # normal cyan
+]
 _LIVE_RESET = "\x1b[0m"
 
 # Paleta para el ◐ pulsante en la línea ⎿ (amarillo → blanco)
@@ -122,8 +183,24 @@ _SLASH_CMDS = sorted([
     '/models', '/new', '/plugins', '/q', '/quit', '/rag', '/reasoning',
     '/reset', '/resume', '/review', '/schedule', '/session', '/sessions',
     '/settings', '/skills', '/spawn', '/splash', '/status', '/subagents', '/tasks',
-    '/think', '/tip', '/trace', '/usage', '/verbose', '/workspace',
+    '/think', '/tip', '/trace', '/usage', '/verbose', '/workspace', '/plan',
 ])
+
+# Slash MUTADORES: cambian el contexto / modelo / estado del turno que el hilo del
+# agente está usando en vivo (agent_loop.context, config.model, rt.think_level/elevated,
+# restore_session, _do_compact…). Si el agente está ocupado, se ENCOLAN como un mensaje
+# normal y se ejecutan al terminar el turno — ejecutarlos a mitad de turno corrompería el
+# contexto. El resto de slash (display/lectura) y los de control de turno (/kill, /steer,
+# /abort, /exit) pasan al momento. Se compara por comando base (primer token). Se encola
+# el comando entero por nombre (no se inspeccionan args): el coste es que la forma
+# "display" de algunos (p.ej. `/model` sin args) también espera al fin del turno.
+_QUEUE_SLASH_CMDS = frozenset({
+    "/new", "/reset", "/clear", "/compact", "/resume",
+    "/model", "/models", "/switch", "/agent",
+    "/session", "/branch",
+    "/elevated", "/elev", "/think", "/reasoning", "/ctx",
+    "/init",
+})
 
 
 # ── Completado ────────────────────────────────────────────────────────────────
@@ -258,7 +335,9 @@ class OOCodeApp:
         self._agent_loop = agent_loop
         self._config = config
         self._lock = threading.Lock()
-        self._output_parts: list[str] = []
+        # deque: el trim recorta por el frente (popleft O(1) vs list.pop(0) O(n) — en
+        # sesiones largas con muchos fragmentos el recorte era O(n) por append).
+        self._output_parts: deque[str] = deque()
         self._output_chars: int = 0
         self._agent_thread: Optional[threading.Thread] = None
         # Throttle de invalidate: evita re-renders innecesarios cuando el status no cambia
@@ -274,6 +353,11 @@ class OOCodeApp:
         self._current_tip: str = _rt()
         # Cache del tip sin markup Rich (evita regex 7×/seg en _get_status_text)
         self._plain_tip_cache: str = _RICH_TAG_RE.sub('', self._current_tip)
+        # Sugerencia contextual del siguiente mensaje (generada por LLM tras cada turno,
+        # mostrada en la franja idle en lugar del tip). _suggest_seq evita pisar una
+        # sugerencia con la de un turno anterior si llegan fuera de orden.
+        self._suggestion: str = ""
+        self._suggest_seq: int = 0
 
         # Scroll: cursor-based → _auto_scroll=True pone cursor en la última línea real
         #         _auto_scroll=False usa cursor en _scroll_pos (posición manual)
@@ -289,6 +373,10 @@ class OOCodeApp:
         self._perm_result: list = ["s"]
         self._perm_tool: str = ""
         self._perm_description: str = ""  # descripción completa (tool + args)
+        # ask_user: pregunta estructurada al usuario. Reutiliza la maquinaria de _perm_mode
+        # (input bloqueante + _perm_event), pero con render/parseo de opciones numeradas.
+        # Cuando _question != None y _perm_mode=True, el input está en "modo pregunta".
+        self._question: Optional[dict] = None   # {question, options, mode, allow_other}
 
         # Input genérico (vault, plugins) — similar al modo permiso
         self._input_mode: bool   = False
@@ -325,6 +413,13 @@ class OOCodeApp:
         # Imágenes pendientes adjuntas (via Ctrl+P o /attach) para el próximo mensaje
         self._pending_images: list[str] = []
         agent_loop._pending_images = self._pending_images  # referencia compartida para toolbar
+
+        # Cola FIFO de entradas recibidas mientras el agente está ocupado (turno en curso).
+        # Los mensajes normales y los slash MUTADORES (cambian contexto/modelo/estado) se
+        # encolan aquí y se drenan al terminar el turno (_drain_pending_queue). Los slash de
+        # display/control (/help, /mcp, /kill, /steer…) pasan al momento. Items:
+        #   {"kind": "message", "text": str}  |  {"kind": "slash", "text": str}
+        self._pending_queue: list[dict] = []
 
         # Status callback → hilo del agente actualiza el spinner en la fila 3
         agent_loop._status_text = ""
@@ -386,8 +481,17 @@ class OOCodeApp:
     def _append_output(self, text: str) -> None:
         text = text.replace('\r\n', '\n').replace('\r', '\n')
         text = _DEC_PRIV_RE.sub('', text)   # elimina \x1b[?25l y similares
+        text = _flatten_osc8(text)          # hyperlinks OSC 8 → "texto (url)"
+        # El live block es del AGENTE: solo el hilo del turno (oocode-agent) escribe en su
+        # cuerpo. Lo que imprime CUALQUIER otro hilo mientras el turno corre —el echo del
+        # input (event loop) y la salida de un slash de paso (hilo oocode-slash)— va al
+        # buffer estático (encima del live block), visible al momento, en vez de quedar
+        # enterrado en el cuerpo del live block hasta el flush al final del turno.
+        _agent_thread = self._agent_thread
+        _in_agent_thread = (_agent_thread is not None
+                            and threading.current_thread() is _agent_thread)
         with self._lock:
-            if self._live_block_active:
+            if self._live_block_active and _in_agent_thread:
                 # Durante live block: O(1) append en lista (evita O(n²) string concat)
                 if self._live_block_plan_mode:
                     # plan_create imprimiendo: va al header (encima del ●)
@@ -399,7 +503,7 @@ class OOCodeApp:
                 self._output_chars += len(text)
                 self._output_line_count += text.count('\n')
                 while self._output_chars > self._MAX_OUTPUT_CHARS and len(self._output_parts) > 1:
-                    removed = self._output_parts.pop(0)
+                    removed = self._output_parts.popleft()
                     self._output_chars -= len(removed)
                     self._output_line_count -= removed.count('\n')
                 self._output_line_count = max(0, self._output_line_count)
@@ -451,7 +555,10 @@ class OOCodeApp:
             _inline = f" {_preview[0]}" if _preview else ""
             lines.append(f"  \x1b[2m│\x1b[0m \x1b[2m◐ {self._live_block_current_tool}{_inline}\x1b[0m")
             if body.strip():
-                for _bl in body.rstrip('\n').splitlines()[:5]:
+                # COLA del body (lo más reciente: último 💭, output de la tool previa),
+                # no la cabeza — con bloques largos las primeras 5 líneas se quedaban
+                # congeladas y el usuario no veía avanzar el bloque hasta el flush.
+                for _bl in body.rstrip('\n').splitlines()[-5:]:
                     lines.append(f"  \x1b[2m│    {_bl}\x1b[0m")
             elif _preview[1:]:
                 for _pl in _preview[1:5]:
@@ -481,7 +588,6 @@ class OOCodeApp:
             live_active       = self._live_block_active
             live_bullet       = self._live_block_bullet if live_active else ""
             live_action       = self._live_block_action if live_active else ""
-            live_body         = "".join(self._live_block_body) if live_active else ""
             live_plan_hdr     = "".join(self._live_block_plan_header) if live_active else ""
             live_tool_n       = self._live_block_tool_n if live_active else 0
             live_current_tool      = self._live_block_current_tool if live_active else ""
@@ -526,8 +632,14 @@ class OOCodeApp:
                 _preview_budget = max(0, 7 - _n_done)  # 8 │ lines - N_done - 1 current
                 _inline = f" {live_preview[0]}" if live_preview else ""
                 lb.append(f"  \x1b[2m│\x1b[0m \x1b[2m◐ {live_current_tool}{_inline}\x1b[0m")
+                _run_color = _RUNNING_PULSE_COLORS[live_pulse % len(_RUNNING_PULSE_COLORS)]
                 for _pl in live_preview[1:1 + _preview_budget]:
-                    lb.append(f"  \x1b[2m│    {_pl}\x1b[0m")
+                    # "Running…" respira sutilmente (mismo ritmo que el ●); el resto del
+                    # preview (líneas de contenido) se queda atenuado estático.
+                    if _pl.strip() == "Running…":
+                        lb.append(f"  \x1b[2m│\x1b[0m    {_run_color}{_pl}{_LIVE_RESET}")
+                    else:
+                        lb.append(f"  \x1b[2m│    {_pl}\x1b[0m")
             # live_body (texto del mensaje) NO se muestra en la zona live — se preserva
             # en _live_block_body para que aparezca correctamente tras el flush.
             if live_tool_n > 0:
@@ -722,7 +834,7 @@ class OOCodeApp:
             self._output_chars += len(final)
             self._output_line_count += final.count('\n')
             while self._output_chars > self._MAX_OUTPUT_CHARS and len(self._output_parts) > 1:
-                removed = self._output_parts.pop(0)
+                removed = self._output_parts.popleft()
                 self._output_chars -= len(removed)
                 self._output_line_count -= removed.count('\n')
             self._output_line_count = max(0, self._output_line_count)
@@ -747,7 +859,21 @@ class OOCodeApp:
                 pass
 
     def _status_window_height(self) -> int:
-        """Altura dinámica del status window según si hay plan de tareas activo."""
+        """Altura dinámica del status window según el contenido activo."""
+        # Formulario ask_user: alto suficiente para ver pregunta + todas las opciones
+        # (con altura fija de 3 el formulario se recortaba — opciones invisibles).
+        if getattr(self, "_perm_mode", False) and getattr(self, "_question", None):
+            st  = self._question
+            idx = st["idx"]
+            qs  = st["questions"]
+            if idx >= len(qs):
+                return 3                       # chip Submit: header + chips + mensaje
+            q = qs[idx]
+            h = 2 + 1                           # header + fila de chips + pregunta
+            for opt in q["options"]:
+                h += 1 + (1 if opt.get("description") else 0)
+            h += 1 + 1                          # fila de texto libre + línea de ayuda
+            return min(h, 18)
         tasks = getattr(self._agent_loop, "_plan_tasks", [])
         if not tasks:
             return 3  # spinner(1) + tokens/bar(1) + tip(1)
@@ -779,7 +905,7 @@ class OOCodeApp:
             return 0
 
     def _get_subagent_panel_text(self):
-        """Contenido del panel de subagentes (estilo Claude Code).
+        """Contenido del panel de subagentes.
 
         Formato cuando hay subagentes activos:
           ⏵⏵  subagentes activos · ^C interrumpir · /subagents gestionar   N% ctx
@@ -858,7 +984,7 @@ class OOCodeApp:
             sub_ctx = f" · {sub.ctx_pct}% ctx" if sub.ctx_pct > 0 else ""
 
             sub_label  = html.escape(f"{sub.agent_emoji} {sub.agent_id[:12]}")
-            task_short = html.escape(sub.task)
+            task_short = html.escape(_task_one_line(sub.task))
 
             # 💬 parpadea (~1 s) mientras el subagente comunica con el principal;
             # "  " (2 celdas) en la fase apagada mantiene el ancho sin saltos.
@@ -876,7 +1002,90 @@ class OOCodeApp:
 
         return result
 
+    def _move_question_option(self, delta: int) -> bool:
+        """Mueve el cursor de opción (↑/↓) en el formulario ask_user. Devuelve True si
+        consumió la tecla (estaba en una pregunta con opciones), False si no aplica."""
+        st = getattr(self, "_question", None)
+        if not (self._perm_mode and st):
+            return False
+        idx = st["idx"]
+        qs  = st["questions"]
+        if idx >= len(qs):
+            return False   # chip Submit: ↑/↓ no aplican
+        rows = len(qs[idx]["options"]) + 1   # +1 = fila de texto libre
+        st["opt_idx"] = (st.get("opt_idx", 0) + delta) % rows
+        try: self._app.invalidate()
+        except Exception: pass
+        return True
+
     def _get_status_text(self):
+        if self._perm_mode and self._question:
+            # Formulario multi-pregunta (ask_user v2): fila de chips (preguntas + Submit) con
+            # el actual resaltado + opciones de la pregunta actual. Navegación ←/→ libre.
+            st       = self._question
+            qs       = st["questions"]
+            idx      = st["idx"]
+            answers  = st["answers"]
+            n        = len(qs)
+            submit_ready = all(a["selection"] or a["free_text"].strip() for a in answers)
+
+            # ── Fila de chips (botones-cabecera) ─────────────────────────────
+            # Casilla por pregunta con su header corto (2-3 palabras) + [Submit].
+            # El chip de la pregunta actual va resaltado; respondidas con ☑.
+            chips = []
+            for i, q in enumerate(qs):
+                done = bool(answers[i]["selection"] or answers[i]["free_text"].strip())
+                box  = "☑" if done else "☐"
+                style = "class:spinner" if i == idx else ("class:option-done" if done else "class:dim")
+                chips.append((style, f"{box} [{q['header']}]"))
+                chips.append(("", "  "))
+            _submit_style = "class:spinner" if idx == n else ("class:option-done" if submit_ready else "class:dim")
+            chips.append((_submit_style, f"{'☑' if submit_ready else '☐'} [Submit]"))
+            out = [("class:dim", "  ◈  Preguntas de OOCode  "),
+                   ("class:dim", f" ({min(idx + 1, n)}/{n})" if idx < n else " "), ("", "\n"),
+                   ("", "  ")]
+            out += chips
+            out.append(("", "\n"))
+
+            if idx == n:
+                # Chip Submit seleccionado
+                _msg = ("  Enter para enviar todas las respuestas  ·  ← para volver"
+                        if submit_ready else
+                        "  faltan preguntas por responder  ·  ←/→ para navegar")
+                out += [("class:dim", _msg), ("", "\n ")]
+                return out
+
+            # ── Pregunta actual + opciones navegables (❯ = cursor ↑/↓) ───────
+            q       = qs[idx]
+            a       = answers[idx]
+            opt_idx = st.get("opt_idx", 0)
+            nopts   = len(q["options"])
+            out += [("", "  "), ("class:spinner", q["question"]), ("", "\n")]
+            for i, opt in enumerate(q["options"]):
+                sel    = i in a["selection"]
+                cursor = "❯" if i == opt_idx else " "
+                box    = "◉" if sel else "○"
+                head   = ("class:spinner" if i == opt_idx
+                          else ("class:option-done" if sel else "class:dim"))
+                out.append((head, f"  {cursor} {box} {i + 1}. {opt['label']}"))
+                out.append(("", "\n"))
+                if opt.get("description"):
+                    out.append(("class:dim", f"        {opt['description']}"))
+                    out.append(("", "\n"))
+            # Fila de texto libre (siempre la última, índice = nopts)
+            _free   = a["free_text"].strip()
+            _on_free = opt_idx >= nopts
+            _cursor  = "❯" if _on_free else " "
+            _box     = "◉" if _free else "○"
+            _flabel  = f": {_free}" if _free else " (escribe tu respuesta y Enter)"
+            out.append((("class:spinner" if _on_free else "class:dim"),
+                        f"  {_cursor} {_box} {nopts + 1}. ✎ Otra respuesta{_flabel}"))
+            out.append(("", "\n"))
+            _multi = "  ·  Espacio/Enter marca (varias)" if q.get("multiSelect") else "  ·  Enter elige"
+            out.append(("class:dim",
+                        f"  ↑/↓ moverse{_multi}  ·  escribe = respuesta libre  ·  ←/→ preguntas"))
+            out.append(("", "\n "))
+            return out
         if self._perm_mode:
             desc = self._perm_description or self._perm_tool
             return [
@@ -892,12 +1101,19 @@ class OOCodeApp:
         tasks     = [] if _compacting else getattr(self._agent_loop, "_plan_tasks", [])
 
         if not s and not tasks:
-            # Sin status activo: mostrar solo el tip (3 líneas)
+            # Sin status activo: sugerencia contextual si la hay, si no el tip (3 líneas)
+            suggestion = self._suggestion
+            if suggestion:
+                return [
+                    ("", " \n"),
+                    ("", " \n"),
+                    ("class:dim", f"    ⎿ Sugerencia: «{suggestion}»"),
+                ]
             if plain_tip:
                 return [
                     ("", " \n"),
                     ("", " \n"),
-                    ("class:dim", f"   ⎿  Tip: {plain_tip}"),
+                    ("class:dim", f"    ⎿ Tip: {plain_tip}"),
                 ]
             return [("", " \n \n ")]
 
@@ -913,7 +1129,7 @@ class OOCodeApp:
             result.append(("", "\n"))
             if not tasks and line2_raw:
                 # Sin plan activo: mostrar barra de ctx/tokens en línea 2 con colores
-                result += _parse_status_line(f"   {line2_raw}", "class:dim")
+                result += _parse_status_line(f"  {line2_raw}", "class:dim")
                 result.append(("", "\n"))
             elif not tasks:
                 result.append(("", " \n"))
@@ -921,7 +1137,7 @@ class OOCodeApp:
         else:
             result.append(("", " \n"))
 
-        # ── Task list estilo Claude Code ──────────────────────────────────────
+        # ── Task list ─────────────────────────────────────────────────────────
         if tasks:
             done_count = active_count = pending_count = 0
             for _t in tasks:
@@ -947,29 +1163,32 @@ class OOCodeApp:
 
             for i, task in enumerate(visible_tasks):
                 status = task["status"]
-                icon   = "✔" if status == "done" else "◼" if status == "active" else "◻"
-                style  = ("class:task-done"   if status == "done"
-                          else "class:task-active" if status == "active"
-                          else "class:dim")
                 label  = task["text"]
-                if i == 0:
-                    # Primera fila visible: ⎿ connector
-                    result.append(("class:dim", "  ⎿  "))
-                    result.append((style, f"{icon} {label}"))
+                # Sangría / conector: primera fila con ↳ (col 2, bajo el spinner),
+                # resto alineado bajo el icono de la primera tarea (col 4).
+                result.append(("class:dim", "  ↳ ") if i == 0 else ("", "    "))
+                if status == "done":
+                    # Completada: ✔ verde + texto tachado
+                    result.append(("class:task-done", f"✔ {label}"))
+                elif status == "active":
+                    # En curso: ◼ cuadrado verde + texto blanco negrita
+                    result.append(("class:task-active-mark", "◼ "))
+                    result.append(("class:task-active-text", label))
                 else:
-                    result.append((style, f"     {icon} {label}"))
+                    # Pendiente: ◻ atenuado
+                    result.append(("class:dim", f"◻ {label}"))
                 result.append(("", "\n"))
 
-            # Summary estilo Claude Code
+            # Summary — alineado bajo los iconos de tarea (col 4)
             if active_count > 0 or pending_count > 0:
-                summary = f"      … +{pending_count} pending, {done_count} completed"
+                summary = f"    … +{pending_count} pending, {done_count} completed"
             else:
-                summary = f"      … {done_count} completed  ✓"
+                summary = f"    … {done_count} completed  ✓"
             result.append(("class:dim", summary))
         else:
             # Sin tasks: tip en última línea
             if plain_tip:
-                result.append(("class:dim", f"   ⎿  Tip: {plain_tip}"))
+                result.append(("class:dim", f"    ⎿ Tip: {plain_tip}"))
             else:
                 result.append(("", " "))
         return result
@@ -1012,6 +1231,43 @@ class OOCodeApp:
             return app._perm_result[0]
 
         self._agent_loop.permissions._ask_fn = _ask_fn
+
+        # ask_user: callback que el agente invoca (vía _execute_ask_user) para preguntar
+        # al usuario con opciones. Reutiliza _perm_mode/_perm_event (input bloqueante).
+        def _ask_user_fn(questions: list):
+            """Formulario multi-pregunta (ask_user v2). Bloquea el hilo del agente; devuelve
+            la lista de answers [{selection, free_text}] paralela a `questions`, o None si
+            timeout/cancelado. Navegación libre por chips con ←/→; respuesta vía Enter."""
+            app._question = {
+                "questions": questions,
+                "idx": 0,                                   # chip actual (len = Submit)
+                "opt_idx": 0,                               # opción resaltada (↑/↓) en la pregunta actual
+                "answers": [{"selection": [], "free_text": ""} for _ in questions],
+                "result": None,                             # lista de answers al hacer Submit
+            }
+            app._perm_description = "ask_user"
+            app._perm_result      = [None]
+            app._perm_event.clear()
+            app._perm_mode        = True
+            try:
+                app._app.invalidate()
+            except Exception:
+                app._perm_mode = False
+                app._question  = None
+                return None
+            timed_out = not app._perm_event.wait(timeout=900.0)
+            _result = (app._question or {}).get("result") if app._question else None
+            app._perm_mode = False
+            app._question  = None
+            try:
+                app._app.invalidate()
+            except Exception:
+                pass
+            if timed_out or app._perm_result[0] == "n":
+                return None        # cancelado (/kill, Ctrl+C) o timeout
+            return _result
+
+        self._agent_loop._ask_user_cb = _ask_user_fn
 
         # Cuando el usuario responde "siempre", persistir como "auto" en oocode.json
         _config = self._config
@@ -1070,6 +1326,13 @@ class OOCodeApp:
     # ── Prompt, toolbar, separador ───────────────────────────────────────────
 
     def _get_prompt(self):
+        if self._perm_mode and self._question:
+            # Formulario ask_user: el input es para respuesta libre opcional, NO un permiso.
+            return [
+                ("class:dim",   "  "),
+                ("class:arrow", "❯"),
+                ("class:dim",   " "),
+            ]
         if self._perm_mode:
             return [
                 ("class:dim",   "  "),
@@ -1160,7 +1423,9 @@ class OOCodeApp:
             return 1  # contraseñas: una sola fila visible
         tw = shutil.get_terminal_size((80, 24)).columns
 
-        if self._perm_mode:
+        if self._perm_mode and self._question:
+            prompt_w = 4   # "  ❯ " (formulario ask_user: input para respuesta libre)
+        elif self._perm_mode:
             prompt_w = 16  # "  ¿Permitir?  → "
         elif self._input_mode:
             prompt_w = 5   # "  🔑 " o "  › "
@@ -1376,7 +1641,16 @@ class OOCodeApp:
                 _summary = self._agent_loop.request_kill()
                 self._set_status("")
                 _nsub = _summary.get("subagents", 0)
-                _sfx  = f"  ·  {_nsub} subagente(s)" if _nsub else ""
+                # Ctrl+C también descarta la cola de entradas pendientes.
+                with self._lock:
+                    _nq = len(self._pending_queue)
+                    self._pending_queue.clear()
+                _parts = []
+                if _nsub:
+                    _parts.append(f"{_nsub} subagente(s)")
+                if _nq:
+                    _parts.append(f"{_nq} en cola descartada(s)")
+                _sfx = ("  ·  " + "  ·  ".join(_parts)) if _parts else ""
                 _out(f"\n  ↯  Kill enviado al agente.{_sfx}\n")
             else:
                 _out("\n  (Ctrl+C — escribe /exit para salir)\n")
@@ -1393,6 +1667,9 @@ class OOCodeApp:
         # ── Up/Down — historial o movimiento cursor en multi-línea ─────────
         @kb.add("up")
         def _(event):
+            # Formulario ask_user: ↑ mueve el cursor de opción (incluye fila de texto libre)
+            if self._move_question_option(-1):
+                return
             if self._perm_mode:
                 return
             # Agente activo: ↑ desplaza el output hacia arriba (scroll)
@@ -1409,6 +1686,8 @@ class OOCodeApp:
 
         @kb.add("down")
         def _(event):
+            if self._move_question_option(+1):
+                return
             if self._perm_mode:
                 return
             # Agente activo: ↓ desplaza el output hacia abajo (scroll)
@@ -1423,6 +1702,29 @@ class OOCodeApp:
                 delta = doc.get_cursor_down_position()
                 if delta != 0:
                     buf.cursor_position += delta
+
+        # ── ←/→ navegación libre por chips en el formulario ask_user ────────
+        # Solo activas durante el formulario multi-pregunta (eager para no mover el cursor
+        # del input). El chip índice len(questions) es [Submit].
+        _in_question = Condition(lambda: self._perm_mode and self._question is not None)
+
+        @kb.add("left", filter=_in_question, eager=True)
+        def _(event):
+            st = self._question
+            if st:
+                st["idx"] = max(0, st["idx"] - 1)
+                st["opt_idx"] = 0
+                try: self._app.invalidate()
+                except Exception: pass
+
+        @kb.add("right", filter=_in_question, eager=True)
+        def _(event):
+            st = self._question
+            if st:
+                st["idx"] = min(len(st["questions"]), st["idx"] + 1)
+                st["opt_idx"] = 0
+                try: self._app.invalidate()
+                except Exception: pass
 
         # ── PageUp/PageDown — scroll ─────────────────────────────────────────
         # _scroll_pos es siempre un índice de LÍNEA LÓGICA (no filas de pantalla).
@@ -1785,6 +2087,64 @@ class OOCodeApp:
                     sys.stdout.flush()
             threading.Thread(target=_verify_history, daemon=True, name="oocode-hist-check").start()
 
+        # ── Modo pregunta (ask_user): el usuario elige opción(es) o responde libre ──
+        if self._perm_mode and self._question:
+            # Formulario multi-pregunta navegable:
+            #   ↑/↓ mueven el cursor ❯ por las opciones · Enter (buffer vacío) elige la
+            #   opción resaltada · escribir texto + Enter = respuesta libre · ←/→ cambian
+            #   de pregunta · número + Enter = atajo de selección directa.
+            import re as _re_q
+            st = self._question
+            qs = st["questions"]; answers = st["answers"]; n = len(qs); idx = st["idx"]
+            raw = text.strip()
+            _all_done = lambda: all(a["selection"] or a["free_text"].strip() for a in answers)
+
+            def _advance():
+                st["idx"] = min(idx + 1, n)
+                st["opt_idx"] = 0
+
+            if idx >= n:                                   # chip [Submit]
+                if _all_done():
+                    st["result"] = answers
+                    self._perm_result[0] = "ok"
+                    self._perm_event.set()
+                # si faltan, permanece en Submit (el render avisa)
+            else:
+                q = qs[idx]; a = answers[idx]; nopts = len(q["options"])
+                if not raw:
+                    # Enter sin texto → actúa sobre la opción resaltada (❯).
+                    cur = st.get("opt_idx", 0)
+                    if cur >= nopts:
+                        # Fila de texto libre sin nada escrito: avanza si ya hay respuesta.
+                        if a["selection"] or a["free_text"].strip():
+                            _advance()
+                    elif q.get("multiSelect"):
+                        (a["selection"].remove(cur) if cur in a["selection"]
+                         else a["selection"].append(cur))   # alterna, sin avanzar
+                    else:
+                        a["selection"] = [cur]; a["free_text"] = ""
+                        _advance()                           # single: auto-avanzar
+                elif _re_q.fullmatch(r'[\d\s,]+', raw):    # atajo: selección por número(s)
+                    valid = [x - 1 for x in (int(m) for m in _re_q.findall(r'\d+', raw))
+                             if 1 <= x <= nopts]
+                    if q.get("multiSelect"):
+                        for j in valid:
+                            (a["selection"].remove(j) if j in a["selection"]
+                             else a["selection"].append(j))
+                    elif valid:
+                        a["selection"] = valid[:1]; a["free_text"] = ""
+                        _advance()
+                else:                                      # texto libre
+                    a["free_text"] = raw
+                    if not q.get("multiSelect"):
+                        a["selection"] = []
+                        _advance()
+            try:
+                self._app.invalidate()
+            except Exception:
+                pass
+            return
+
         # ── Modo permiso: el usuario responde s/n/siempre ────────────────────
         if self._perm_mode:
             choice = text.lower()
@@ -1869,7 +2229,13 @@ class OOCodeApp:
                 summary = self._agent_loop.request_kill()
                 _n_sub  = summary.get("subagents", 0)
                 self._set_status("")
+            # /kill descarta la cola de entradas pendientes (no se reanuda nada).
+            with self._lock:
+                _n_queued = len(self._pending_queue)
+                self._pending_queue.clear()
             _extra = []
+            if _n_queued:
+                _extra.append(f"{_n_queued} en cola descartada(s)")
             if _n_sub:
                 _extra.append(f"{_n_sub} subagente(s)")
             if _is_all and self._agent_loop.scheduler:
@@ -1902,8 +2268,17 @@ class OOCodeApp:
             self._app.exit()
             return
 
-        # Slash commands → en hilo daemon
+        _busy = bool(self._agent_thread and self._agent_thread.is_alive())
+
+        # ── Slash commands ───────────────────────────────────────────────────
         if text.startswith("/"):
+            _base = lower.split()[0] if lower.split() else lower
+            # Slash MUTADOR con el agente ocupado → encolar (se ejecuta al fin del turno;
+            # cambiarían el contexto/modelo que el turno está usando). El resto de slash
+            # (display/lectura/control: /help /mcp /kill /steer…) pasan al momento.
+            if _busy and _base in _QUEUE_SLASH_CMDS:
+                self._enqueue_pending("slash", text)
+                return
             def _run_slash():
                 from ui.commands import handle_slash
                 result = handle_slash(text, self._agent_loop, self._config)
@@ -1915,14 +2290,68 @@ class OOCodeApp:
             ).start()
             return
 
-        # Mensaje al agente
-        if self._agent_thread and self._agent_thread.is_alive():
+        # ── Mensaje normal ───────────────────────────────────────────────────
+        # Con el agente ocupado: NO se rechaza ni se envía en paralelo — se ENCOLA (FIFO)
+        # y se procesa al terminar el turno actual (_drain_pending_queue).
+        if _busy:
+            self._enqueue_pending("message", text)
+            return
+
+        # Agente libre → arrancar el turno.
+        self._start_agent_turn(text)
+
+    def _enqueue_pending(self, kind: str, text: str) -> None:
+        """Encola una entrada recibida mientras el agente está ocupado y avisa en pantalla.
+
+        `kind`: "message" (mensaje al agente) | "slash" (comando mutador). El aviso lo
+        imprime el event loop (no el hilo oocode-agent) → con el routing de _append_output
+        va al buffer estático y es visible al momento, encima del live block en curso.
+        """
+        with self._lock:
+            self._pending_queue.append({"kind": kind, "text": text})
+            _pos = len(self._pending_queue)
+        _what = "comando" if kind == "slash" else "mensaje"
+        sys.stdout.write(
+            f"  ⏳  En cola ({_pos}) — {_what} pendiente; se procesará al terminar el turno actual.\n"
+        )
+        sys.stdout.flush()
+
+    def _drain_pending_queue(self) -> None:
+        """Procesa la cola FIFO tras finalizar un turno (llamado desde el finally de
+        _run_agent). Los slash mutadores en cola se ejecutan en orden (ya es seguro: el
+        turno terminó); al encontrar un mensaje, arranca su turno y para — el finally de
+        ESE turno drenará el resto. /kill vacía la cola (no se reanuda)."""
+        while True:
+            with self._lock:
+                if not self._pending_queue:
+                    return
+                item = self._pending_queue.pop(0)
+            text = item["text"]
+            if item["kind"] == "slash":
+                try:
+                    from ui.commands import handle_slash
+                    handle_slash(text, self._agent_loop, self._config)
+                except Exception as e:
+                    sys.stdout.write(f"  ✗  Error en comando en cola «{text}»: {e}\n")
+                    sys.stdout.flush()
+                continue   # seguir drenando hasta toparse con un mensaje o vaciar
+            # Mensaje → arrancar turno y delegar el resto del drenaje a su finally
+            self._start_agent_turn(text)
+            return
+
+    def _start_agent_turn(self, text: str) -> None:
+        """Arranca un turno del agente con `text` (detecta imágenes, lanza oocode-agent)."""
+        # Si hay una compactación en curso (la compactación corre en otro hilo, no en
+        # _agent_thread, así que el guard de arriba no la detecta), avisar de que el
+        # mensaje queda ENCOLADO: run() esperará a que la compactación termine antes
+        # de procesarlo (loop.py:_compact_running). Sin este aviso parecía que el
+        # mensaje se ignoraba o que arrancaba en paralelo a la compactación.
+        if getattr(self._agent_loop, "_compact_running", None) is not None \
+                and self._agent_loop._compact_running.is_set():
             sys.stdout.write(
-                "  El agente anterior sigue activo. "
-                "Usa /kill para interrumpirlo.\n"
+                "  ⏳  Compactando contexto… tu mensaje se enviará al terminar.\n"
             )
             sys.stdout.flush()
-            return
 
         self._agent_loop._kill_requested = False
         # Al enviar un mensaje siempre volvemos a auto-scroll para seguir la respuesta
@@ -1980,7 +2409,7 @@ class OOCodeApp:
                 return
             # Eliminar partes del principio hasta llegar al objetivo
             while self._output_chars > self._TRIM_TARGET_CHARS and len(self._output_parts) > 1:
-                removed = self._output_parts.pop(0)
+                removed = self._output_parts.popleft()
                 self._output_chars -= len(removed)
                 self._output_line_count -= removed.count('\n')
             self._output_line_count = max(0, self._output_line_count)
@@ -1993,6 +2422,8 @@ class OOCodeApp:
         _t1 = _random_tip()
         self._current_tip = _t1
         self._plain_tip_cache = _RICH_TAG_RE.sub('', _t1)
+        # Nuevo turno: descartar la sugerencia del turno anterior (deja de mostrarse)
+        self._suggestion = ""
         try:
             self._agent_loop.run(text, images=images or [])
         finally:
@@ -2004,6 +2435,40 @@ class OOCodeApp:
             self._agent_loop._pending_usage_line = ""
             # Recortar el buffer para que el primer render post-turno sea rápido
             self._trim_output_buffer()
+            # Drenar la cola FIFO: ejecuta los slash mutadores pendientes y, si hay un
+            # mensaje en cola, arranca su turno (que al terminar drenará el resto). El
+            # turno encadenado reasigna self._agent_thread → lo usamos para saber si
+            # hubo continuación y NO sugerir en ese caso.
+            self._drain_pending_queue()
+            if self._agent_thread is threading.current_thread():
+                # No se encadenó otro turno desde la cola → sugerencia contextual idle.
+                self._spawn_suggestion()
+
+    def _spawn_suggestion(self) -> None:
+        """Lanza en background la generación de la sugerencia contextual idle."""
+        if not getattr(self._agent_loop.config, "suggestions_enabled", True):
+            return
+        self._suggest_seq += 1
+        my_seq = self._suggest_seq
+
+        def _gen() -> None:
+            try:
+                text = self._agent_loop._suggest_followup()
+            except Exception:
+                text = ""
+            # Solo publicar si sigue siendo la sugerencia más reciente y el agente está
+            # idle (si el usuario ya lanzó otro turno, _run_agent la habrá reseteado).
+            if not text or my_seq != self._suggest_seq:
+                return
+            if self._agent_thread and self._agent_thread.is_alive():
+                return
+            self._suggestion = text
+            try:
+                self._app.invalidate()
+            except Exception:
+                pass
+
+        threading.Thread(target=_gen, daemon=True, name="oocode-suggest").start()
 
     # ── Timer de parpadeo ────────────────────────────────────────────────────
 
@@ -2039,6 +2504,27 @@ class OOCodeApp:
         old_stdout = sys.stdout
         sys.stdout = writer
 
+        # Endurecimiento: los warnings de Python (SyntaxWarning, DeprecationWarning…)
+        # van a stderr por defecto, que NO redirigimos; en la app full-screen eso
+        # escribe texto crudo sobre la pantalla y rompe el statusbar/prompt. Durante
+        # la sesión TUI los enrutamos al log (quedan registrados, no corrompen la UI).
+        import warnings as _warnings
+        _old_showwarning = _warnings.showwarning
+
+        def _tui_showwarning(message, category, filename, lineno, file=None, line=None):
+            try:
+                from agent import logger as _log
+                _log.warn(
+                    "python_warning",
+                    category=getattr(category, "__name__", str(category)),
+                    message=str(message),
+                    location=f"{filename}:{lineno}",
+                )
+            except Exception:
+                pass
+
+        _warnings.showwarning = _tui_showwarning
+
         from ui.renderer import print_banner
         print_banner(self._config)
         console.print(
@@ -2052,6 +2538,7 @@ class OOCodeApp:
         finally:
             self._blink_stop.set()
             sys.stdout = old_stdout
+            _warnings.showwarning = _old_showwarning
             self._agent_loop._status_cb  = None
             self._agent_loop._status_text = ""
             if hasattr(self._agent_loop.permissions, "_ask_fn"):

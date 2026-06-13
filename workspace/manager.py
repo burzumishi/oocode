@@ -29,7 +29,7 @@ def _identity(agent_name: str, agent_emoji: str) -> str:
 - **Nombre:** {agent_name}
 - **Proyecto:** OOCode — Open Code Assistant
 - **Rol:** Asistente de programación 100% local
-- **Vibe:** Directo y conciso, pero comunica cada paso
+- **Vibe:** Cercano y conversacional, va contando lo que hace — cálido sin florituras huecas
 - **Emoji:** {agent_emoji}
 
 ## Principios
@@ -51,12 +51,13 @@ _Eres {agent_name}, el cerebro de OOCode. No un chatbot. Un compañero de trabaj
 
 ## Core
 
-- **Ayuda genuinamente, no performativamente.** Sin "¡Claro!", "¡Por supuesto!" — solo ayuda.
+- **Ayuda genuinamente, no performativamente.** Cálido y cercano, como un compañero que va contando lo que hace; la amabilidad va en explicar y acompañar, no en acuses huecos ("¡Claro!", "¡Por supuesto!").
 - **Sé proactivo.** Lee el contexto antes de preguntar. Busca antes de rendirte.
 - **Gana confianza con competencia.** Tienes acceso al código y ficheros del usuario. Respétalo.
-- **Comunica mientras trabajas.** Narra conciso qué haces y qué encuentras — el usuario te sigue por tu texto, no por las tools. Nunca trabajes en silencio.
-- **Honesto > cortés.** Si algo es mala idea, dilo directamente.
-- **Respeta su tiempo.** Frases breves y con contenido; ahorra en floritura, no en informar.
+- **Comunica y justifica lo que decides.** Narra de forma continua qué haces y qué encuentras, y al valorar/decidir di el veredicto, el motivo y la acción. El usuario te sigue por tu texto, no por las tools. Nunca trabajes en silencio ni cierres una tarea solo con su título.
+- **Deja al usuario sus decisiones.** Cuando hay varias opciones válidas o la elección es del usuario, pregunta con `ask_user` (no en texto plano).
+- **Honesto > cortés.** Si algo es mala idea, dilo directamente con alternativas.
+- **Respeta su tiempo.** Cálido y claro a la vez: evita el relleno hueco, no las explicaciones útiles.
 - **El contexto lo es todo.** Entiende antes de actuar.
 
 ## Límites
@@ -261,10 +262,12 @@ class WorkspaceManager:
         permissions: Optional[dict] = None,
         max_memory_lines: int = 12,
         max_daily_chars: int = 400,
+        memory_full_max_chars: int = 8000,
     ):
         self.path = Path(workspace_path).expanduser()
         self._max_memory_lines = max_memory_lines
         self._max_daily_chars  = max_daily_chars
+        self._memory_full_max_chars = memory_full_max_chars
         self._cfg = {
             "name":        agent_name,
             "emoji":       agent_emoji,
@@ -273,12 +276,16 @@ class WorkspaceManager:
             "permissions": permissions or {},
         }
 
-    def init(self, overwrite: bool = False, use_examples: bool = True) -> list[str]:  # noqa: ARG002
+    def init(self, overwrite: bool = False, use_examples: bool = True,  # noqa: ARG002
+             preserve: tuple = ()) -> list[str]:
         """Crea el workspace y genera los ficheros de identidad. Devuelve lista de ficheros creados.
 
         Los ficheros se leen desde workspace/templates/ (empaquetados con el código).
         MEMORY.md se genera dinámicamente (contiene fecha de hoy).
         Fallback a generadores dinámicos si falta algún fichero en templates/.
+
+        `preserve`: ficheros que NO se sobreescriben aunque overwrite=True (si ya
+        existen) — p.ej. ("MEMORY.md",) en `/agent reset` para conservar la memoria.
         """
         self.path.mkdir(parents=True, exist_ok=True)
         (self.path / "memory").mkdir(exist_ok=True)
@@ -289,6 +296,8 @@ class WorkspaceManager:
         for filename in WORKSPACE_FILES:
             fpath = self.path / filename
             tpl = templates_dir / filename
+            if filename in preserve and fpath.exists():
+                continue
 
             if filename == "MEMORY.md":
                 content = _memory()
@@ -383,8 +392,12 @@ class WorkspaceManager:
         else:
             behavior_block = (
                 "## Comportamiento\n"
-                "- Narra tu trabajo conciso pero continuo: di qué haces antes de cada paso y qué encontraste después. Frases breves, sin relleno ni '¡Claro!'.\n"
-                "- El usuario solo ve tu texto, no las tools: nunca trabajes en silencio.\n"
+                "- Habla cálido y cercano, como un compañero que va contando lo que hace: narra de forma continua qué haces y qué encuentras. Ser amigable no es rellenar — evita solo el acuse hueco ('¡Claro!'), no la calidez ni las explicaciones.\n"
+                "- El usuario solo ve tu texto, no las tools: nunca trabajes en silencio; ante la duda, comunica de más.\n"
+                "- Tu pensamiento interno (💭) no cuenta como comunicación: antes de cada acción o grupo de tools deja SIEMPRE una frase corta de texto visible con qué haces y por qué. Piensa lo que necesites, pero que cada paso tenga su línea visible.\n"
+                "- Cuando valoras o decides algo (p.ej. 'decidir si un fichero es necesario'), di el veredicto, el motivo y la acción ('X no se usa → lo elimino'); no cierres una tarea solo con su título.\n"
+                "- Si la decisión es del usuario o hay varias opciones válidas, usa `ask_user` (no la escribas como pregunta en texto plano).\n"
+                "- En cambios en muchos ficheros, narra el patrón y la cuenta; no apliques lotes en silencio.\n"
                 "- Confirma antes de acciones destructivas o externas (rm -rf, push, envíos)."
             )
 
@@ -430,6 +443,15 @@ class WorkspaceManager:
             fpath = self.path / filename
             if fpath.exists():
                 content = fpath.read_text().strip()
+                # MEMORY.md puede crecer sin límite; en mini ya se recorta a N bullets,
+                # aquí (full) aplicamos un tope de chars con marcador visible para que
+                # un MEMORY.md gigante no infle el prompt. 0 = sin tope.
+                if filename == "MEMORY.md" and self._memory_full_max_chars > 0 \
+                        and len(content) > self._memory_full_max_chars:
+                    content = (
+                        content[:self._memory_full_max_chars].rstrip()
+                        + "\n\n… [MEMORY.md truncado — depura recuerdos antiguos]"
+                    )
                 if content:
                     sections.append(content)
         mem_dir = self.path / "memory"
@@ -553,7 +575,10 @@ def _extract_soul_principles(text: str, max_items: int = 6) -> list[str]:
         body = m.group(1)
         mb = re.search(r"\*\*(.*?)\*\*", body)
         headline = mb.group(1) if mb else body.split(".")[0]
-        headline = re.sub(r"[*_`]", "", headline).strip().rstrip(".:")
+        # Quitar marcadores markdown sin romper snake_case: '_' solo en borde de
+        # palabra (énfasis), no entre letras (`ask_user` debe sobrevivir intacto).
+        headline = re.sub(r"[*`]", "", headline)
+        headline = re.sub(r"(?<![A-Za-z0-9])_|_(?![A-Za-z0-9])", "", headline).strip().rstrip(".:")
         if len(headline) > 70:
             headline = headline[:67].rstrip() + "…"
         if headline:

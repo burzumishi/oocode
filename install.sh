@@ -23,7 +23,7 @@ _err()  { printf '  \033[31m✗\033[0m  %s\n' "$*"; }
 echo ""
 echo "  ╔═══════════════════════════════════╗"
 echo "  ║   OOCode — Ollama Open Code       ║"
-echo "  ║   Instalador v1.2  ·  OOCode 0.4.3 ║"
+echo "  ║   Instalador v1.2  ·  OOCode 0.5.0 ║"
 echo "  ╚═══════════════════════════════════╝"
 echo ""
 _info "Directorio del repo: ${REPO_DIR}"
@@ -177,6 +177,20 @@ if [ ! -f "${CONFIG_DIR}/oocode.json" ]; then
         "emoji":     "🧠",
         "model":     "",
         "workspace": "~/.oocode/workspace/reasoning"
+      },
+      {
+        "id":        "home_office",
+        "name":      "OOCode Office",
+        "emoji":     "📋",
+        "model":     "",
+        "workspace": "~/.oocode/workspace/home_office"
+      },
+      {
+        "id":        "webcrawler",
+        "name":      "WebCrawler",
+        "emoji":     "🕷️",
+        "model":     "",
+        "workspace": "~/.oocode/workspace/webcrawler"
       }
     ]
   },
@@ -217,10 +231,11 @@ if [ ! -f "${CONFIG_DIR}/oocode.json" ]; then
 
   "context": {
     "minKeep":             6,
-    "compactThreshold":    0.85,
+    "compactThreshold":    0.80,
     "maxSummaryChars":     2100,
-    "maxToolResultTokens": 2048,
-    "autoContinueMax":     8
+    "maxToolResultTokens": 800,
+    "autoContinueMax":     8,
+    "planApproval":        false
   },
 
   "embeddings": {
@@ -395,6 +410,14 @@ echo ""
 echo "  Personalizar un agente sin tocar código:"
 echo "    Edita la sección '## Notas' de ~/.oocode/workspace/<agente>/TOOLS.md"
 echo "    (uso de herramientas) o AGENTS.md (delegación). Ver doc/16_workspaces_agents.md"
+echo ""
+echo "  Servidores MCP opcionales (desactivados por defecto):"
+echo "    El agente 'home_office' usa los MCP de ofimática. Actívalos con:"
+echo "      /mcp enable word-assistant  excel-assistant  pptx-assistant"
+echo "      /mcp enable mail-assistant  cmdb-assistant"
+echo "    Otros: database-assistant · security-assistant · iot-assistant · http-client-assistant"
+echo ""
+echo "  Configuraciones de ejemplo por VRAM (4b/9b · q4_0/q8_0):  doc/examples/"
 echo ""
 echo "  Actualizar (los cambios se aplican al instante):"
 echo "    cd ${REPO_DIR} && git pull"

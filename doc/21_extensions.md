@@ -6,7 +6,7 @@ OOCode incluye extensiones para VIM/Neovim y VSCode que conectan con el WebUI vi
 
 ## Extensión VIM / Neovim
 
-**Versión:** 3.1.0  
+**Versión:** 3.2.0  
 **Ubicación:** `extensions/vim/`  
 **Requisito:** el WebUI debe estar corriendo (`/webserver start` o `python oocode.py --webserver start`)
 
@@ -133,7 +133,9 @@ Los mappings se asignan automáticamente si `g:oocode_no_mappings` no está defi
 - **Sesión compartida con el envío**: el plugin establece la cookie de sesión antes de abrir el stream, de modo que el SSE y el POST `/api/chat/send` comparten `sid` y los eventos llegan a la cola correcta (ver más abajo)
 - **Subagentes**: la cabecera del subagente y sus líneas (texto + tools) se muestran prefijadas con `│`, igual que el bloque dedicado del TUI/WebUI
 - **Indicador "Pensando"** y frase *preflight* mientras el modelo piensa
-- **Inyección de contexto automática**: cuando `g:oocode_inject_file_hint = 1`, cada mensaje incluye automáticamente `[Vim: fichero=ruta L:col ft=tipo]`
+- **Interacción `ask_user` (v3.2)**: cuando el agente plantea preguntas, el panel las muestra y te pide la respuesta con `inputlist()` (soporta multiselección `1,3` y texto libre); la respuesta se envía a `/api/chat/answer` y el turno continúa. Igual para la **confirmación de permisos** (si `webui.permissionPrompt` está activo). Antes, un `ask_user` dejaba el turno colgado hasta el timeout. *(El prompt se difiere con un timer porque `input()` no puede invocarse desde el callback del stream SSE.)*
+- **Cola y slash (v3.2)**: muestra los mensajes encolados mientras el agente trabaja y el resultado de los slash commands ejecutados en el servidor.
+- **Inyección de contexto automática (v3.2)**: cuando `g:oocode_inject_file_hint = 1`, cada `:OOCode`/`:OOCodeAsk` antepone una referencia con la **ruta absoluta** del fichero abierto (+ línea/columna del cursor) y el directorio de trabajo — `[Contexto Vim — el usuario está viendo el fichero: /ruta/abs.c (línea L12:5, ft=c). Directorio de trabajo: /ruta]` — para que el agente sepa a qué te refieres y lo lea con `read_file`. En un explorador (netrw) referencia el directorio. Las rutas son siempre absolutas (el `read_file` del agente no las acota a su `project_dir`). Para enviar el **contenido** en vez de la referencia, usa `:OOCodeContext`/`:OOCodeSelection`/`:OOCodeExplain`/`:OOCodeReview`.
 - **Watchdog del turno**: si el stream enmudece más de `g:oocode_turn_timeout` segundos, el turno se cierra para que el prompt no quede colgado
 - **Auto-detección del servidor**: al arrancar VIM, el plugin verifica si el WebUI está disponible en el puerto configurado; si no, muestra un aviso
 
@@ -206,10 +208,16 @@ Editor (VIM, g:oocode_stream=1)
   ├── 1. GET  /api/chat/status   — establece la cookie de sesión (jar)   ┐
   │                                 (petición que COMPLETA → curl la vuelca)│ mismo
   ├── 2. GET  /api/chat/stream   — SSE persistente (curl -sN -b jar)      ├ sid /
-  │         ↑ text · tool_start · tool_done · plan · subagent · done       │ cola
+  │         ↑ text · tool_start/done · plan · subagent · question ·        │ cola
+  │           permission · queued · slash_result · done                    │
   └── 3. POST /api/chat/send     — dispara el turno (fire-and-forget)     ┘
             (los eventos del turno llegan por el stream del paso 2)
 ```
+
+Los eventos interactivos del paso 2 que **bloquean** el turno (`question` de
+`ask_user`, `permission`) se responden con un POST de vuelta: `/api/chat/answer`
+y `/api/chat/permission` respectivamente. El plugin (v3.2) los maneja en paridad
+con el WebUI.
 
 **Por qué el paso 1 es imprescindible:** un curl SSE persistente nunca escribe
 el cookie jar (libcurl lo vuelca al terminar la transferencia, y el stream no

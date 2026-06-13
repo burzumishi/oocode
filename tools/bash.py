@@ -88,12 +88,25 @@ _BASH_ANTIPATTERNS: list[tuple[re.Pattern, str]] = [
 ]
 
 
+# Filtros de texto que son LEGÍTIMOS cuando consumen un pipe: `make 2>&1 | grep error`,
+# `autogen.sh | tail -5`… operan sobre la SALIDA de otro comando, no sobre un fichero —
+# grep_code/read_file/file_stat NO pueden sustituirlos ahí. Avisar igualmente era un
+# falso positivo que ensuciaba el resultado de CADA comando de compilación (tokens +
+# steering erróneo). `sed` queda fuera a propósito: `sed -i` muta ficheros esté donde esté.
+_PIPE_FILTER_CMDS = frozenset({"grep", "head", "tail", "wc", "awk", "cat"})
+
+
 def _check_antipatterns(command: str) -> str:
     """Devuelve un mensaje de advertencia si el comando usa bash donde debería usar una tool."""
     warnings = []
     for pattern, msg in _BASH_ANTIPATTERNS:
-        if pattern.search(command):
+        for m in pattern.finditer(command):
+            _head_word = m.group(0).lstrip().split()[0].rsplit("/", 1)[-1] if m.group(0).strip() else ""
+            if (_head_word in _PIPE_FILTER_CMDS
+                    and command[:m.start()].rstrip().endswith("|")):
+                continue   # filtro de pipe: no hay tool nativa equivalente
             warnings.append(f"⚠️  {msg}")
+            break   # una advertencia por patrón
     if not warnings:
         return ""
     return "\n\n" + "\n".join(warnings)

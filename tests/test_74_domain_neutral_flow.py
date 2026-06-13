@@ -64,7 +64,9 @@ def test_system_rules_preserves_communication_rule():
     from agent.loop import SYSTEM_RULES
     assert "Comunicación" in SYSTEM_RULES
     assert "usuario NO ve" in SYSTEM_RULES
-    assert "Sin relleno" in SYSTEM_RULES
+    # La regla mantiene el "no trabajar en silencio" y distingue calidez de relleno hueco.
+    assert "relleno HUECO" in SYSTEM_RULES
+    assert "nunca trabajes en silencio" in SYSTEM_RULES
 
 
 # ── B — hint #14 por extensión ────────────────────────────────────────────────

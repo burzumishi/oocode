@@ -7,8 +7,8 @@ El TUI de OOCode muestra un **live block** al final del área de conversación m
 ```
   ● Voy a revisar el código y corregir los errores de compilación.
 
-  ● Updating act_comm.c:
-  │ ◐ Replace: (act_comm.c)
+  ● Updating handlers.c:
+  │ ◐ Replace: (handlers.c)
   │ ◐ Bash: $ grep -rn "gethostname" src/
   │   Running…
   │ ◐ Read: (doc/api.md)
@@ -40,6 +40,54 @@ Todos los marcadores se alinean en la columna 2 (0-indexed):
 | `⎿` | col 2 | dim — resumen compacto final |
 
 La línea `|  ◐ Tool:` usa 2 espacios entre `|` y `◐`; las líneas de preview usan 5 espacios.
+
+---
+
+## Barra de estado — spinner y plan multitarea
+
+Mientras el agente piensa o ejecuta, la **barra de estado** (encima del prompt) muestra un
+spinner animado (`_SPINNER_FRAMES`, nunca un icono fijo). Tiene tres formas según el momento,
+todas con el **mismo patrón de alineación** — icono/spinner en col 2 + 1 espacio; conector
+`↳` en col 2; iconos de tarea, summary `…` y footer `⎿ Tip` en col 4:
+
+**Turno simple (sin plan):**
+
+```
+  ◉ Cavilando…  (830.9s)
+  ↳ 2.5M↑ 14K↓  ·  ctx: ▰▱▱▱▱▱▱▱▱▱ 17%
+    ⎿ Tip: /doctor  diagnostica la conexión con Ollama
+```
+
+La palabra de "pensamiento" (`_THINKING_WORDS`) y la frase near-finish (`_NEAR_FINISH_PHRASES`,
+a partir de 25 s) se colorean con `status-word` (cyan) y `status-phrase` (ámbar).
+
+**Multitarea (con `plan_create` activo):**
+
+```
+  ◉ Recableando word/excel/pptx (Cavilando… · 3m 19s · 2.5M↑ 14K↓ tokens)
+  ↳ ✔ Generar word/excel/pptx_assistant.py desde office
+    ◼ Re-cablear config/comandos/webui/tests/docs para word/excel/pptx
+    … +0 pending, 1 completed
+```
+
+- **Frase principal en rojo** (`status-main`) = el `summary` del plan (`plan_create(summary=…)`,
+  guardado en `_plan_summary`); si no hay summary, cae al texto de la tarea activa.
+- Entre paréntesis, la misma palabra/colores que el turno simple.
+- **Tareas** (`_get_status_text` en `ui/app.py`): completadas `✔` en **verde tachado**
+  (`task-done` con `strike`); la activa `◼` con el cuadrado en **verde** (`task-active-mark`)
+  y el texto en **blanco negrita** (`task-active-text`); pendientes `◻` atenuadas. El conector
+  `↳` solo va en la primera fila visible.
+
+**Compactación (`_compacting_ctx`):**
+
+```
+  ↻ Compactando  40 msgs · ~50,000 tok · 81%
+  ◉ ▰▰▰▱▱▱▱▱▱▱   45%  resumiendo 12 msgs…
+    ⎿ Tip: …
+```
+
+El `↻` es el arco de compactación; la animación va en la barra de progreso de la línea 2
+(`_frame_cmp`, también `_SPINNER_FRAMES`).
 
 ---
 
@@ -144,7 +192,7 @@ Cuando el modelo emite un planning text general ("Voy a refactorizar el módulo 
 ```
   ● Voy a continuar con la refactorización completa. Primero necesito revisar...
   |  ◐ Replace:
-  |     act_comm.c
+  |     handlers.c
   ⎿ Used 3 tools (ctrl+o to expand)
 ```
 
@@ -159,19 +207,19 @@ Si el planning text tiene **más de 60 caracteres** y **no menciona explícitame
 ```
   ● Voy a continuar con la refactorización completa. Primero necesito revisar...
 
-  ● Updating act_comm.c:
+  ● Updating handlers.c:
   |  ◐ Replace:
-  |     act_comm.c
-  ⎿ Updated act_comm.c (ctrl+o to expand)
+  |     handlers.c
+  ⎿ Updated handlers.c (ctrl+o to expand)
 ```
 
 ### Formato del header auto-generado
 
 | Ficheros modificados | Header generado |
 |---|---|
-| 1 fichero | `Updating act_comm.c:` |
-| 2 ficheros | `Updating act_comm.c, imc.c:` |
-| 3+ ficheros | `Updating act_comm.c (+2 more):` |
+| 1 fichero | `Updating handlers.c:` |
+| 2 ficheros | `Updating handlers.c, utils.c:` |
+| 3+ ficheros | `Updating handlers.c (+2 more):` |
 
 ### Condición de activación
 
@@ -182,7 +230,85 @@ El split **solo** ocurre cuando:
 - Las write tools del batch tienen path en sus args
 - El texto no menciona el nombre de ningún fichero objetivo
 
-Si el modelo ya anuncia explícitamente el fichero ("Corrigiendo gethostname en act_comm.c:"), el comportamiento es el original: el texto del modelo se usa directamente como bullet del live block.
+Si el modelo ya anuncia explícitamente el fichero ("Corrigiendo gethostname en handlers.c:"), el comportamiento es el original: el texto del modelo se usa directamente como bullet del live block.
+
+---
+
+## Razonamiento del modelo (💭) — v0.4.8
+
+Cuando el pensamiento del modelo está activado (`/think low|medium…`, o `thinking.think_level` en `models.configs`), su razonamiento (canal `<think>`) se **muestra como narración atenuada** prefijada con 💭 — antes se descartaba (solo se contaba para tokens) y las herramientas se ejecutaban sin explicar el "porqué".
+
+- **Apertura de paso** (sin bloque de tools abierto): el razonamiento va al nivel de la conversación, renderizado como **Markdown** (negritas, listas, `code`) y **alineado** (columna 2, como el `●`):
+
+```
+  💭 Veo varios errores. Voy a corregirlos: primero el `else` sin `if` en db.c,
+     luego los tipos en parser.c.
+```
+
+- **Dentro de un bloque** (ya hay herramientas trabajando sobre un fichero y esta iteración CONTINÚA ese trabajo — tool-only o preámbulo repetido): el razonamiento intermedio aparece **dentro del bloque**, con el prefijo `│`, para no romperlo:
+
+```
+  ● Reading db.c
+  │ ◐ Reading: (db.c:650+20)
+  │ 💭 Veo un else sin if previo. Voy a reescribir esa sección.
+  │ ◐ Update: (db.c)
+  ⎿ Read 1 file (db.c) …
+```
+
+- **Paso nuevo con bloque abierto** (la iteración trae **texto nuevo** no-duplicado → tendrá su propio `●`): el flush del bloque anterior — que iba a producirse igualmente por el texto — se **adelanta** a antes del 💭, de modo que el razonamiento del paso queda **entre bloques**, visible al nivel de la conversación, y no enterrado como última línea `│ 💭` del bloque que se estaba cerrando:
+
+```
+  ⎿ Read 1 file (configure.ac) …
+
+  💭 Ahora voy a regenerar el proyecto con autogen.sh para confirmar que funciona.
+
+  ● Regenerando el proyecto con autogen.sh:
+  │ ◐ Bash: $ ./autogen.sh
+```
+
+- **Paso nuevo por razonamiento distinto** (v0.5.0, `_reasoning_step`): con `reasoning` activo el modelo razona ANTES de cada acción aunque reemita el mismo preámbulo (o ninguno). Sin esto, todos esos pasos se fundían bajo un único `●` "Used N tools" (medido en logs reales: 11 mensajes de agente para 132 tools). Ahora, cuando una iteración de continuación trae un 💭 **distinto** del último **y** herramientas nuevas **y** el bloque abierto ya tiene trabajo, se cierra el bloque, el 💭 sale entre bloques y se abre un `●` etiquetado por la acción — la estructura `💭 → ● → tools → ⎿` por cada paso, igual que en Claude Code:
+
+```
+  ⎿ Read 2 files …
+
+  💭 Los símbolos que faltan son funciones de Windows, no del sistema de moneda.
+
+  ● Editing (winport.c):
+  │ ◐ Update: (winport.c)
+```
+
+> **Regla canónica (guards en test_42/test_22/test_76):** la frontera del bloque la decide el **texto nuevo** (misma condición que el `●`), el **auto-split por fichero** de las write tools, el **cambio de asunto** de la tanda de tools entrante (ver abajo) o un **razonamiento (💭) DISTINTO acompañado de tools nuevas** (v0.5.0). **Razonar a solas sigue SIN cerrar el bloque**: razonar sin tools, o repitiendo el MISMO pensamiento, mantiene el bloque abierto (💭 dentro, `│ 💭`). Lo que abre paso es un 💭 nuevo + tools nuevas con el bloque ya con trabajo. Los modelos sin `reasoning` conservan la agrupación previa. Los tres intentos de "flush-al-razonar INCONDICIONAL" del 2026-06-11 (incondicional → por fichero → `_continue_same_file`) troceaban bloques y suprimían `●`; el corte v0.5.0 es distinto porque exige 💭 distinto + tools + bloque con trabajo (no reintroduce aquella regresión).
+
+Coste cero cuando el pensamiento está desactivado (default): no se emite nada. En la WebUI/Vim se emite el evento SSE `reasoning` con `new_step` (misma decisión de colocación que el TUI: `true` → el cliente cierra su bloque y pinta el 💭 standalone).
+
+## Bloques de herramientas por edición (unidades visuales) — v0.4.8
+
+La unidad visual es **una edición**: exploración + razonamiento + UNA edición + su diff = un bloque, que se **cierra inmediatamente al completarse la edición con éxito** (`_show_tool_block` → `_flush_turn_block` tras renderizar el diff). El bloque pasa YA al buffer estático — el usuario ve cada decisión y cada diff **al momento**, como en Claude Code, en lugar de un live block que apila 16 tools del mismo fichero y suelta todos los diffs de golpe al final:
+
+```
+  ● Voy a corregir los warnings de compilación…
+  │ ◐ Read: (handlers.c:700+30)
+  │ ◐ Update: (handlers.c)  + diff
+  ⎿ Read 1 file (handlers.c)
+
+  ● Continuing with handlers.c
+  │ ◐ Update: (handlers.c)  + diff
+  ⎿ Used 1 tool
+```
+
+Reglas de la unidad:
+- **Cierre**: edición completada con éxito (diff renderizado). Una edición **fallida** (PRE-EDIT, duplicado…) NO cierra: el reintento se queda en el mismo bloque.
+- **Reapertura**: la siguiente write tool abre su propia unidad en `_show_tool_running_header` (sin bloque abierto → `_start_live_block_cb`): frase de **continuación** si es el MISMO fichero (`_last_write_target`, sobrevive al flush) o de **cambio** si es otro (`_pick_file_continue_phrase` / `_pick_file_switch_phrase`).
+- **Auto-split por cambio de fichero** (`_current_write_target`): sigue existiendo como frontera adicional (cubre el caso edición fallida → edición de otro fichero, donde no hubo cierre post-diff).
+- **Cambio de ASUNTO (concern) en iteración tool-only**: un intento de compilación/ejecución (`bash`/`python_exec`/`make_run`/`run_script`/`pip_tool`/`npm_tool` → concern `cmd`) y la edición de un fichero (concern `file:<ruta>`) son unidades visuales **distintas**. En `run()`, cuando una iteración de continuación (dup/tool-only) trae una tanda cuyo concern (`_tools_concern`) difiere del establecido en el bloque abierto (`_block_has_cmd` / `_current_write_target`), el dedup se anula: el bloque se cierra, el 💭 de la iteración queda **entre bloques** y la tanda abre su `●` (etiquetado por su primera tool). Sin esto, "autogen + make + razonar los errores + editar config.h" se encadenaban bajo un solo "Used N tools". La decisión la toman las **tools entrantes**, no el razonamiento; el concern del bloque muere con el flush.
+- Las **lecturas/búsquedas** no cierran unidades ni fijan concern (son NEUTRALES): se agrupan con el trabajo al que acompañan (diagnóstico tras un make fallido, exploración previa a una edición…).
+- **`task_done` cierra la unidad de su tarea**: el header hace flush ANTES de ejecutarse, la narración del desenlace (`●` de `_render_task_narration`) sale estática **entre bloques** (antes caía en `_live_block_body` y quedaba enterrada), y su resultado interno ("✔ Tarea N/M…") no se bufferiza ni cuenta en el `⎿` del bloque siguiente.
+- **Paridad WebUI**: el evento `tool_done` lleva `is_modify`; el cliente hace `_finishToolBlock()` tras una edición OK y la siguiente tool abre bloque nuevo.
+- **Tools de memoria** (`mem_save`/`workspace_remember`): son acciones de continuidad del agente, NO trabajo sobre ficheros — cierran el bloque en curso y su `◐ ⬡` + resultado salen estáticos al nivel de la conversación (nunca enterrados en un "Used N tools"); no cuentan en el `⎿` del bloque siguiente.
+
+`_extract_write_target` debe cubrir **todos** los nombres de parámetro de ruta de las modify tools: `path` (edit_file, lsp_rename…), `file_path` (write_file) **y `file` (smart_replace, regex_replace)**. Si falta uno, el cierre/auto-split deja de disparar para esa tool en silencio y vuelven los bloques multi-edición (bug real: el steering anti-fallos de edición empuja hacia `smart_replace`, cuyo parámetro `file` no estaba cubierto).
+
+El **mensaje de `task_done(message=…)`** (resumen de cada tarea del plan) se **muestra al usuario** como narración: los modelos locales suelen poner ahí su explicación ("Tarea 3: eliminé X porque no se usa"), que antes se descartaba.
 
 ---
 
@@ -368,7 +494,7 @@ Para que el split sea innecesario la mayoría de las veces, `SYSTEM_RULES` inclu
 
 > **OBLIGATORIO antes de llamar a `edit_file`/`smart_replace`/`write_file`:** emite una frase corta que mencione el fichero concreto: `"Corrigiendo X en Y.c:"` o `"Actualizando Y.c — razón:"`. Esto aparece como cabecera `●` en el terminal.
 
-Cuando el modelo sigue esta regla, el texto corto ("Corrigiendo act_comm.c:") se usa directamente como bullet del live block y el auto-split no se activa. El auto-split es el **fallback** para cuando el modelo emite un planning general sin mencionar el fichero.
+Cuando el modelo sigue esta regla, el texto corto ("Corrigiendo handlers.c:") se usa directamente como bullet del live block y el auto-split no se activa. El auto-split es el **fallback** para cuando el modelo emite un planning general sin mencionar el fichero.
 
 ---
 

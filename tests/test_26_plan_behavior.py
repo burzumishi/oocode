@@ -374,10 +374,10 @@ class TestGetStatusTextWithTasks:
         return "".join(text for _, text in frags)
 
     def test_has_lyre_connector(self):
-        """Primera tarea tiene ⎿ connector."""
+        """Primera tarea tiene ↳ connector."""
         app = self._make_app_with_tasks(["done", "active", "pending"])
         text = self._flat_text(app._get_status_text())
-        assert "⎿" in text
+        assert "↳" in text
 
     def test_done_icon_present(self):
         app = self._make_app_with_tasks(["done", "active"])
@@ -412,6 +412,23 @@ class TestGetStatusTextWithTasks:
         app._plain_tip_cache = "Esto es un tip"
         text = self._flat_text(app._get_status_text())
         assert "Tip:" not in text
+
+    def test_active_task_split_styles(self):
+        """En curso: ◼ en clase verde (task-active-mark) y texto en blanco (task-active-text)."""
+        app = self._make_app_with_tasks(["done", "active"])
+        frags = app._get_status_text()
+        # El cuadrado y el texto de la tarea activa son segmentos separados con clases distintas
+        mark = [t for cls, t in frags if cls == "class:task-active-mark"]
+        textf = [t for cls, t in frags if cls == "class:task-active-text"]
+        assert any("◼" in m for m in mark)
+        assert any("algo importante" in t for t in textf)
+
+    def test_done_task_strike_class(self):
+        """Completada: clase task-done (verde + tachado) sobre ✔ + texto."""
+        app = self._make_app_with_tasks(["done", "active"])
+        frags = app._get_status_text()
+        done = [t for cls, t in frags if cls == "class:task-done"]
+        assert any("✔" in d for d in done)
 
 
 # ── Tests: sincronización _plan_tasks con plan del LLM ───────────────────────

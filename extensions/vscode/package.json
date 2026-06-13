@@ -62,7 +62,7 @@
         "oocode.agent": {
           "type": "string",
           "default": "main",
-          "description": "ID del agente activo (main, coding, reasoning, home_office, webcrawler)"
+          "description": "ID del agente activo (main, coding, reasoning, office, webcrawler)"
         }
       }
     },
@@ -102,6 +102,6 @@
     "package": "vsce package"
   },
   "keywords": ["ollama", "ai", "local", "cli", "assistant", "code", "llm"],
-  "author": "Antonio Cao",
+  "author": "burzumishi",
   "license": "MIT"
 }

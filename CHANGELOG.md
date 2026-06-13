@@ -1,5 +1,286 @@
 # Changelog — OOCode
 
+## v0.5.0 (2026-06-12) — Estructura de conversación por pasos estilo Claude Code
+
+Esta versión reescribe **cómo se agrupan los bloques de la conversación** para que el flujo se parezca al de Claude Code: cada paso del trabajo (su razonamiento, su acción y sus herramientas) forma su propio bloque visual en vez de fundirse todo en un único "Used N tools". También arregla la etiqueta del ● cuando el modelo no aporta texto. 3980 tests.
+
+### Bloques por paso (el 💭 distinto separa el trabajo)
+
+- **Un razonamiento (💭) nuevo abre un bloque nuevo.** Con el pensamiento activo, el modelo razona ANTES de cada acción pero a menudo reemite el mismo preámbulo (o ninguno), así que **todos los pasos se fundían bajo un solo `●` con "Used N tools"** — el usuario veía 9 herramientas juntas sin saber a qué tarea correspondía cada una. Ahora, cuando una iteración de continuación trae un razonamiento **distinto** del anterior y herramientas nuevas, se cierra el bloque previo, el 💭 sale **entre** bloques y se abre un `●` etiquetado por la acción (`Editing (db.c)…`). Resultado: la estructura `💭 razonamiento → ● acción → herramientas → ⎿ resumen` por cada paso, como en Claude Code.
+- **Gated para no trocear de más.** El corte por razonamiento exige las cuatro condiciones a la vez: hay 💭, el bloque abierto ya acumuló herramientas, llegan herramientas nuevas y el 💭 es **distinto** del último (repetir el mismo pensamiento NO abre paso). Los modelos sin razonamiento conservan el comportamiento de agrupación anterior; el corte por cambio de asunto (comando↔fichero) sigue intacto. Revierte conscientemente la regla "razonar a solas nunca cierra el bloque" (`test_42`), que ahora era la causa de la fusión.
+
+### Etiqueta del ● — muestra el fichero, no el nombre interno de la tool
+
+- **`Editing Update` → `Editing (db.c)`.** Cuando el agente ejecutaba una edición sin aportar texto, el ● mostraba el verbo + el nombre INTERNO de display de la herramienta (`Editing Update`), que no dice nada. Ahora el ● resuelve y muestra el **fichero** que se edita (`Editing (db.c)…`), incluso cuando el modelo nombra el argumento de ruta con un alias (`edit_file(file=…)` en vez de `path=`). Si una herramienta no tiene verbo propio (p.ej. `docker_inspect`), se muestra `Using DockerInspect`; si lo tiene pero no hay contexto, solo el verbo (`Editing`), nunca el nombre de display colgando.
+
+### Prompts de razonamiento — menos volcado al `<think>`, más texto visible
+
+- **`think_injection` ya no refuerza el volcado al canal interno.** Con `reasoning` activo, el prompt añadía *"Muestra tu razonamiento paso a paso"* e inyectaba la cláusula de narración visible (`_THINK_VISIBLE`) **dos veces**. En modelos parcos (9B) ese refuerzo del razonamiento hacía que volcaran todo al `<think>` y dejaran la **respuesta visible vacía** (mucho uso de herramientas, pocos mensajes reales). Ahora el razonamiento ya está habilitado por el parámetro `think` del backend, así que el prompt solo pide **texto visible** una vez (sin reforzar el volcado; los niveles `high`/`full` conservan su énfasis intrínseco en mostrar el razonamiento).
+- **`_THINK_VISIBLE` cubre la exploración.** El modelo narraba bien las **decisiones** pero encadenaba `grep`/`read` en silencio. La cláusula ahora pide explícitamente una frase visible **también al explorar** ("busco la definición de X en Y", "el error está en Z:línea"), no solo al decidir o editar.
+- **El backstop (hint #15) nombra las herramientas mudas.** En vez de solo ejemplos genéricos, el aviso de turno silencioso ahora referencia las últimas herramientas usadas sin narrar ("Acabas de usar `grep_code`, `read_file`, `read_file` sin narrar nada") — un nudge concreto lanza mejor en modelos pequeños. *Persiste un techo de comportamiento con 9B; bajar `/think` desplaza más salida al texto visible.*
+
+### Verificado
+
+- **`/think` y `/reasoning` se aplican desde la configuración.** El nivel guardado por modelo (`models.configs.<modelo>.thinking`) se carga al arrancar y llega a la petición del backend (`think=`). El presupuesto de salida (`num_predict`) no trunca el texto visible.
+- **Plantillas de workspace y personas alineadas.** Revisados `SOUL.md` de las plantillas y de los agentes desplegados (`main`, `coding`, `home_office`, `reasoning`, `webcrawler`): la persona empuja a narrar paso a paso, sin reglas que contradigan el flujo por pasos.
+
+## v0.4.9 (2026-06-12) — Narración real estilo Claude Code + limpieza
+
+Esta versión hace que el agente **comunique con texto real** (no solo razonamiento), acercando el flujo de la conversación al de Claude Code, y audita el conteo de tokens y la compactación. Incluye una limpieza de referencias de prueba/personales y un adelgazamiento de la suite de tests. 3976 tests.
+
+### Más texto real del LLM (el 💭 no sustituye a la narración)
+
+- **El razonamiento (💭) ya NO cuenta como narración visible.** Con el pensamiento activo, el modelo razonaba casi cada iteración y eso **desactivaba** el recordatorio interno que empuja a escribir una frase de texto al usuario (el `_turn_text_emitted` quedaba en `True` por el simple hecho de razonar). Resultado real medido en logs: el agente narraba **una vez** y encadenaba ~25 herramientas en silencio, incluido un **giro importante** del diagnóstico sin avisar. Ahora el indicador de narración mide **solo texto visible**: el 💭 se sigue mostrando (canal auxiliar), pero el agente recibe presión para narrar cada acción con texto normal.
+- **`THINK_PROMPTS` reformulado.** La guía de razonamiento decía "razona en profundidad… muestra tu razonamiento" **sin pedir nunca narración visible**, así que los modelos locales volcaban toda su comunicación al canal `<think>` y devolvían una respuesta mínima. Se añade en todos los niveles (y en `/reasoning on`) la cláusula: *el razonamiento es un canal INTERNO; tras pensar, escribe SIEMPRE 1-2 frases visibles de qué haces y por qué*. Es un steer persistente que complementa el backstop reactivo.
+- **Giros y descubrimientos = mensaje de texto nuevo.** Nueva regla de Comunicación: cuando un resultado cambia el plan o el diagnóstico, el agente para y escribe 1-2 frases ANTES de seguir — el giro abre su propio bloque en vez de quedar enterrado.
+- *Nota:* con modelos pequeños (9B) hay un techo de comportamiento; bajar `/think` desplaza más salida al canal de texto visible.
+
+### Conteo de tokens y compactación — auditados
+
+- **El conteo de contexto es correcto.** Los contadores de coste (↑/↓, sesión y turno) incluyen el razonamiento (vía `eval_count` y la estimación en vivo). La **barra de contexto %** NO crece con `/think` **a propósito**: el razonamiento es efímero — no se almacena en el historial ni lo reenvía ningún backend (Ollama/OpenAI/Anthropic solo reenvían `content` + `tool_calls`), así que no consume ventana. Lo que llena el contexto son los **resultados de herramientas** (lecturas de fichero, `make`, `lint`), que es lo esperado.
+- **Limpieza:** se elimina la rama muerta que "contaba" el razonamiento en la estimación de contexto (`_msg_tokens`/`_CPT_THINK`) — nunca se ejecutaba y contradecía el diseño efímero.
+- **Compactación verificada segura tras los cambios de flujo:** ocurre en frontera de iteración (nunca a mitad de una herramienta → no deja ficheros a medio editar), el `min_keep` adaptativo conserva todos los mensajes de la tarea activa, no rompe pares tool-call/resultado y ancla la "Tarea original" en el resumen.
+
+### Limpieza de referencias de prueba/personales
+
+- Auditoría completa del código, prompts y documentación: sustituidas las referencias a proyectos de prueba por nombres genéricos (p.ej. `act_comm.c`/`act_wiz.c` → `handlers.c`, `mud.h` → `core.h`, `interp.c` → `parser.c`, programa de ejemplo → `myapp`) y rutas de ejemplo `src/` neutralizadas en los prompts. Las referencias a **Claude** que se conservan son funcionales (backend Anthropic real, IDs de modelo, comparativa intencional del README) y la identidad pública del proyecto (`github.com/burzumishi/oocode`) se mantiene.
+- **Suite de tests adelgazada sin perder cobertura.** `test_18_permissions.py` parametrizaba 15 métodos sobre listas de ~60 tools (auto/ask), generando ~850 casos que verificaban la **misma** lógica de resolución de permisos por cada tool individual. Se convirtieron a un bucle interno por test (se sigue comprobando cada tool, pero en un solo caso): de 953 a 118 tests en ese fichero. Total de la suite: de 4812 a 3976, **sin** reducir comportamiento cubierto.
+
+## v0.4.8 (2026-06-11) — Razonamiento visible + edición robusta multi-lenguaje
+
+Esta versión hace que la conversación sea **clara y razonada paso a paso** (se muestra el razonamiento del modelo, las herramientas se agrupan por fichero, `ask_user` se respeta siempre) y mejora OOCode como **editor**: las herramientas de edición toleran diferencias de whitespace en cualquier lenguaje. 4778 tests.
+
+### Razonamiento visible (💭)
+
+- El **razonamiento del modelo** (canal `<think>`) ahora se **muestra como narración** atenuada (💭), renderizada en Markdown y alineada con la conversación. Antes se descartaba (solo se contaba para tokens), así que las herramientas se ejecutaban sin explicación del "porqué".
+- **Coste cero si está desactivado**: solo aparece cuando habilitas el pensamiento del modelo (`/think low|medium…` o `thinking.think_level` en `models.configs`). Con modelos locales en modo herramientas, esta es la vía para tener el "porqué" de cada paso.
+- **Fix crítico (2026-06-12): `/think` y `/reasoning` ahora llegan de verdad al modelo.** El nivel de pensamiento y el flag de razonamiento se guardaban en `oocode.json` por modelo y se cargaban a runtime, pero **nunca se enviaban en la petición LLM** — `OllamaBackend` solo pasaba `options`, jamás el parámetro `think`. Resultado: `/think high` y `/reasoning on` no producían razonamiento (el modelo usaba su default). Ahora el valor se mapea y se envía a los 3 backends (Ollama `think`, OpenAI `reasoning_effort`, Anthropic bloque `thinking` con `budget_tokens`). Verificado contra Ollama real. `/think off` envía `think=False` explícito (muchos modelos —qwen3.5— razonan por defecto si no se pasa el parámetro, así que omitirlo no los silenciaba). Los modelos sin soporte de thinking se manejan con un retry automático sin el parámetro (no se propaga el error).
+- **El cap de visualización del 💭 escala con el nivel** (2026-06-12): con `/think high` se muestra el razonamiento prácticamente completo (antes un corte fijo de 1200 chars recortaba lo que pedías ver).
+- **Nudge de narración visible (2026-06-12).** Con el pensamiento activo, los modelos de razonamiento tienden a poner la narración en el canal `<think>` y emitir poco texto, así que el razonamiento quedaba mayormente dentro de los bloques de tools en vez de fluir entre ellos. Se refuerza en las 3 capas (SYSTEM_RULES, persona de los agentes y backstop reactivo) que **el pensamiento interno no sustituye al texto visible**: antes de cada acción el agente deja una frase de texto normal → se forman fronteras naturales y el 💭 sale como narración entre bloques. No se tocó la lógica de agrupación de bloques (estilo Claude Code).
+- **Match de configuración por modelo robusto**: la config de un modelo (thinking, contexto, timeout) ahora se aplica aunque el nombre lleve prefijo de registry o `:latest` — p.ej. una entrada `qwen3.5-9b` se aplica a `tu-registry/qwen3.5-9b:latest`.
+
+### Bloques de herramientas por fichero/paso
+
+- **Agrupación por fichero.** Las herramientas y razonamientos que trabajan sobre **el mismo fichero** (leer + buscar + razonar + editar `module.c`) quedan **juntos en un bloque**; el razonamiento intermedio aparece **dentro** (`│ 💭`) y, sin bloque abierto, fuera como narración Markdown. El bloque se cierra cuando el modelo emite un **mensaje nuevo** (cada texto del modelo conserva su `●`) o cuando una **edición toca otro fichero** (auto-split: bloque nuevo + su diff). Razonar por sí solo **nunca** rompe el bloque, y las búsquedas amplias (`grep_code`) y `bash` tampoco. Esto evita los dos extremos: el "Used N tools" gigante que soltaba todos los diffs al final, y el sobre-troceo (cada lectura/búsqueda del mismo fichero en su propio bloque).
+- **Fix (2026-06-12): el auto-split también dispara con `smart_replace`/`regex_replace`.** Estas tools usan el parámetro `file` (no `path`) y la extracción del fichero destino no lo cubría, así que el auto-split **nunca** disparaba para ellas: tres `Replace` sobre tres ficheros distintos acababan en un solo bloque "Used 13 tools". Como el steering anti-fallos de edición empuja precisamente hacia `smart_replace`, era el caso común.
+- **Las tools de memoria van FUERA de los bloques (2026-06-12).** `mem_save`/`workspace_remember` son acciones de continuidad del agente, no trabajo sobre ficheros: su `◐ ⬡` cierra el bloque en curso y se muestra al nivel de la conversación, en vez de quedar enterrado en el "Used N tools" de la edición en curso.
+- **`/agent reset` con paridad de plantillas (2026-06-12).** El reset regeneraba los ficheros del workspace con los generadores Python (fallback) en vez de leer `workspace/templates/` como hace la creación — un agente reseteado quedaba con una persona divergente y sin las mejoras de las plantillas. Ahora usa el mismo camino (`WorkspaceManager.init(overwrite=True, preserve=("MEMORY.md",))`); MEMORY.md y `memory/` se siguen conservando.
+- **Unidades visuales por edición (2026-06-12), estilo Claude Code.** Cada edición completada con éxito **cierra su bloque al momento** (exploración + razonamiento + edición + **su diff** pasan ya a la conversación) y la siguiente edición **reabre el suyo** ("● Continuing with handlers.c" si es el mismo fichero, "● Moving on to parser.c" si cambia). Antes, N ediciones del mismo fichero se apilaban en el live block y todos los diffs y razonamientos aparecían de golpe al final ("Used 16 tools"). Una edición **fallida** no cierra el bloque: su reintento se queda en la misma unidad. Paridad WebUI (`tool_done.is_modify` → el cliente cierra el bloque).
+- **Fix (2026-06-12): el razonamiento que abre un paso nuevo queda ENTRE bloques.** Cuando la iteración trae texto nuevo (→ su propio `●`), el cierre del bloque anterior se adelanta a antes del 💭: el razonamiento del paso se ve al nivel de la conversación, en lugar de quedar enterrado como última línea `│ 💭` del bloque que se estaba cerrando. La frontera sigue siendo la del texto (misma condición que el `●`) — razonar por sí solo sigue sin cerrar nada. Paridad WebUI vía `reasoning.new_step`.
+- **Frontera por cambio de ASUNTO (2026-06-12).** Un intento de compilación/ejecución (`bash`/`make_run`/`run_script`/`python_exec`…) y la edición de un fichero son **unidades visuales distintas**: cuando una iteración sin texto pasa de comandos a ediciones (o viceversa, o a otro fichero), el bloque abierto se cierra, el 💭 de esa iteración queda **entre bloques** y la tanda nueva abre su propio `●`. Antes, "autogen + make + razonar los errores + editar config.h" se encadenaban bajo un solo "Used N tools" con cinco 💭 enterrados. La decisión la toman las **tools entrantes** (no el razonamiento); las lecturas/búsquedas son neutrales y nunca rompen el bloque.
+- **El live block muestra la COLA del bloque mientras corre una tool** (las 5 líneas más recientes: último 💭, output previo), no las primeras 5 — con bloques largos la ventana se quedaba congelada en el principio y nada parecía avanzar hasta el flush.
+- **`task_done` es frontera visual (2026-06-12).** Al cerrar una tarea del plan, el bloque de tools de esa tarea se cierra ANTES y la narración del desenlace (`● Tarea N: …`) sale estática **entre bloques** — antes caía dentro del live block y quedaba enterrada como los 💭. Su resultado interno ("✔ Tarea N/M…") ya no cuenta como tool del bloque siguiente.
+- **El razonamiento ya NO se pierde por el camino (2026-06-12).** Auditoría de todos los returns de `_stream_response`: (1) los **retries XML** (EOF/malformado) descartaban el thinking ya acumulado del intento fallido — y el retry va con `/no_think`, así que la iteración salía muda; (2) el **path sync** (subagentes) nunca propagaba `resp.thinking` → los subagentes no mostraban 💭 jamás; (3) `Response` ni siquiera tenía campo `thinking` (los `chat_sync` de los 3 backends lo tiraban); (4) el backend **OpenAI** ignoraba `reasoning_content` (llama.cpp/vLLM) en streaming y sync; (5) la rama REPL sin fallback no recolectaba `chunk.thinking`. Todos preservan ahora el razonamiento.
+- **El thinking cuenta como actividad para el watchdog de timeout (2026-06-12).** Con think alto el modelo puede razonar minutos sin emitir texto; el watchdog de modo app solo contaba chars de TEXTO y mataba el stream a mitad de razonamiento (el path REPL ya lo contaba — paridad).
+- **Avisos de bash conscientes de pipes (2026-06-12).** `make 2>&1 | grep error | tail -30` ya no genera los falsos "Usa grep_code/read_file en lugar de bash" — esos filtros consumen la SALIDA de otro comando, donde no hay tool nativa equivalente. El aviso se mantiene para uso directo sobre ficheros (`grep foo file.c`), y `sed -i` sigue prohibido esté donde esté.
+- **Las ediciones nunca se paralelizan**: un lote con `edit_file`/`write_file`/`smart_replace`/… se ejecuta en secuencia para que cada edición tenga su propio bloque + diff a medida que ocurre (en paralelo se volcaban agrupadas al final). Las lecturas/búsquedas sí siguen en paralelo. Paridad TUI/WebUI.
+- El **mensaje de `task_done`** (resumen de cada tarea) ahora **se muestra al usuario**. Los modelos locales suelen poner ahí su narración ("Tarea 3: eliminé X porque no se usa"); antes se descartaba.
+- Un separador `---` que el modelo emita como texto ya **no se muestra como `● ---`** (se reconoce como regla horizontal).
+
+### `ask_user` y aprobación de plan
+
+- **`ask_user` se muestra SIEMPRE.** Es una pregunta genuina del agente; `/elevated` (que solo afecta a permisos de herramientas) ya **no la silencia**. Igual para la **aprobación de plan** (`/plan on`): si la activas, siempre te pregunta. *(Antes, en modo elevado el agente decidía por su cuenta sin mostrar la pregunta.)*
+- La **aprobación de plan** muestra el plan **formateado** en la conversación y un formulario con una **pregunta corta** (antes metía el plan multilínea dentro de la pregunta, ilegible en la barra de estado).
+- **Las preguntas de cierre sí/no van por `ask_user` (2026-06-12).** El agente cerraba una tarea con un resumen y una pregunta en texto plano ("…¿Deseas que continúe corrigiendo los errores?") y se detenía, dejando al usuario sin forma estructurada de responder. La regla de `ask_user` ya cubría preguntas "con opciones" pero el modelo local no veía una confirmación sí/no de continuación como "opciones". Ahora la regla cubre **explícitamente** las confirmaciones sí/no ("¿Sigo con X?", "¿Lo arreglo?", "¿Procedo?") y deja claro que **aplica aunque consideres la tarea completada**: el resumen se narra en texto y el siguiente paso se ofrece con `ask_user` (sí/no como opciones). Reforzado en las personas de los agentes. También se amplió el recordatorio de narración para cubrir la **exploración** (no encadenar 10 `grep`/`read` en silencio: decir qué se busca y resumir los hallazgos), no solo las ediciones.
+- **Formulario `ask_user` rehecho y navegable (2026-06-12).** Antes era ilegible: las opciones no se podían navegar, reutilizaba el prompt de permisos ("¿Permitir? →"), el botón de la pregunta salía cortado a media palabra y **el formulario se recortaba** (altura fija de 3 líneas → las opciones quedaban invisibles). Ahora: fila de **chips-botón** con el resumen de cada pregunta (☐/☑), y debajo la pregunta completa con sus **opciones navegables con ↑/↓** (cursor `❯`), una fila de "✎ Otra respuesta" para texto libre y una línea de ayuda. Se elige con **Enter** (o número como atajo), se cambia de pregunta con ←/→, y el alto del formulario se ajusta al contenido. El input ya no muestra "¿Permitir?" durante una pregunta.
+
+### Tono y narración
+
+- El agente narra de forma **cálida, cercana y continua**, explicando qué hace y **por qué decide** lo que decide (veredicto + motivo + acción), sin trabajar en silencio ni cerrar tareas solo con su título. Personas de los agentes (plantillas y workspaces) alineadas.
+
+### Edición robusta (menos fallos de `edit_file`), multi-lenguaje
+
+- **`edit_file`/`edit_files` toleran diferencias de whitespace.** La causa nº1 de "PRE-EDIT FALLIDO" era el modelo equivocándose en espacios/tabs/indentación de un `old_string` multilínea. Ahora el match escala la tolerancia y **solo aplica si la coincidencia es única** (si es ambigua, no adivina): exacto → ignorando espacios finales (CRLF incluido) → ignorando indentación (reaplicando la del fichero) → **(2026-06-12) ignorando whitespace interior** (tabs de alineación dentro de la línea, invisibles para el modelo en el output numerado de `read_file`). Funciona en **cualquier lenguaje** (opera sobre líneas/whitespace). El resultado avisa cuando hubo que tolerar whitespace; el diff mostrado es la verdad.
+- **Fix (2026-06-12): el precheck de `edit_file` usa el MISMO matcher tolerante.** El precheck del agente comprobaba `old_string` con match EXACTO y bloqueaba la llamada antes de que la tool corriera — toda la tolerancia anterior era código muerto en la práctica (causa real de la mayoría de "PRE-EDIT FALLIDO" en ficheros C indentados con tabs). Ahora deja pasar cuando hay match tolerante ÚNICO; si es ambiguo lo dice ("añade más contexto") y si de verdad no está, sugiere las **líneas más parecidas** del fichero por similitud real (antes sugería basura por substring, p.ej. ASCII-art al buscar `}`).
+- **`smart_replace`/`regex_replace` con semántica de editor (2026-06-12):** `re.MULTILINE` **siempre activo** (`^`/`$` casan por línea — antes `^patrón$` solo casaba al inicio del fichero entero y el modelo recibía "NO encontrado" sistemático); si el patrón no casa y contiene espacios, **reintento tolerante a tabs** (`[ \t]+`, anotado en el resultado); y al fallar, el contexto muestra las **líneas relacionadas con el patrón** (fragmento literal más largo + similitud), no las primeras 40 líneas del fichero.
+- **`read_file(skip_comment_banner=true)`**: colapsa una cabecera de comentario/licencia larga (logos, listas de autores) en un marcador, **conservando los números de línea** para no desalinear ediciones. Detección **multi-lenguaje** por extensión: C-family (`//`,`/* */`; `#include`/`#define` no se colapsan), `#` (Python/shell/Ruby/YAML… + docstrings `"""`), `--` (SQL/Lua/Haskell), `;` (Lisp), `!` (Fortran), `%` (LaTeX/Erlang), `<!-- -->` (HTML/XML/MD), `(* *)` (OCaml/Pascal)…
+- **Fix (2026-06-12, de logs reales): `edit_file(file=…)` ya no revienta.** El modelo confunde el nombre del parámetro de ruta entre herramientas (`edit_file`/`read_file`/`write_file` usan `path`; `smart_replace`/`regex_replace` usan `file`), así que llamaba `edit_file(file=…)` y el filtro de kwargs descartaba `file` → `missing 1 required positional argument: 'path'` (era la causa nº1 de crashes de edición en los logs). Ahora un alias de ruta se **remapea automáticamente** al nombre que la herramienta acepta (bidireccional, conservador: no toca nada si ya viene el correcto). Aplicado en el dispatch nativo y en las tools MCP de edición (`smart_replace`/`regex_replace`/`context_before_edit`/`pre_edit_check`…).
+- **Telemetría de tool calls más precisa** (`tool_calls.jsonl`): el flag `ok` clasificaba `⛔ PRE-EDIT FALLIDO` como éxito (no contenía la palabra exacta "fallida") y daba falsos negativos cuando el lint mencionaba "error". Ahora usa un clasificador robusto de los marcadores reales de fallo.
+
+### Subagentes
+
+- Los subagentes ya **no saludan al usuario** ("¡Hola!") al empezar cada tarea: reciben una instrucción de "trabajador interno" y empiezan directos por el trabajo y los resultados. (Verificado además que reciben el mismo conjunto de reglas/correcciones que el agente principal — no pierden contexto.)
+
+### RAG del proyecto
+
+- La indexación semántica del proyecto **ignora más artefactos de build/generados** (autotools `.deps`/`.libs`/`autom4te.cache`, CMake, IDE, `vendor`, `config.h`, `*_pb2.py`, `moc_*.cpp`…) para reducir re-embeds inútiles tras cada compilación. Ajustable con `rag.indexInterval`/`rag.maxFiles`/`rag.enabled`.
+
+### Limpieza / release
+
+- Auditoría de datos: eliminadas referencias de marca/estilo incidentales; plantilla `USER.md` saneada a placeholders genéricos; **nuevo `.gitignore`** para no publicar artefactos locales (tags, caché, config local con rutas/IPs de la máquina).
+
+## v0.4.7 (2026-06-10) — Edición fiable + paridad del plugin Vim
+
+Esta versión corrige la **causa raíz** del problema por el que las herramientas de edición "nunca acertaban y revertían", da **paridad de interacción** al plugin de Vim con TUI/WebUI y mejora cómo el plugin referencia el fichero abierto. 4684 tests.
+
+### Edición fiable — invalidación de la caché de lecturas
+
+- **Bug raíz corregido**: la caché de resultados de lectura (`read_file`, `grep_code`, `read_sections`…) solo se vaciaba una vez por turno, así que tras un `edit_file` exitoso un `read_file` posterior del **mismo fichero** devolvía el contenido **pre-edición** cacheado. El agente creía que el cambio no se había aplicado, reintentaba el mismo `old_string` y obtenía `PRE-EDIT FALLIDO` (ya estaba aplicado) → bucle de reintento/revert. Era un fallo de la herramienta, no del modelo.
+- Ahora, tras cada operación de mutación, las lecturas afectadas se **invalidan automáticamente**: dirigida por ruta (fichero + directorio) para las tools con ruta concreta; vaciado completo para las que ejecutan comandos (`bash`, `python_exec`, `make`, git, docker…) y pueden tocar ficheros arbitrarios.
+- Además, `smart_replace` y varias operaciones git mutadoras (`checkout`/`reset`/`merge`/`rebase`/`apply`) dejan de cachearse (antes, una segunda llamada idéntica devolvía el resultado cacheado **sin editar**).
+- Reforzada la guía de edición: leer el fichero y copiar el texto literal antes del primer edit; no reintentar el mismo patrón al fallar, sino escalar a `smart_replace`/`regex_replace`.
+
+### Plugin Vim 3.2 — paridad con TUI/WebUI
+
+- El panel de Vim ya maneja los eventos interactivos del servidor que antes ignoraba: **`ask_user`** (preguntas con opciones → se responde con `inputlist`/texto libre y se envía la respuesta), **confirmación de permisos**, **resumen de respuestas**, **mensajes en cola** y **resultados de slash commands**. Antes, cualquier `ask_user` dejaba el turno colgado hasta el timeout.
+- **Contexto del fichero/directorio abierto**: cada `:OOCode`/`:OOCodeAsk` antepone una referencia con la **ruta absoluta** del fichero que estás viendo (+ línea/columna del cursor) y el directorio de trabajo, para que el agente sepa a qué te refieres ("revisa esta función") y lo lea con `read_file`. En un explorador de directorios referencia el directorio. Configurable con `g:oocode_inject_file_hint`.
+
+### TUI
+
+- **Separadores `---` ya no aparecen como bullet**: cuando el modelo emitía una regla horizontal markdown (`---`, `***`, `___`) como separador —típicamente tras presentar un plan—, la TUI la mostraba como un inútil `● ---`. Ahora esas líneas se descartan del bullet (solo para el display; el texto sigue intacto en contexto/logs) y, si el turno no tiene más texto, el bullet etiqueta la primera herramienta (`Running make clean…`), indicando qué hizo el agente.
+
+### Limpieza
+
+- Eliminadas referencias de marca de terceros en los prompts del sistema, la ayuda al usuario y los comentarios de desarrollo (OOCode es su propio producto).
+
+## v0.4.6 (2026-06-10) — Interacción con el usuario + robustez
+
+Esta versión mejora la **interacción con el usuario** en el TUI y la WebUI: preguntas estructuradas, aprobación de planes y confirmación de permisos — además de una tanda de correcciones de robustez y precisión. 4679 tests.
+
+### `ask_user` — preguntas estructuradas / encuestas (TUI + WebUI)
+
+- Nueva tool **`ask_user`**: el agente puede plantear **una o varias preguntas** (hasta 4) con opciones, esperar la respuesta y continuar con la decisión del usuario — en vez de adivinar o soltar listas pasivas de "próximos pasos".
+- Cada pregunta admite **multiSelect** (el orden de selección se conserva → sirve para fijar un orden de ejecución) y siempre una opción de **texto libre**.
+- **TUI**: formulario en la barra de estado con chips de pregunta y **navegación libre con ←/→**; se responde por teclado. **WebUI**: tarjeta con secciones y botón Submit. Al cerrar, se vuelca un resumen `● User answered OOCode's questions: …` antes de seguir.
+- El agente usa `ask_user` ante **ambigüedad real**, para **elegir enfoque/orden**, y al proponer **próximos pasos que dependen de tu decisión**. Los subagentes no preguntan (deciden solos).
+
+### Plan-mode — aprobación de planes (`/plan`)
+
+- Nuevo modo opt-in **`/plan on`** (config `context.planApproval`): antes de ejecutar un plan, el agente lo **presenta y espera tu aprobación** (Aprobar / Editar / Cancelar). Reutiliza `ask_user`; funciona en TUI y WebUI.
+
+### WebUI — confirmación de permisos (opt-in)
+
+- Nueva config **`webui.permissionPrompt`** (default off): cuando se activa, las herramientas que requieren permiso **preguntan en el navegador** (Sí/No/Siempre). Con **guarda de cliente conectado**: si no hay navegador abierto (VIM/`send_sync`/pestaña cerrada) auto-aprueba — no se cuelga el uso headless.
+
+### Cola de entrada mientras el agente trabaja
+
+- Ahora puedes **escribir mientras el agente ejecuta un turno**: los slash de display/control (`/help`, `/mcp`, `/steer`, `/kill`…) pasan al momento; los mensajes y los slash que mutan estado (`/new`, `/compact`, `/model`…) se **encolan (FIFO)** y se procesan al terminar. `/kill` descarta la cola. TUI y WebUI.
+
+### Precisión y robustez
+
+- **Edición**: ante fallos de `edit_file` por espacios/indentación, el agente es guiado a `smart_replace`/`regex_replace` (más robustas) y a `context_before_edit`, rompiendo los bucles de reintento. `edit_files` informa mejor del fallo atómico.
+- **Retry XML**: los tool calls XML malformados se reintentan con `/no_think` (generación más corta y determinística).
+- **Conteo de tokens**: los contadores y barras muestran el límite **efectivo del modelo** (no el fallback interno); las imágenes ahora cuentan en la estimación.
+- **Turnos sin texto** (qwen3.x): el `●` etiqueta la herramienta (`● Running make`) en vez de `…`; re-anclaje correcto tras compactar a mitad de turno.
+- **Esquemas de herramientas**: añadidos tipos a parámetros que faltaban; test de higiene de esquemas.
+- **Limpieza**: claves huérfanas eliminadas de `oocode.json` (`context_window_*`, `prompt_cache_*`, `cache_dir`); defaults de docs/instalador alineados con el código (`compactThreshold` 0.80, `maxToolResultTokens` 800).
+
+## v0.4.5 (2026-06-09) — Rediseño del prompt multitarea del TUI + alineación unificada
+
+Pulido visual de la barra de estado del TUI mientras el agente trabaja, y limpieza de
+referencias obsoletas en los workspaces tras el split de MCP de 0.4.4.
+
+### TUI — prompt multitarea rediseñado
+
+- **Frase principal en rojo**: el modo multitarea muestra el resumen del plan
+  (`plan_create(summary=…)`, nuevo atributo `_plan_summary`) como frase principal en
+  rojo, en lugar del antiguo `◈ Multitarea: [N/M] tarea`. Fallback al texto de la tarea
+  activa si no hay summary.
+- **Palabra de "pensamiento" idéntica al modo normal**: el indicador entre paréntesis
+  (`Cavilando… · tiempo · tokens`) reutiliza exactamente las mismas palabras
+  (`_THINKING_WORDS`/`_NEAR_FINISH_PHRASES`) y colores (`status-word`/`status-phrase`) que
+  el spinner de turno simple.
+- **Lista de tareas**:
+  - Completadas → **verde tachado** (`task-done` con `strike`).
+  - En curso → cuadrado **`◼` verde** (`task-active-mark`) + texto **blanco en negrita**
+    (`task-active-text`), como dos segmentos separados.
+  - Pendientes → `◻` atenuado. Se mantiene el contador `… +N pending, M completed`.
+- La tarea activa ya **no** se duplica en la línea del spinner (solo aparece en la lista).
+
+### TUI — alineación unificada del status window
+
+- Patrón de columnas común para los tres prompts (normal, multitarea y compactación):
+  icono/spinner animado en **col 2** + 1 espacio; conector `↳` en col 2; iconos de tarea
+  no-primera, summary `…` y footer `⎿ Tip` en **col 4**.
+- Todos los spinners de trabajo siguen animados (`_SPINNER_FRAMES`); no hay ningún spinner
+  fijo durante la ejecución.
+
+### Compactación — objetivo post-compactación (`compactTarget`)
+
+- **Síntoma:** con modelos de contexto grande (9b q8_0) en proyectos con ficheros grandes,
+  tras compactar el contexto se quedaba al 50–70% (a veces 70%), cerca de volver a compactar —
+  justo lo que el contexto grande debía evitar.
+- **Causa:** la 2ª pasada (la única que reduce el *tamaño* de los mensajes conservados,
+  truncando tool results largos) solo se activaba por encima de `highWater` (0.70) y protegía
+  las **4** tool results más recientes. Con lecturas grandes recientes, no llegaba a truncar y
+  el contexto se quedaba alto.
+- **Fix:** nuevo `context.compactTarget` (defecto **0.50**). Tras soltar mensajes antiguos, la
+  2ª pasada trunca los tool results largos conservados hasta bajar de ese objetivo —
+  protegiendo solo las **2** más recientes, y si aún sigue alto, solo la última. `highWater`
+  pasa a usarse únicamente para el disparo de la pre-compactación en background.
+- Recomendación añadida a `doc/02_configuration.md`: combinar `compactTarget` con un
+  `maxToolResultTokens` moderado (4000–7000) para no inflar el contexto de trabajo entre
+  compactaciones.
+
+### Workspaces — limpieza tras el split de MCP (0.4.4)
+
+- El workspace del agente `home_office` citaba el servidor muerto `home-office-assistant`
+  (→ `word/excel/pptx/mail/cmdb-assistant`) y tools eliminadas en el split
+  (`doc_insert_chart_native` → `insert_chart`; bloque `doc_insert_diagram` con PNG/matplotlib
+  → gráficas OOXML nativas). Auditados system prompt, prompts MCP, plantillas y
+  `_TOOL_LIVE_VERBS`: el resto estaba correcto.
+
+### Documentación
+
+- Configuraciones de ejemplo en `doc/examples/` para tres perfiles de VRAM
+  (4b q4_0, 4b q8_0, 9b q8_0) con un README que explica los tradeoffs y que la cuantización
+  se elige al hacer `ollama pull`.
+
+4576 tests.
+
+## v0.4.4 (2026-06-09) — División del MCP home-office en cinco servidores
+
+El servidor MCP `home-office-assistant` había crecido demasiado (9854 líneas, 66 tools)
+y mezclaba dominios dispares. Se divide en cinco servidores MCP autocontenidos, cada uno
+activable por separado y arrancado al inicio como el resto de bundled. Primero por dominio
+(mail, cmdb y un `office`); después ese `office` se subdividió por formato (word/excel/pptx)
+porque seguía siendo demasiado grande.
+
+### Cinco servidores nuevos (split de `home_office_assistant.py`)
+
+- **`word-assistant`** (`mcp_servers/word_assistant.py`) — 29 tools: documentos Word
+  (.docx) O365 nativos, la tool unificada **`doc_create`** (genera .docx/.xlsx/.pptx según
+  extensión), gráficas OOXML DrawingML editables (`insert_chart`), plantillas docxtpl/Jinja2,
+  estilos Calibri, y utilidades transversales (conversión pandoc, OCR `image_to_text`,
+  `pdf_extract_text`, metadatos, comparación, gestión de proyecto). 13 prompts,
+  8 resources (`office://…`).
+- **`excel-assistant`** (`mcp_servers/excel_assistant.py`) — 16 tools: hojas `.xlsx`
+  (openpyxl) — lectura/escritura, informes, tablas nativas, gráficas, formato condicional,
+  validación, freeze panes, protección; y `csv_analyze`. 3 prompts.
+- **`pptx-assistant`** (`mcp_servers/pptx_assistant.py`) — 7 tools: presentaciones `.pptx`
+  (python-pptx) — crear, diapositivas, gráficas, notas, fondos, lectura. 1 prompt.
+- **`mail-assistant`** (`mcp_servers/mail_assistant.py`) — 11 tools de comunicación/PIM:
+  email IMAP/SMTP, calendario `.ics`, notas markdown, contactos vCard. 2 prompts,
+  4 resources (`mail://…`).
+- **`cmdb-assistant`** (`mcp_servers/cmdb_assistant.py`) — 3 tools de inventario IT:
+  `cmdb_search`, `cmdb_update`, `asset_register_add` (CSV/XLSX/JSON). 1 resource
+  (`cmdb://server_inventory`).
+
+Sin pérdida de funcionalidad: las 66 tools, 19 prompts y 13 resources originales se
+conservan, repartidos entre los cinco servidores. Total bundled: 12 servidores.
+
+### Configuración y migración transparente
+
+- Flags nuevos en `config/model.py` y `config/blocks/mcp.py`: `mcp.wordAssistant`,
+  `mcp.excelAssistant`, `mcp.pptxAssistant`, `mcp.mailAssistant`, `mcp.cmdbAssistant`.
+- **Fallback legacy en cadena:** word lee `~/.oocode/office.json`, mail `mail.json`, cmdb
+  `cmdb.json`, todos con fallback a `~/.oocode/home_office.json`. Flags:
+  `word/excel/pptx` ← `officeAssistant` ← `homeOfficeAssistant`; `mail/cmdb` ←
+  `homeOfficeAssistant`. Quien tuviera `mcp.homeOfficeAssistant.enabled=true` ve los cinco
+  activados en la primera carga (`OOConfig.load` los materializa en `save()`).
+- Cableado actualizado: `agent/services.py` (`_BUNDLED_MCP`, ahora 12 servidores),
+  `agent/mcp_manager.py` (`_BUNDLED_SERVER_MAP`), `ui/commands.py` (`/mcp`, `/doctor`,
+  `/config`), `webui/api_config.py` + `webui/page_config.py`, hook
+  `doc_validate_template_filled` (prefijo `mcp_word_assistant_…`).
+
+### Tests y docs
+
+- `tests/test_45_home_office_mcp.py` → `tests/test_45_office_mail_cmdb_mcp.py`: prueba los
+  cinco servidores; los agregados se verifican como unión (66 tools / 19 prompts / 13 res).
+- Actualizados `test_53`, `test_58`, `test_59`, `test_61`, `test_62`, `test_79`.
+- `CLAUDE.md`, `README.md`, `doc/22_mcp_servers.md` reflejan los 12 servidores bundled.
+- 4574 tests (sin LLM ni servidor externo).
+
 ## v0.4.3 (2026-06-04) — Robustez de subagentes, contexto y personalización de agentes
 
 Bloque de robustez y visibilidad: confusión PDF/web corregida, compactación a mitad de
@@ -440,7 +721,7 @@ Versión de pulido que hace que los backends OpenAI-compatible y Anthropic (expe
 
 ## v0.3.4 (2026-05-30)
 
-- TUI Claude Code style: `●` sin sangría, `⎿` sin `◐`, resumen compacto
+- TUI estilo bloques: `●` sin sangría, `⎿` sin `◐`, resumen compacto
 - WebUI + TUI fixes: collapse via `.expanded`, file cards unificadas, status al inicio de turno
 - Home Office v5: `doc_create` + `template_path`, checklist/callout/highlight/toc en Word
 - Home Office OOXML refactor: gráficas OOXML nativas (sin PNG), diagramas bar/pie/line

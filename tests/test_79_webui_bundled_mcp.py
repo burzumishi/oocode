@@ -16,18 +16,20 @@ from config import OOConfig
 from agent.services import bundled_mcp_servers, _BUNDLED_MCP
 
 
-# Los 8 servidores bundled documentados en CLAUDE.md
-_EXPECTED_8 = {
+# Los 12 servidores bundled documentados en CLAUDE.md
+# (word/excel/pptx/mail/cmdb = split del antiguo home-office)
+_EXPECTED_12 = {
     "oocode-assistant", "system-assistant", "devops-assistant", "database-assistant",
-    "home-office-assistant", "security-assistant", "iot-assistant", "http-client-assistant",
+    "word-assistant", "excel-assistant", "pptx-assistant", "mail-assistant", "cmdb-assistant",
+    "security-assistant", "iot-assistant", "http-client-assistant",
 }
 
 
 class TestBundledMcpHelper:
 
-    def test_all_eight_servers_registered(self):
+    def test_all_servers_registered(self):
         names = {name for _, name, _ in _BUNDLED_MCP}
-        assert names == _EXPECTED_8
+        assert names == _EXPECTED_12
 
     def test_each_has_config_flag(self):
         c = OOConfig()
@@ -39,7 +41,7 @@ class TestBundledMcpHelper:
         for flag_attr in (a for a, _, _ in _BUNDLED_MCP):
             setattr(c, flag_attr, True)
         got = bundled_mcp_servers(c)
-        assert len(got) == 8, [s["name"] for s in got]
+        assert len(got) == 12, [s["name"] for s in got]
 
     def test_defaults_include_devops(self):
         """devops-assistant está activo por defecto y DEBE arrancar."""
@@ -69,7 +71,7 @@ class TestBundledMcpHelper:
 
 
 class TestWebuiConfigCoverage:
-    """El endpoint de config del WebUI expone y persiste los 8 flags MCP."""
+    """El endpoint de config del WebUI expone y persiste los 12 flags MCP."""
 
     def test_get_config_exposes_all_flags(self):
         import webui.api_config as ac

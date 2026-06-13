@@ -145,6 +145,7 @@ class MemorySystem:
 
         results: list[tuple[float, str, str]] = []
         for md_path in mem_files:
+            content = None   # texto del fichero si se llega a leer → reutilizable
             # 1) Caché RAM
             vec = self._vec_cache.get(md_path.name)
             if vec is None:
@@ -169,7 +170,8 @@ class MemorySystem:
             score = self._embed.similarity(query_vec, vec)
             if score >= self._threshold:
                 try:
-                    raw = md_path.read_text()
+                    # Reutiliza el texto si ya se leyó para el embedding (evita una 2ª lectura).
+                    raw = content if content is not None else md_path.read_text()
                     snippet = _extract_body(raw, self._snippet_chars)
                     results.append((score, md_path.name, snippet))
                 except Exception as e:

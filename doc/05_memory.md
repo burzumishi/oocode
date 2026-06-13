@@ -155,7 +155,7 @@ Al guardar manualmente, ejecuta `/mem rebuild` para regenerar los embeddings.
 ## Aislamiento entre agentes y proyectos
 
 Las memorias son **globales al agente** (se comparten entre proyectos del mismo agente).
-Para información específica de proyecto usa `workspace_remember` que escribe en `OOCODE.md` del workspace.
+Para información específica de proyecto usa `workspace_remember`, que añade notas a `OOCODE.md` (el fichero de contexto del proyecto, equivalente a CLAUDE.md). Respeta el techo de tamaño (`workspace.oocodeMdMaxKb`): si la nota lo superase, no escribe y pide condensar — el resumen y las instrucciones del proyecto viven SIEMPRE en OOCODE.md, nunca en ficheros nuevos. La política completa (qué incluir en el resumen, mantenerlo bajo el límite) está en el bloque "## Memoria del proyecto" de `SYSTEM_RULES`.
 
 ```
 ~/.oocode/workspace/<agent_id>/<proyecto>/OOCODE.md  — notas de proyecto

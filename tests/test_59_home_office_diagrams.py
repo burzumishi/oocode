@@ -10,7 +10,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from mcp_servers.home_office_assistant import _tool_doc_fill_template
+from mcp_servers.word_assistant import _tool_doc_fill_template
 
 
 class TestDocFillTemplateStyles:
